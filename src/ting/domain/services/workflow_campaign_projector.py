@@ -7,6 +7,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 
 from niuu.domain.models import Principal
+from niuu.observability import get_observability
 from ting.domain.campaign_stages import FAILURE_STAGE_KEY, record_runtime_failure
 from ting.domain.models import CampaignStageState, WorkflowCampaign, WorkflowCampaignStatus
 from ting.domain.services.workflow_campaign_lifecycle import (
@@ -369,9 +370,37 @@ class WorkflowCampaignProjector:
         finally:
             if terminal_session_cleanup_needed(saved):
                 await self.cleanup_terminal_session(saved)
+        _record_a2a_state_transition(saved)
 
 
 _PENDING_BLOCKER_STATUSES = frozenset({"", "pending", "open", "waiting", "help_needed", "blocked"})
+
+_A2A_STATE_BY_STATUS = {
+    WorkflowCampaignStatus.PENDING: "TASK_STATE_SUBMITTED",
+    WorkflowCampaignStatus.RUNNING: "TASK_STATE_WORKING",
+    WorkflowCampaignStatus.BLOCKED: "TASK_STATE_INPUT_REQUIRED",
+    WorkflowCampaignStatus.COMPLETED: "TASK_STATE_COMPLETED",
+    WorkflowCampaignStatus.FAILED: "TASK_STATE_FAILED",
+}
+
+
+def _record_a2a_state_transition(campaign: WorkflowCampaign) -> None:
+    telemetry = get_observability()
+    attributes = {"state": _A2A_STATE_BY_STATUS[campaign.status]}
+    telemetry.count(
+        "a2a_task_state_transitions_total",
+        attributes=attributes,
+        description="A2A task state transitions observed by Ting.",
+    )
+    if campaign.status not in {WorkflowCampaignStatus.COMPLETED, WorkflowCampaignStatus.FAILED}:
+        return
+    finished_at = campaign.completed_at or campaign.updated_at
+    telemetry.duration(
+        "a2a_send_to_terminal_duration_seconds",
+        max(0.0, (finished_at - campaign.created_at).total_seconds()),
+        attributes=attributes,
+        description="Time from A2A SendMessage campaign creation to terminal state.",
+    )
 
 
 def _with_delivery(campaign: WorkflowCampaign, activity_metadata: dict) -> dict:

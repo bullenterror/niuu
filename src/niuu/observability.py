@@ -379,6 +379,38 @@ _active_fingerprint: tuple[Any, ...] | None = None
 _active_component = ""
 _seen_components: set[str] = set()
 _current_component: ContextVar[str] = ContextVar("niuu_observability_component", default="")
+_previous_log_record_factory: Any | None = None
+_trace_log_correlation_enabled = False
+
+
+def enable_trace_log_correlation() -> None:
+    """Add active OpenTelemetry trace IDs to Python log records."""
+    global _previous_log_record_factory, _trace_log_correlation_enabled
+    if _trace_log_correlation_enabled:
+        return
+    previous = logging.getLogRecordFactory()
+
+    def record_factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
+        record = previous(*args, **kwargs)
+        trace_id, span_id = _current_span_ids()
+        record.trace_id = trace_id
+        record.span_id = span_id
+        return record
+
+    _previous_log_record_factory = previous
+    logging.setLogRecordFactory(record_factory)
+    _trace_log_correlation_enabled = True
+
+
+def disable_trace_log_correlation() -> None:
+    """Restore the prior log-record factory."""
+    global _previous_log_record_factory, _trace_log_correlation_enabled
+    if not _trace_log_correlation_enabled:
+        return
+    if _previous_log_record_factory is not None:
+        logging.setLogRecordFactory(_previous_log_record_factory)
+    _previous_log_record_factory = None
+    _trace_log_correlation_enabled = False
 
 
 def _pipeline_fingerprint(config: ObservabilityConfig) -> tuple[Any, ...]:
@@ -529,6 +561,7 @@ def configure_observability(
     _active_fingerprint = fingerprint
     _active_component = component_name
     _seen_components.add(component_name)
+    enable_trace_log_correlation()
     atexit.register(_active.shutdown)
     logger.info(
         "Niuu OpenTelemetry enabled: traces=%s metrics=%s service=%s component=%s",
@@ -551,6 +584,7 @@ def shutdown_observability() -> None:
     _active_fingerprint = None
     _active_component = ""
     _seen_components.clear()
+    disable_trace_log_correlation()
 
 
 def instrument_fastapi_app(
@@ -879,9 +913,22 @@ async def _httpx_async_request_hook(span: Any, request_info: Any) -> None:
     _httpx_request_hook(span, request_info)
 
 
+def _current_span_ids() -> tuple[str, str]:
+    try:
+        from opentelemetry import trace
+    except ImportError:
+        return "", ""
+    context = trace.get_current_span().get_span_context()
+    if not context.is_valid:
+        return "", ""
+    return f"{context.trace_id:032x}", f"{context.span_id:016x}"
+
+
 __all__ = [
     "Observability",
     "configure_observability",
+    "disable_trace_log_correlation",
+    "enable_trace_log_correlation",
     "get_observability",
     "instrument_fastapi_app",
     "instrument_httpx_client",

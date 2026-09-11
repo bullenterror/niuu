@@ -19,6 +19,7 @@ from niuu.adapters.pat_revocation_middleware import PATRevocationMiddleware
 from niuu.adapters.postgres_integrations import PostgresIntegrationRepository
 from niuu.cors import apply_cors_middleware
 from niuu.domain.models import Principal
+from niuu.observability import enable_trace_log_correlation
 from niuu.ports.delivery import EvidenceAuthenticator
 from niuu.ports.integrations import IntegrationRepository
 from niuu.ports.workload_identity import WorkloadTokenIssuer
@@ -326,14 +327,24 @@ def _configure_logging(settings: Settings) -> None:
     level_name = settings.logging.level.upper()
     log_format = settings.logging.format.lower()
     level = getattr(logging, level_name, logging.INFO)
+    if settings.observability.enabled:
+        enable_trace_log_correlation()
 
     if log_format == "json":
-        fmt = (
-            '{"time":"%(asctime)s","level":"%(levelname)s",'
-            '"logger":"%(name)s","message":"%(message)s"}'
-        )
+        fields = [
+            '"time":"%(asctime)s"',
+            '"level":"%(levelname)s"',
+            '"logger":"%(name)s"',
+            '"message":"%(message)s"',
+        ]
+        if settings.observability.enabled:
+            fields.extend(['"trace_id":"%(trace_id)s"', '"span_id":"%(span_id)s"'])
+        fmt = "{" + ",".join(fields) + "}"
     else:
-        fmt = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        fmt = "%(asctime)s - %(name)s - %(levelname)s"
+        if settings.observability.enabled:
+            fmt += " - trace_id=%(trace_id)s span_id=%(span_id)s"
+        fmt += " - %(message)s"
 
     logging.basicConfig(
         level=level,
