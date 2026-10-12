@@ -115,3 +115,40 @@ def test_catalog_telegram_connections_get_a_channel_adapter():
 def test_invalid_delivery_configuration_fails_loudly(values):
     with pytest.raises(ValidationError):
         NotificationsConfig(**values)
+
+
+PUSH_SINK = {
+    "name": "push",
+    "adapter": "volundr.adapters.outbound.push_notification_sink.PushNotificationSink",
+}
+
+
+def test_needs_input_push_delivers_through_its_configured_sink():
+    settings = Settings(push={"enabled": True}, notifications={"sinks": [PUSH_SINK]})
+    assert settings.push.attention_sink == "push"
+    custom = Settings(
+        push={"enabled": True, "attention_sink": "phone"},
+        notifications={"sinks": [{**PUSH_SINK, "name": "phone"}]},
+    )
+    assert custom.push.attention_sink == "phone"
+
+
+@pytest.mark.parametrize(
+    ("push", "notifications", "match"),
+    [
+        ({"enabled": True}, {"sinks": []}, "notifications.sinks entry named 'push'"),
+        (
+            {"enabled": True, "attention_sink": "phone"},
+            {"sinks": [PUSH_SINK]},
+            "named 'phone'",
+        ),
+        ({"enabled": True}, {"enabled": False, "sinks": [PUSH_SINK]}, "notifications.enabled"),
+    ],
+)
+def test_needs_input_push_without_its_sink_fails_loudly(push, notifications, match):
+    with pytest.raises(ValidationError, match=match):
+        Settings(push=push, notifications=notifications)
+
+
+def test_push_off_needs_no_sink():
+    assert Settings(push={"enabled": False}).push.enabled is False

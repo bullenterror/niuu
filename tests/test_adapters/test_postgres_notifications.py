@@ -336,6 +336,16 @@ class TestRules:
         pool.execute.return_value = "DELETE 0"
         assert not await repo.delete("u", rule.id)
 
+    async def test_create_if_absent(self):
+        pool, _ = _pool()
+        repo = PostgresNotificationRuleRepository(pool)
+        rule = _rule()
+        pool.fetchrow.return_value = _rule_row(rule)
+        assert await repo.create_if_absent(rule) == rule
+        assert "ON CONFLICT (id) DO NOTHING" in pool.fetchrow.await_args.args[0]
+        pool.fetchrow.return_value = None
+        assert await repo.create_if_absent(rule) is None
+
 
 class TestOutbox:
     def test_rejects_invalid_configuration(self):

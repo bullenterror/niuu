@@ -96,7 +96,6 @@ def create_notification_delivery(
     credential_store: CredentialStorePort | None,
     device_repository: DeviceTokenRepository | None,
     push_channel: NotificationChannel | None,
-    attention_push_enabled: bool,
 ) -> NotificationDelivery | None:
     """Build the outbox dispatcher, or ``None`` when delivery is switched off.
 
@@ -112,7 +111,7 @@ def create_notification_delivery(
             config.dispatcher.enabled,
         )
         return None
-    dependencies: dict[str, Any] = {"attention_push_enabled": attention_push_enabled}
+    dependencies: dict[str, Any] = {}
     if device_repository is not None:
         dependencies["device_repository"] = device_repository
     if push_channel is not None:

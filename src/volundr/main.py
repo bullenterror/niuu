@@ -6,6 +6,7 @@ import logging
 import os
 from collections.abc import AsyncGenerator
 from contextlib import AsyncExitStack, asynccontextmanager
+from functools import partial
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -163,7 +164,6 @@ from volundr.domain.services import (
     TenantService,
     TokenService,
 )
-from volundr.domain.services.attention_notifier import PushAttentionNotifier
 from volundr.domain.services.communication_ingress import CommunicationIngressService
 from volundr.domain.services.credential import CredentialService
 from volundr.domain.services.credential_enrollment import CredentialEnrollmentService
@@ -275,16 +275,14 @@ def _create_notification_delivery(
     integration_repository: Any,
     credential_store: Any,
     device_repository: Any,
-    push_channel: Any,
-    attention_push_enabled: bool,
 ) -> NotificationDelivery | None:
     """Compose the outbox dispatcher (``notifications.dispatcher.enabled``).
 
-    A configured push sink reuses the needs-input push channel when push is on,
-    and otherwise builds its own from ``push.adapter``.
+    Push sinks deliver through the channel built from ``push.adapter``.
     """
     config = settings.notifications
-    if config.enabled and config.dispatcher.enabled and push_channel is None:
+    push_channel = None
+    if config.enabled and config.dispatcher.enabled:
         # A broken push.adapter is a configuration error: raise rather than run
         # delivery with every push rule quietly failing.
         push_channel = create_push_channel(settings)
@@ -296,7 +294,6 @@ def _create_notification_delivery(
         credential_store=credential_store,
         device_repository=device_repository,
         push_channel=push_channel,
-        attention_push_enabled=attention_push_enabled,
     )
 
 
@@ -801,24 +798,6 @@ def create_app(
                 sleipnir_publisher=sleipnir_bus,
             )
 
-            # Push / attention notifier (optional — enabled via push.enabled).
-            # Fans a "session needs you" push out to the owner's devices when a
-            # session enters awaiting_input.
-            attention_notifier = None
-            push_channel = None
-            if settings.push.enabled:
-                # push.enabled with a channel that cannot be built is fatal.
-                push_channel = create_push_channel(settings)
-                attention_notifier = PushAttentionNotifier(
-                    device_repository,
-                    push_channel,
-                    min_urgency=settings.push.min_urgency,
-                )
-                logger.info(
-                    "Push notifications enabled: adapter=%s",
-                    settings.push.adapter.rsplit(".", 1)[-1],
-                )
-
             # Create services with broadcaster for real-time updates
             # Forge catalog (launch specs + session definitions), built via the
             # shared `build_catalog` builder. The repository enables user-scope CRUD.
@@ -1041,9 +1020,20 @@ def create_app(
                 integration_repository=integration_repo,
                 credential_store=credential_store,
                 device_repository=device_repository,
-                push_channel=push_channel,
-                attention_push_enabled=attention_notifier is not None,
             )
+            # push.enabled: an owner registering a device gets the "Needs-input
+            # pushes" rule, so the outbox pushes each session that needs them.
+            on_device_registered = None
+            if settings.push.enabled:
+                on_device_registered = partial(
+                    notification_service.ensure_attention_push_rule,
+                    sink=settings.push.attention_sink,
+                )
+                logger.info(
+                    "Needs-input pushes on: through sink %r (adapter=%s)",
+                    settings.push.attention_sink,
+                    settings.push.adapter.rsplit(".", 1)[-1],
+                )
             app.state.notification_dispatcher = (
                 notification_delivery.dispatcher if notification_delivery is not None else None
             )
@@ -1131,7 +1121,6 @@ def create_app(
                 communication_route_repository=communication_route_repository,
                 public_origin=public_origin,
                 session_communication_port=session_room_port,
-                attention_notifier=attention_notifier,
                 runtime_backend=runtime_backend,
                 execution_resolver=pod_manager if execution_components is not None else None,
                 span_repository=span_repository,
@@ -1440,6 +1429,7 @@ def create_app(
                 archive_service=archive_service,
                 external_session_service=external_session_service,
                 device_repository=device_repository,
+                on_device_registered=on_device_registered,
                 prefix="/api/v1/forge",
                 server_public_host=settings.server_public_host,
                 openshell_internal_gateway_url=settings.openshell_internal_gateway_url,

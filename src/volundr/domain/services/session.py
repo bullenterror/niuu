@@ -43,7 +43,6 @@ from volundr.domain.models import (
     TenantRole,
 )
 from volundr.domain.ports import (
-    AttentionNotifier,
     AuthorizationPort,
     ChronicleRepository,
     CommunicationRouteRepository,
@@ -169,7 +168,6 @@ class SessionService:
         sleipnir_publisher: object | None = None,
         communication_route_repository: CommunicationRouteRepository | None = None,
         session_communication_port: SessionCommunicationPort | None = None,
-        attention_notifier: AttentionNotifier | None = None,
         runtime_backend: str = "kubernetes",
         execution_resolver: SessionExecutionResolver | None = None,
         public_origin: str = "http://localhost:8080",
@@ -192,8 +190,6 @@ class SessionService:
         self._provisioning_initial_delay = provisioning_initial_delay
         self._provisioning_tasks: dict[UUID, asyncio.Task] = {}
         self._activity_stop_tasks: set[asyncio.Task[None]] = set()
-        self._attention_notify_tasks: set[asyncio.Task[None]] = set()
-        self._attention_notifier = attention_notifier
         self._integration_repo = integration_repo
         self._storage = storage
         self._chronicle_repository = chronicle_repository
@@ -571,36 +567,11 @@ class SessionService:
                     )
                 )
 
-        # Fan a push out to the owner's devices off the activity hot-path (a slow
-        # APNs/webhook call must not delay Skuld's activity report response).
-        if is_new_attention and self._attention_notifier is not None:
-            self._schedule_attention_notify(updated, metadata)
-
+        # The owner's push for a new request is the attention item recorded above:
+        # the notification outbox delivers it through their "Needs-input pushes" rule.
         if self._should_auto_stop_after_activity(updated, state, metadata):
             self._schedule_activity_stop(updated.id)
         return updated
-
-    def _schedule_attention_notify(self, session: Session, metadata: dict) -> None:
-        """Dispatch a needs-input push in the background, tracking the task."""
-        task = asyncio.create_task(
-            self._attention_notifier.notify_needs_input(
-                session,
-                kind=metadata.get("kind", "question"),
-                prompt=metadata.get("prompt", "") or "",
-                request_id=metadata.get("request_id", "") or "",
-            ),
-            name=f"attention-notify-{session.id}",
-        )
-        self._attention_notify_tasks.add(task)
-        task.add_done_callback(self._attention_notify_tasks.discard)
-        task.add_done_callback(self._report_attention_notify_failure)
-
-    @staticmethod
-    def _report_attention_notify_failure(task: asyncio.Task) -> None:
-        """Surface a failed needs-input push: it runs detached, so nothing else would."""
-        if task.cancelled() or task.exception() is None:
-            return
-        logger.error("Needs-input push failed (%s)", task.get_name(), exc_info=task.exception())
 
     async def _settle_attention_feed(
         self,

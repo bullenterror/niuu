@@ -32,7 +32,6 @@ def build(settings: Settings, **overrides):
         "credential_store": MagicMock(),
         "device_repository": MagicMock(),
         "push_channel": LoggingNotificationChannel(),
-        "attention_push_enabled": True,
     }
     values.update(overrides)
     return create_notification_delivery(settings, MagicMock(), **values)
@@ -63,7 +62,6 @@ async def test_builds_sinks_resolver_and_dispatcher_from_config():
     phone = delivery.sinks._sinks["phone"]  # noqa: SLF001
     assert isinstance(ops, WebhookNotificationSink)
     assert isinstance(phone, PushNotificationSink)
-    assert phone._attention_push_enabled is True  # noqa: SLF001
     assert isinstance(delivery.sinks._resolver, IntegrationSinkResolver)  # noqa: SLF001
     assert delivery.dispatcher._settings.batch_size == 7  # noqa: SLF001
     assert delivery.dispatcher._renderer._base == "https://forge.example.com"  # noqa: SLF001
@@ -128,8 +126,6 @@ def test_main_builds_a_push_channel_for_push_sinks():
         integration_repository=None,
         credential_store=None,
         device_repository=MagicMock(),
-        push_channel=None,
-        attention_push_enabled=False,
     )
     assert delivery.sinks.names == ["phone"]
 
@@ -145,6 +141,4 @@ def test_main_builds_a_push_channel_for_push_sinks():
             integration_repository=None,
             credential_store=None,
             device_repository=MagicMock(),
-            push_channel=None,
-            attention_push_enabled=False,
         )

@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, time
 from enum import StrEnum
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -394,6 +394,31 @@ class NotificationRule(NotificationRuleSpec):
     owner_id: str
     created_at: datetime
     updated_at: datetime
+
+
+#: Namespace of the per-owner needs-input push rule ids (see ``attention_push_rule``).
+_ATTENTION_PUSH_RULE_NAMESPACE = UUID("5b0c9d6e-3f1a-4c7e-9a2b-8d4e6f1a7c3b")
+ATTENTION_PUSH_RULE_NAME = "Needs-input pushes"
+
+
+def attention_push_rule(owner_id: str, sink: str, now: datetime) -> NotificationRule:
+    """The rule that pushes an owner every "session needs you" moment (``push.enabled``).
+
+    Its id is derived from the owner, so provisioning it twice (two devices
+    registering at once) creates one rule. It selects only the attention items
+    Forge raises itself, which is what the needs-input push always covered.
+    """
+    return NotificationRule(
+        id=uuid5(_ATTENTION_PUSH_RULE_NAMESPACE, owner_id),
+        owner_id=owner_id,
+        name=ATTENTION_PUSH_RULE_NAME,
+        match=NotificationRuleMatch(
+            kinds=[NotificationKind.ATTENTION], sources=[NotificationSource.SYSTEM]
+        ),
+        sink=sink,
+        created_at=now,
+        updated_at=now,
+    )
 
 
 def rules_matching(

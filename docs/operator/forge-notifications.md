@@ -286,19 +286,29 @@ notifications:
       label: Forge app push
       adapter: volundr.adapters.outbound.push_notification_sink.PushNotificationSink
       max_body_chars: 280                  # optional
+push:
+  enabled: true                            # the needs-input push (below)
+  attention_sink: push                     # default; must name a notifications.sinks entry
+  adapter: volundr.adapters.outbound.push_channels.ApnsNotificationChannel
+  kwargs: {team_id: ABCDE12345, key_id: KEY1234567, bundle_id: com.niuu.forge}
+  secret_kwargs_env: {private_key: APNS_PRIVATE_KEY}
 ```
 
 The push sink delivers through the channel configured under `push:` (APNs, the webhook
-relay, or the logging default) to the devices the owner registered. It uses that
-channel even when `push.enabled` is false, so you can offer push rules without the
-automatic needs-input push.
+relay, or the logging default) to the devices the owner registered. A rule that
+targets it is the only way a notification reaches a phone.
 
-The existing needs-input push (`PushAttentionNotifier`, `push.enabled`) is unchanged. It
-still pushes every "session needs you" moment as it happens. To avoid a second push for
-the same moment, the push sink **suppresses** `attention` notifications raised by Forge
-itself (`source: system`) while `push.enabled` is on. Agent-raised `attention`
-notifications and every other kind are pushed. A rule that targets the push sink is the
-only way other notifications reach a phone.
+**Needs-input push.** With `push.enabled`, the "session needs you" push is delivered by
+this outbox like any other notification, so it is retried, recorded per delivery, and
+honours quiet hours and rate limits. When an owner registers a device
+(`POST /api/v1/forge/devices`), Forge gives them a **Needs-input pushes** rule:
+`attention` notifications raised by Forge itself (`source: system`) → the sink named by
+`push.attention_sink`. Forge adds it only when the owner has no rule for that sink yet
+(enabled or not), so owners opt out by disabling it and keep any rule they made
+themselves. If the rule cannot be added, the registration answers 500 and the app
+registers again. `push.enabled` needs `notifications.enabled` and the named sink; Forge
+refuses to start without them. Delivery runs on every host where
+`notifications.dispatcher.enabled` is on.
 
 APNs results: delivered if at least one device accepted. It is retryable when every
 device failed transiently (429/5xx, network). It is `dead` when the owner has no iOS

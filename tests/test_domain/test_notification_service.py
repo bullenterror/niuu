@@ -278,6 +278,7 @@ class TestAttention:
         assert first.title == "fix-auth needs your input" and first.body == "Which DB?"
         assert first.metadata == {"input_kind": "question", "request_id": "q1"}
         assert first.session_seq is None
+        assert second.body == "The agent needs permission to continue"  # no prompt
         assert len(broadcaster.events) == 2
 
     async def test_long_names_and_prompts_are_bounded(self):
@@ -291,6 +292,57 @@ class TestAttention:
             request_id="",
         )
         assert len(created.title) == 200 and len(created.body) == 4000
+
+
+class TestAttentionPushRule:
+    """push.enabled: the needs-input push is an owner rule the outbox delivers."""
+
+    async def test_registering_owner_gets_one_rule_for_system_attention(self):
+        service, store = _service()
+        created = await service.ensure_attention_push_rule("owner-a", sink="ops")
+        assert created.name == "Needs-input pushes" and created.sink == "ops"
+        assert created.enabled and created.owner_id == "owner-a"
+        assert created.match.kinds == ["attention"] and created.match.sources == ["system"]
+        assert await service.ensure_attention_push_rule("owner-a", sink="ops") is None
+        assert list(store.rules) == [created.id]
+
+        other = await service.ensure_attention_push_rule("owner-b", sink="ops")
+        assert other.id != created.id
+
+    async def test_an_owner_who_already_routes_to_the_sink_keeps_their_rules(self):
+        service, store = _service()
+        own = await service.create_rule(
+            OWNER, NotificationRuleSpec(name="mine", sink="ops", enabled=False)
+        )
+        assert await service.ensure_attention_push_rule("owner-a", sink="ops") is None
+        assert list(store.rules) == [own.id]
+
+    async def test_concurrent_registrations_create_one_rule(self):
+        service, store = _service()
+        rule = await service.ensure_attention_push_rule("owner-a", sink="ops")
+        # A second registration that raced past the existence check.
+        assert await store.rule_repo.create_if_absent(rule) is None
+        assert len(store.rules) == 1
+
+    async def test_unconfigured_sink_is_refused(self):
+        service, _ = _service()
+        with pytest.raises(NotificationValidationError, match="'push' is not configured"):
+            await service.ensure_attention_push_rule("owner-a", sink="push")
+
+    async def test_needs_input_is_scheduled_for_delivery_through_the_rule(self):
+        service, store = _service()
+        rule = await service.ensure_attention_push_rule("owner-a", sink="ops")
+        session = _session()
+        attention = await service.record_attention(
+            session,
+            state_since=datetime.now(UTC),
+            kind="question",
+            prompt="Which DB?",
+            request_id="q1",
+        )
+        [delivery] = store.deliveries.values()
+        assert (delivery.notification_id, delivery.rule_id) == (attention.id, rule.id)
+        assert delivery.sink == "ops"
 
 
 class TestAttentionRetirement:

@@ -755,25 +755,6 @@ class NotificationChannel(ABC):
         return f"handed to {type(self).__name__}"
 
 
-class AttentionNotifier(ABC):
-    """Port the session service calls when a session needs the user.
-
-    Decouples session logic from the push delivery mechanism: the session
-    service emits the intent, an adapter resolves devices and dispatches.
-    """
-
-    @abstractmethod
-    async def notify_needs_input(
-        self,
-        session: Session,
-        *,
-        kind: str,
-        prompt: str,
-        request_id: str,
-    ) -> None:
-        """Alert the session owner that the session is blocked awaiting them."""
-
-
 class LaunchSpecProvider(ABC):
     """Read port for system-scope launch specs (config-seeded, read-only)."""
 

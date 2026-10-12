@@ -104,11 +104,10 @@ class TestBuildSinks:
                 "adapter": "volundr.adapters.outbound.push_notification_sink.PushNotificationSink",
                 "max_body_chars": 100,
             },
-            {"device_repository": devices, "push_channel": channel, "attention_push_enabled": True},
+            {"device_repository": devices, "push_channel": channel},
         )
         assert isinstance(sink, PushNotificationSink)
         assert sink._devices is devices and sink._channel is channel  # noqa: SLF001
-        assert sink._attention_push_enabled is True  # noqa: SLF001
 
     def test_non_sink_classes_are_rejected(self):
         with pytest.raises(TypeError, match="not a NotificationSink"):

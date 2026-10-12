@@ -491,6 +491,22 @@ class PostgresNotificationRuleRepository(NotificationRuleRepository):
         )
         return row_to_rule(row)
 
+    async def create_if_absent(self, rule: NotificationRule) -> NotificationRule | None:
+        row = await self._pool.fetchrow(
+            """INSERT INTO forge_notification_rules
+                   (id, owner_id, name, enabled, match, sink, integration_connection_id,
+                    config, quiet_hours, created_at, updated_at)
+               VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8::jsonb, $9::jsonb, $10, $11)
+               ON CONFLICT (id) DO NOTHING
+               RETURNING *""",
+            *_rule_args(rule),
+            rule.created_at,
+            rule.updated_at,
+        )
+        if row is None:
+            return None
+        return row_to_rule(row)
+
     async def update(self, rule: NotificationRule) -> NotificationRule | None:
         row = await self._pool.fetchrow(
             """UPDATE forge_notification_rules

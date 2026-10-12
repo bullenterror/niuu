@@ -657,8 +657,6 @@ class TestLifespan:
         delivery.stop.assert_awaited_once()
         assert captured["pool"] is mock_pool
         assert captured["public_origin"] == "https://forge.example.com"
-        assert captured["attention_push_enabled"] is False
-        assert captured["push_channel"] is None
         assert captured["settings"].notifications.dispatcher.enabled is True
 
 

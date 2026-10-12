@@ -10,7 +10,7 @@ Named sinks come from ``notifications.sinks`` with the dynamic adapter rule::
 
 The sink receives ``name`` plus its kwargs. Volundr also passes the
 dependencies a sink's constructor asks for by name (for the push sink:
-``device_repository``, ``push_channel`` and ``attention_push_enabled``). A sink
+``device_repository`` and ``push_channel``). A sink
 that fails to build stops startup: a configured sink is never silently left out.
 """
 

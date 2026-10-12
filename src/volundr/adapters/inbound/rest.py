@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import time
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path as FilePath
 from typing import Any, Literal
@@ -1628,6 +1629,7 @@ def create_router(
     *,
     external_session_service: ExternalSessionService | None = None,
     device_repository: DeviceTokenRepository | None = None,
+    on_device_registered: Callable[[str], Awaitable[object]] | None = None,
     prefix: str = "/api/v1/forge",
     server_public_host: str = "127.0.0.1",
     openshell_internal_gateway_url: str = DEFAULT_OPENSHELL_INTERNAL_GATEWAY_URL,
@@ -2727,7 +2729,9 @@ def create_router(
         """Register a push device for the authenticated user.
 
         The iOS app/widget calls this so a session that needs attention can fan
-        a push out to it. Idempotent on (owner, token).
+        a push out to it. Idempotent on (owner, token). With ``push.enabled`` it
+        also gives the owner the "Needs-input pushes" rule; when that fails the
+        registration answers 500 so the app registers again.
         """
         if device_repository is None:
             raise HTTPException(
@@ -2754,6 +2758,8 @@ def create_router(
             app_bundle_id=data.app_bundle_id,
         )
         stored = await device_repository.upsert(device)
+        if on_device_registered is not None:
+            await on_device_registered(principal.user_id)
         return DeviceResponse.from_device(stored)
 
     @router.get(

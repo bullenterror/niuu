@@ -270,6 +270,14 @@ async def test_rule_crud_round_trips_json_columns(pool):
     assert await rules.list_for_owner("owner-a") == []
 
 
+async def test_create_if_absent_keeps_the_first_rule(pool):
+    rules = PostgresNotificationRuleRepository(pool)
+    first = rule()
+    assert (await rules.create_if_absent(first)).id == first.id
+    assert await rules.create_if_absent(first.model_copy(update={"name": "second"})) is None
+    assert [r.name for r in await rules.list_for_owner("owner-a")] == [first.name]
+
+
 async def test_outbox_claim_lease_fence_and_settle(pool):
     repo = PostgresNotificationRepository(pool)
     rules = PostgresNotificationRuleRepository(pool)

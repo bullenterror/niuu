@@ -111,6 +111,10 @@ class NotificationRuleRepository(ABC):
         """Persist a new rule."""
 
     @abstractmethod
+    async def create_if_absent(self, rule: NotificationRule) -> NotificationRule | None:
+        """Persist ``rule`` unless one with its id exists; ``None`` when it did."""
+
+    @abstractmethod
     async def update(self, rule: NotificationRule) -> NotificationRule | None:
         """Replace an owner's rule; ``None`` when it no longer exists."""
 

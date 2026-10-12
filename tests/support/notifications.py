@@ -195,6 +195,12 @@ class InMemoryNotificationRuleRepository(NotificationRuleRepository):
         self.rules[rule.id] = rule
         return rule
 
+    async def create_if_absent(self, rule: NotificationRule) -> NotificationRule | None:
+        if rule.id in self.rules:
+            return None
+        self.rules[rule.id] = rule
+        return rule
+
     async def update(self, rule: NotificationRule) -> NotificationRule | None:
         current = self.rules.get(rule.id)
         if current is None or current.owner_id != rule.owner_id:

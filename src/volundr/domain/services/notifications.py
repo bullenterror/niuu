@@ -50,6 +50,7 @@ from volundr.domain.notifications import (
     NotificationScope,
     NotificationSinkInfo,
     NotificationValidationError,
+    attention_push_rule,
 )
 from volundr.domain.ports import EventBroadcaster, IntegrationRepository
 from volundr.domain.session_read_state import is_final_output
@@ -94,6 +95,15 @@ def _bounded(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[: max(limit - 1, 0)].rstrip() + "…"
+
+
+#: Body of an attention item whose request carries no prompt (it is also the push body).
+_DEFAULT_ATTENTION_PROMPTS = {
+    "question": "The agent is asking you a question",
+    "confirmation": "The agent needs your confirmation",
+    "permission": "The agent needs permission to continue",
+}
+_DEFAULT_ATTENTION_PROMPT = "The agent needs your attention"
 
 
 def attention_dedupe_key(session_id: UUID, state_since: datetime, request_id: str) -> str:
@@ -224,7 +234,10 @@ class NotificationService(NotificationRecorder):
             kind=NotificationKind.ATTENTION,
             severity=NotificationSeverity.WARNING,
             title=_bounded(f"{context.session_name} needs your input", MAX_TITLE_CHARS),
-            body=_bounded(prompt.strip(), MAX_BODY_CHARS),
+            body=_bounded(
+                prompt.strip() or _DEFAULT_ATTENTION_PROMPTS.get(kind, _DEFAULT_ATTENTION_PROMPT),
+                MAX_BODY_CHARS,
+            ),
         )
         candidate = self._candidate(
             context,
@@ -468,6 +481,25 @@ class NotificationService(NotificationRecorder):
         if await self._messaging_connections(principal):
             sinks.append(INTEGRATION_SINK)
         return sinks
+
+    async def ensure_attention_push_rule(self, owner_id: str, sink: str) -> NotificationRule | None:
+        """Give ``owner_id`` the needs-input push rule unless they already route to ``sink``.
+
+        Called when an owner registers a device while ``push.enabled`` is on. Any
+        existing rule naming ``sink``, enabled or not, means the owner has decided
+        how pushes reach them, so nothing is added; disabling the rule is how an
+        owner opts out. Returns the rule it created, if any.
+        """
+        if sink not in {info.name for info in self._sinks}:
+            raise NotificationValidationError(
+                f"Sink {sink!r} is not configured; add it under notifications.sinks"
+            )
+        existing = await self._rules.list_for_owner(owner_id)
+        if any(rule.sink == sink for rule in existing):
+            return None
+        return await self._rules.create_if_absent(
+            attention_push_rule(owner_id, sink, datetime.now(UTC))
+        )
 
     async def list_rules(self, principal: Principal) -> list[NotificationRule]:
         return await self._rules.list_for_owner(principal.user_id)

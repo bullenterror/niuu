@@ -764,18 +764,22 @@ class SleipnirConfig(BaseModel):
 
 
 class PushNotificationConfig(BaseModel):
-    """Push / attention notification fan-out (optional).
+    """The push channel, and the needs-input push (optional).
 
-    When enabled, a session entering ``awaiting_input`` dispatches a push to the
-    owner's registered devices through the configured NotificationChannel
-    adapter. Off by default; the default adapter only logs.
+    ``adapter`` + ``kwargs`` build the NotificationChannel that push sinks deliver
+    through (the default adapter only logs). With ``enabled``, every owner who
+    registers a device gets a "Needs-input pushes" delivery rule targeting
+    ``attention_sink``, so each session entering ``awaiting_input`` is pushed
+    through the notification outbox (retried, recorded, quiet hours honoured).
+    That needs ``notifications.enabled`` and a ``notifications.sinks`` entry
+    named ``attention_sink``.
 
     Example YAML::
 
         push:
           enabled: true
+          attention_sink: push
           adapter: "volundr.adapters.outbound.push_channels.ApnsNotificationChannel"
-          min_urgency: 0.8
           kwargs:
             team_id: "ABCDE12345"
             key_id: "KEY1234567"
@@ -786,7 +790,14 @@ class PushNotificationConfig(BaseModel):
 
     enabled: bool = Field(
         default=False,
-        description="Enable push notifications for sessions that need attention.",
+        description=(
+            "Push every session that needs its owner: give each owner who registers a "
+            "device a delivery rule for it (needs notifications.enabled)."
+        ),
+    )
+    attention_sink: str = Field(
+        default="push",
+        description="The notifications.sinks entry the needs-input push rule delivers through.",
     )
     adapter: str = Field(
         default="volundr.adapters.outbound.push_channels.LoggingNotificationChannel",
@@ -796,12 +807,6 @@ class PushNotificationConfig(BaseModel):
     secret_kwargs_env: dict[str, str] = Field(
         default_factory=dict,
         description="Mapping of kwarg names to env var names holding secret values.",
-    )
-    min_urgency: float = Field(
-        default=0.8,
-        ge=0.0,
-        le=1.0,
-        description="Drop pushes below this urgency.",
     )
 
 
@@ -2736,6 +2741,26 @@ class Settings(BaseSettings):
         if value:
             LLMConfig.model_validate(value)
         return value
+
+    @model_validator(mode="after")
+    def _needs_input_push_has_its_sink(self) -> "Settings":
+        """``push.enabled`` delivers through the outbox; refuse it without one."""
+        if not self.push.enabled:
+            return self
+        if not self.notifications.enabled:
+            raise ValueError(
+                "push.enabled delivers needs-input pushes through notifications; set "
+                "notifications.enabled: true, or push.enabled: false"
+            )
+        sink_names = {sink.get("name") for sink in self.notifications.sinks}
+        if self.push.attention_sink not in sink_names:
+            raise ValueError(
+                f"push.enabled needs a notifications.sinks entry named "
+                f"{self.push.attention_sink!r} (push.attention_sink), e.g. adapter "
+                "volundr.adapters.outbound.push_notification_sink.PushNotificationSink; "
+                "or set push.enabled: false"
+            )
+        return self
 
     @model_validator(mode="after")
     def _merge_built_in_session_definitions(self) -> "Settings":

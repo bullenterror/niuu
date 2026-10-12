@@ -19,10 +19,7 @@ from volundr.adapters.outbound.push_channels import (
     LoggingNotificationChannel,
     WebhookNotificationChannel,
 )
-from volundr.adapters.outbound.push_notification_sink import (
-    ATTENTION_ALREADY_PUSHED,
-    PushNotificationSink,
-)
+from volundr.adapters.outbound.push_notification_sink import PushNotificationSink
 from volundr.domain.models import DevicePlatform, DeviceToken, PushMessage
 from volundr.domain.ports import DeviceTokenRepository, NotificationChannel
 
@@ -129,21 +126,17 @@ class TestPushSink:
             await sink.send(outbound(owner_id=""))
         assert not info.value.retryable
 
-    def test_system_attention_is_not_pushed_twice_when_attention_push_is_on(self):
-        on = PushNotificationSink(
-            device_repository=Devices([]),
-            push_channel=RecordingChannel(),
-            attention_push_enabled=True,
-        )
-        off = PushNotificationSink(device_repository=Devices([]), push_channel=RecordingChannel())
+    async def test_system_attention_is_pushed(self):
+        """The needs-input push is the outbox delivering Forge's own attention item."""
+        channel = RecordingChannel()
+        sink = PushNotificationSink(device_repository=Devices([ios()]), push_channel=channel)
         system_attention = outbound(
             kind=NotificationKind.ATTENTION, source=NotificationSource.SYSTEM
         )
-        agent_attention = outbound(kind=NotificationKind.ATTENTION)
-        assert on.skip_reason(system_attention) == ATTENTION_ALREADY_PUSHED
-        assert on.skip_reason(agent_attention) is None
-        assert on.skip_reason(outbound()) is None
-        assert off.skip_reason(system_attention) is None
+        assert sink.skip_reason(system_attention) is None
+        await sink.send(system_attention)
+        [(push, devices)] = channel.delivered
+        assert push.kind == "attention" and len(devices) == 1
 
     async def test_channel_failures_propagate(self):
         channel = MagicMock(spec=NotificationChannel)
