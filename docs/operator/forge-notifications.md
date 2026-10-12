@@ -326,7 +326,7 @@ bot tokens, webhook paths or secrets.
 | Rows stay `pending` | The dispatcher is off (`notifications.dispatcher.enabled`), or no Forge host with access to this database is running. |
 | `suppressed`: "Quiet hours …" | Expected inside the rule's window. Raise the notification's severity, or change `allow_min_severity`. |
 | `suppressed`: "Rate limit …" | The rule reached `config.rate_limit`, or the default of 60/hour. Raise it on the rule. |
-| `failed`: "Sink 'x' is not configured on this host" | The rule names a sink missing from `notifications.sinks`, or it failed to build. Check the startup log for "Notification sink … could not be built" and restart once it is fixed. |
+| `failed`: "Sink 'x' is not configured on this host" | The rule names a sink missing from `notifications.sinks`. Add it and restart. (A configured sink that fails to build stops Forge at startup with "Notification sink … could not be built".) |
 | `dead`: "Integration connection … is disabled / was not found" | The user disabled or deleted the integration. Re-enable it, or point the rule at another connection. |
 | `dead`: "Credential '…' … was not found" | The integration's credential was deleted. Re-enter it in Settings → Integrations. |
 | `dead`: "Telegram Bot API returned HTTP 401/403/400" | Wrong bot token, bot not in the chat, or wrong chat id. |
@@ -384,7 +384,7 @@ notifications:
 Sink names use lowercase letters, digits, `.`, `_` and `-`. `integration` is reserved.
 Every key of a sink entry except `label`, `adapter` and `secret_kwargs_env` is passed to
 the adapter. `secret_kwargs_env` maps a kwarg to the environment variable that holds its
-value. A sink that cannot be built is logged at startup and skipped. In Helm, set
+value. A sink that cannot be built stops Forge at startup, naming the entry. In Helm, set
 `notifications:` in `values.yaml` (it is rendered verbatim into the Volundr config) and
 mount sink secrets with `extraEnv`. `GET /api/v1/forge/feature-flags` reports
 `notifications_enabled` and `capabilities.notifications`.

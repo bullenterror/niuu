@@ -317,13 +317,31 @@ def test_module_entry_point(fake_broker, token_file, monkeypatch) -> None:
     monkeypatch.setattr(
         sys,
         "argv",
-        ["skuld.forge_mcp", "--broker-url", fake_broker.url, "--token-file", str(token_file)],
+        [
+            "skuld.forge_mcp",
+            "--broker-url",
+            fake_broker.url,
+            "--token-file",
+            str(token_file),
+            "--timeout",
+            "5",
+            "--max-concurrency",
+            "2",
+        ],
     )
     with pytest.raises(SystemExit) as excinfo:
         runpy.run_module("skuld.forge_mcp", run_name="__main__")
     assert excinfo.value.code == 0
     stdout.flush()
     assert json.loads(stdout.buffer.getvalue()) == {"jsonrpc": "2.0", "id": 1, "result": {}}
+
+
+def test_timeout_and_concurrency_have_no_hidden_defaults(token_file, capsys) -> None:
+    """The broker always passes its configured values; there is no second default."""
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--broker-url", "http://127.0.0.1:1", "--token-file", str(token_file)])
+    assert excinfo.value.code == 2
+    assert "--timeout" in capsys.readouterr().err
 
 
 class TestSubprocess:

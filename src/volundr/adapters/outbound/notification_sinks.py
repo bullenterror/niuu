@@ -11,8 +11,7 @@ Named sinks come from ``notifications.sinks`` with the dynamic adapter rule::
 The sink receives ``name`` plus its kwargs. Volundr also passes the
 dependencies a sink's constructor asks for by name (for the push sink:
 ``device_repository``, ``push_channel`` and ``attention_push_enabled``). A sink
-that fails to build is logged and left out; rules naming it retry until it is
-fixed or they run out of attempts.
+that fails to build stops startup: a configured sink is never silently left out.
 """
 
 from __future__ import annotations
@@ -33,6 +32,15 @@ from volundr.domain.notifications import NotificationRule
 
 logger = logging.getLogger(__name__)
 
+
+class NotificationSinkBuildError(RuntimeError):
+    """A configured ``notifications.sinks`` entry could not be built."""
+
+
+class NotificationSinkSpecError(TypeError):
+    """A sink entry is wrong before its constructor runs; the message holds no secrets."""
+
+
 #: Config-entry keys that describe the sink rather than being passed to it.
 _ENTRY_KEYS = frozenset({"label", "adapter", "secret_kwargs_env"})
 
@@ -51,16 +59,34 @@ def build_sink(entry: Mapping[str, Any], dependencies: Mapping[str, Any]) -> Not
     """Build one configured sink from its ``notifications.sinks`` entry."""
     cls = import_class(str(entry["adapter"]))
     if not isinstance(cls, type) or not issubclass(cls, NotificationSink):
-        raise TypeError(f"{entry['adapter']} is not a NotificationSink")
+        raise NotificationSinkSpecError(f"{entry['adapter']} is not a NotificationSink")
     kwargs = {key: value for key, value in entry.items() if key not in _ENTRY_KEYS}
     kwargs = resolve_secret_kwargs(kwargs, dict(entry.get("secret_kwargs_env") or {}))
-    return cls(**{**_requested(cls, dependencies), **kwargs})
+    arguments = {**_requested(cls, dependencies), **kwargs}
+    missing = _missing_required(cls, arguments)
+    if missing:
+        raise NotificationSinkSpecError(
+            f"{entry['adapter']} is missing required arguments: {', '.join(missing)}"
+        )
+    return cls(**arguments)
+
+
+def _missing_required(cls: type, arguments: Mapping[str, Any]) -> list[str]:
+    """Required keyword parameters of ``cls`` that ``arguments`` does not supply."""
+    return [
+        name
+        for name, parameter in inspect.signature(cls).parameters.items()
+        if parameter.default is inspect.Parameter.empty
+        and parameter.kind
+        in (inspect.Parameter.KEYWORD_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        and name not in arguments
+    ]
 
 
 def build_configured_sinks(
     entries: list[dict[str, Any]], dependencies: Mapping[str, Any]
 ) -> dict[str, NotificationSink]:
-    """Build every configured sink; one that fails is logged and skipped."""
+    """Build every configured sink; one that fails to build raises."""
     sinks: dict[str, NotificationSink] = {}
     for entry in entries:
         name = str(entry["name"])
@@ -68,14 +94,16 @@ def build_configured_sinks(
         try:
             sinks[name] = build_sink(entry, dependencies)
         except Exception as exc:
-            # Only the type: a constructor error can echo a secret kwarg's value.
-            logger.error(
-                "Notification sink %r (%s) could not be built: %s",
-                name,
-                adapter.rsplit(".", 1)[-1],
-                type(exc).__name__,
-            )
-            continue
+            # A constructor error can echo a secret kwarg's value: only the type
+            # is reported and its chain is dropped. Import and pre-construction
+            # errors name only the adapter path and parameters, so they are kept.
+            safe = isinstance(exc, (NotificationSinkSpecError, ImportError, AttributeError))
+            detail = str(exc) if safe else ""
+            raise NotificationSinkBuildError(
+                f"Notification sink {name!r} ({adapter}) could not be built: "
+                f"{type(exc).__name__}{': ' + detail if detail else ''}. Fix or remove its "
+                "notifications.sinks entry, or set notifications.dispatcher.enabled: false."
+            ) from None
         logger.info("Notification sink %r: %s", name, adapter.rsplit(".", 1)[-1])
     return sinks
 
@@ -122,8 +150,12 @@ class ConfiguredNotificationSinks(NotificationSinkProvider):
         await sink.close()
 
     async def close(self) -> None:
-        for name, sink in self._sinks.items():
+        """Close every named sink, then raise every close failure together."""
+        failures: list[Exception] = []
+        for sink in self._sinks.values():
             try:
                 await sink.close()
-            except Exception:
-                logger.warning("Closing notification sink %r failed", name, exc_info=True)
+            except Exception as exc:
+                failures.append(exc)
+        if failures:
+            raise ExceptionGroup("Closing notification sinks failed", failures)

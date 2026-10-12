@@ -81,10 +81,25 @@ data:
 
     notifications: {{ toJson . }}
     {{- end }}
-    {{- with .Values.forgeMcp }}
-
-    forge_mcp: {{ toJson . }}
+    {{- /*
+    Forge session credentials need a signing key. The pod's root filesystem is
+    read-only, so the local key-file issuer cannot work here: unless forgeMcp sets
+    session_tokens.enabled explicitly, they are on only when workload identity
+    signs with a configured key. Volundr refuses to start when they are enabled
+    without a usable key.
+    */}}
+    {{- $forgeMcp := deepCopy (.Values.forgeMcp | default dict) }}
+    {{- $sessionTokens := get $forgeMcp "session_tokens" | default dict }}
+    {{- if not (hasKey $sessionTokens "enabled") }}
+    {{- $workloadSigns := false }}
+    {{- if and .Values.workloadIdentity.enabled .Values.workloadIdentity.signingKey.existingSecret }}
+    {{- $workloadSigns = true }}
     {{- end }}
+    {{- $_ := set $sessionTokens "enabled" $workloadSigns }}
+    {{- end }}
+    {{- $_ := set $forgeMcp "session_tokens" $sessionTokens }}
+
+    forge_mcp: {{ toJson $forgeMcp }}
 
     pod_manager:
       adapter: {{ .Values.podManager.adapter | quote }}

@@ -221,20 +221,25 @@ async def test_store_outage_asks_the_producer_to_retry_and_the_retry_projects():
     assert len(_notification_events(broadcaster)) == 1
 
 
-async def test_projection_defect_never_blocks_the_transcript(caplog):
+async def test_projection_defect_fails_the_append_and_the_retry_projects():
+    """A projection defect is a 500, not an acknowledged append missing its notification."""
     client, log, store, broadcaster, sessions = _app()
     session = await _session(sessions)
+    url = f"/api/v1/forge/sessions/{session.id}/log"
+    batch = {"entries": [_notification_frame(session.id, 1, "nt_bug", "Bug")]}
+    real_project = store.feed.project
 
     async def broken(candidates):
         raise RuntimeError("projection bug")
 
     store.feed.project = broken
-    response = client.post(
-        f"/api/v1/forge/sessions/{session.id}/log",
-        json={"entries": [_notification_frame(session.id, 1, "nt_bug", "Bug")]},
-        headers=HEADERS,
-    )
-    assert response.status_code == 201
-    assert response.json()["latest_seq"] == 1
+    failing = TestClient(client.app, raise_server_exceptions=False)
+    response = failing.post(url, json=batch, headers=HEADERS)
+    assert response.status_code == 500
+    assert await log.latest_seq(session.id) == 1  # the transcript frame is kept
     assert _notification_events(broadcaster) == []
-    assert "transcript append kept" in caplog.text
+
+    store.feed.project = real_project
+    assert client.post(url, json=batch, headers=HEADERS).status_code == 201
+    [projected] = store.notifications.values()
+    assert projected.title == "Bug"

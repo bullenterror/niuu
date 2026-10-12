@@ -17,6 +17,7 @@ from niuu.ports.notifications import (
 )
 from volundr.adapters.outbound.notification_sinks import (
     ConfiguredNotificationSinks,
+    NotificationSinkBuildError,
     build_configured_sinks,
     build_sink,
 )
@@ -46,6 +47,11 @@ class ClosingSink(NotificationSink):
 class NotASink:
     def __init__(self, **kwargs) -> None:
         self.kwargs = kwargs
+
+
+class LeakySink(ClosingSink):
+    def __init__(self, *, secret: str, name: str = "x") -> None:
+        raise ValueError(f"bad secret {secret}")
 
 
 class Resolver(NotificationSinkResolver):
@@ -108,20 +114,35 @@ class TestBuildSinks:
         with pytest.raises(TypeError, match="not a NotificationSink"):
             build_sink({"name": "x", "adapter": f"{__name__}.NotASink"}, {})
 
-    def test_broken_sinks_are_logged_and_skipped(self, caplog):
+    def test_good_sinks_are_built(self):
+        sinks = build_configured_sinks([{"name": "good", "adapter": f"{__name__}.ClosingSink"}], {})
+        assert list(sinks) == ["good"]
+
+    def test_unimportable_sink_raises(self):
         entries = [
             {"name": "good", "adapter": f"{__name__}.ClosingSink"},
             {"name": "missing", "adapter": "no.such.Sink"},
+        ]
+        with pytest.raises(NotificationSinkBuildError, match="'missing'.*notifications.sinks"):
+            build_configured_sinks(entries, {})
+
+    def test_sink_missing_its_dependencies_raises_naming_them(self):
+        entries = [
             {
                 "name": "push",
                 "adapter": "volundr.adapters.outbound.push_notification_sink.PushNotificationSink",
             },
         ]
-        with caplog.at_level("ERROR"):
-            sinks = build_configured_sinks(entries, {})
-        assert list(sinks) == ["good"]
-        assert "'missing'" in caplog.text and "'push'" in caplog.text
-        assert "TypeError" in caplog.text
+        with pytest.raises(NotificationSinkBuildError, match="'push'.*device_repository"):
+            build_configured_sinks(entries, {})
+
+    def test_constructor_errors_do_not_echo_their_message(self):
+        entries = [{"name": "leaky", "adapter": f"{__name__}.LeakySink", "secret": "hunter2"}]
+        with pytest.raises(NotificationSinkBuildError) as raised:
+            build_configured_sinks(entries, {})
+        assert "ValueError" in str(raised.value)
+        assert "hunter2" not in str(raised.value)
+        assert raised.value.__cause__ is None and raised.value.__suppress_context__
 
 
 class TestConfiguredNotificationSinks:
@@ -136,7 +157,8 @@ class TestConfiguredNotificationSinks:
         await provider.release(sink)
         assert ops.closed == 0
 
-        await provider.close()
+        with pytest.raises(ExceptionGroup, match="Closing notification sinks failed"):
+            await provider.close()
         assert ops.closed == 1 and broken.closed == 1
 
     async def test_unknown_named_sink_is_retryable(self):

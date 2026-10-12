@@ -73,10 +73,13 @@ other users can read (`chmod 600` it), is owned by someone else, or is not an RS
 Because the key persists, tokens held by running brokers keep verifying after a Forge
 API restart.
 
-When no key is usable, Forge logs one error with the remedy and mints nothing.
-Sessions then run on their broker credential and get no Forge MCP grants. Read tools
-and `notify` still work, because they go through the broker. Set
-`forge_mcp.session_tokens.enabled: false` to turn session credentials off on purpose.
+When session credentials are enabled but no key is usable, Forge refuses to start and
+the error names the remedy. Set `forge_mcp.session_tokens.enabled: false` to turn
+session credentials off on purpose: sessions then run on their broker credential and
+get no Forge MCP grants, while read tools and `notify` still work through the broker.
+The Volundr Helm chart leaves them off unless `workloadIdentity` is enabled with
+`signingKey.existingSecret` (the pod's root filesystem is read-only, so the key file
+cannot be created there); set `forgeMcp.session_tokens.enabled` to override.
 `GET /api/v1/forge/feature-flags` reports `capabilities.forge_session_tokens` and
 `capabilities.forge_session_token_key` (`workload_identity` or `key_file`).
 

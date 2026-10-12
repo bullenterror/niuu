@@ -285,10 +285,9 @@ def _create_notification_delivery(
     """
     config = settings.notifications
     if config.enabled and config.dispatcher.enabled and push_channel is None:
-        try:
-            push_channel = create_push_channel(settings)
-        except Exception:
-            logger.exception("Push channel for notification delivery could not be built")
+        # A broken push.adapter is a configuration error: raise rather than run
+        # delivery with every push rule quietly failing.
+        push_channel = create_push_channel(settings)
     return create_notification_delivery(
         settings,
         pool,
@@ -808,21 +807,17 @@ def create_app(
             attention_notifier = None
             push_channel = None
             if settings.push.enabled:
-                try:
-                    notification_channel = create_push_channel(settings)
-                    push_channel = notification_channel
-                    attention_notifier = PushAttentionNotifier(
-                        device_repository,
-                        notification_channel,
-                        min_urgency=settings.push.min_urgency,
-                    )
-                    logger.info(
-                        "Push notifications enabled: adapter=%s",
-                        settings.push.adapter.rsplit(".", 1)[-1],
-                    )
-                except Exception:
-                    logger.exception("Failed to initialise push notifications")
-                    attention_notifier = None
+                # push.enabled with a channel that cannot be built is fatal.
+                push_channel = create_push_channel(settings)
+                attention_notifier = PushAttentionNotifier(
+                    device_repository,
+                    push_channel,
+                    min_urgency=settings.push.min_urgency,
+                )
+                logger.info(
+                    "Push notifications enabled: adapter=%s",
+                    settings.push.adapter.rsplit(".", 1)[-1],
+                )
 
             # Create services with broadcaster for real-time updates
             # Forge catalog (launch specs + session definitions), built via the

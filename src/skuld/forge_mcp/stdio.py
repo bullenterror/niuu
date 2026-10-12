@@ -51,10 +51,6 @@ SERVER_INSTRUCTIONS = (
     "inspect other sessions. Tools that act on other sessions need an operator grant."
 )
 _ERROR_BODY_CHARS = 500
-# Defaults for a manual invocation; the broker always passes its configured values
-# (forge_mcp.broker_request_timeout_s / forge_mcp.stdio_max_concurrency).
-DEFAULT_TIMEOUT_S = 60.0
-DEFAULT_MAX_CONCURRENCY = 4
 
 
 class BrokerError(Exception):
@@ -274,14 +270,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="skuld.forge_mcp", description=__doc__.split("\n")[0])
     parser.add_argument("--broker-url", required=True, help="http://127.0.0.1:<broker port>")
     parser.add_argument("--token-file", required=True, help="the broker's 0600 loopback token")
+    # No defaults: the broker passes its configured values
+    # (forge_mcp.broker_request_timeout_s / forge_mcp.stdio_max_concurrency).
+    parser.add_argument("--timeout", type=float, required=True, help="seconds per broker call")
     parser.add_argument(
-        "--timeout", type=float, default=DEFAULT_TIMEOUT_S, help="seconds per broker call"
-    )
-    parser.add_argument(
-        "--max-concurrency",
-        type=int,
-        default=DEFAULT_MAX_CONCURRENCY,
-        help="tool calls served in parallel",
+        "--max-concurrency", type=int, required=True, help="tool calls served in parallel"
     )
     return parser
 

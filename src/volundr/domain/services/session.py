@@ -451,11 +451,19 @@ class SessionService:
         idle/stopped/error always clear it. No artificial turn start is invented;
         clients use ``state_since`` when the turn start is unknown.
 
+        The notification feed is settled (a new request recorded, a settled one's
+        attention items retired) BEFORE the report is persisted. Both operations are
+        idempotent, so when either fails the report fails with it: the session keeps
+        its previous state, the broker sees the rejection, and its retry of the
+        unacknowledged report re-derives the same transition and repeats them.
+
         Raises SessionNotFoundError if the session doesn't exist.
         """
-        session = await self._repository.get(session_id)
-        if session is None:
+        stored = await self._repository.get(session_id)
+        if stored is None:
             raise SessionNotFoundError(session_id)
+        # Mutate a copy: nothing about this report may stick unless it is persisted.
+        session = stored.model_copy()
 
         # The broker rides the CLI/agent conversation id on activity reports.
         # Persist it as a first-class field (so the session can be resumed after
@@ -507,6 +515,10 @@ class SessionService:
         # records from other paths must stay visible).
         if session.error and session.error.startswith("liveness:"):
             session.error = None
+        is_new_attention = self._is_new_attention_request(
+            state, previous_state, metadata, previous_request_id
+        )
+        await self._settle_attention_feed(session, previous_state, metadata, is_new_attention)
         updated = await self._repository.update(session)
         # A concurrent newer activity report may have won the database comparison.
         # Never publish the stale caller's state/timing pair over that winner.
@@ -515,10 +527,6 @@ class SessionService:
             session.activity_state_since,
         ):
             return updated
-
-        is_new_attention = self._is_new_attention_request(
-            state, previous_state, metadata, previous_request_id
-        )
 
         if self._broadcaster is not None:
             await self._broadcaster.publish(
@@ -563,21 +571,6 @@ class SessionService:
                     )
                 )
 
-        # The same "needs the user" transition lands in the notification feed as an
-        # attention notification, deduplicated per request (a retried report of the
-        # same pending request records nothing new).
-        if is_new_attention and self._notification_recorder is not None:
-            await self._record_attention_isolated(updated, session, metadata)
-
-        # ...and once it stops waiting (answered in any client or the terminal, or the
-        # turn ended), its "needs your input" items must not stay unread.
-        if (
-            previous_state is SessionActivityState.AWAITING_INPUT
-            and state is not SessionActivityState.AWAITING_INPUT
-            and self._notification_recorder is not None
-        ):
-            await self._retire_attention_isolated(updated)
-
         # Fan a push out to the owner's devices off the activity hot-path (a slow
         # APNs/webhook call must not delay Skuld's activity report response).
         if is_new_attention and self._attention_notifier is not None:
@@ -601,33 +594,36 @@ class SessionService:
         self._attention_notify_tasks.add(task)
         task.add_done_callback(self._attention_notify_tasks.discard)
 
-    async def _record_attention_isolated(
-        self, updated: Session, previous: Session, metadata: dict
+    async def _settle_attention_feed(
+        self,
+        session: Session,
+        previous_state: SessionActivityState | None,
+        metadata: dict,
+        is_new_attention: bool,
     ) -> None:
-        """Record the feed's attention notification without risking the activity report.
+        """Bring the notification feed in line with the report about to be persisted.
 
-        The activity transition, its SSE events and the push fan-out must not depend
-        on the notification store, so a failure here is logged and absorbed.
+        A new "needs the user" request lands as an attention notification,
+        deduplicated per request; once the session stops waiting (answered in any
+        client or the terminal, or the turn ended) its "needs your input" items must
+        not stay unread. Failures propagate: see ``update_activity``.
         """
         if self._notification_recorder is None:
             return
-        try:
+        if is_new_attention:
             await self._notification_recorder.record_attention(
-                updated,
-                state_since=updated.activity_state_since or previous.activity_state_since,
+                session,
+                state_since=session.activity_state_since,
                 kind=metadata.get("kind", "question"),
                 prompt=metadata.get("prompt", "") or "",
                 request_id=metadata.get("request_id", "") or "",
             )
-        except Exception:
-            logger.exception("recording the attention notification failed for %s", updated.id)
-
-    async def _retire_attention_isolated(self, updated: Session) -> None:
-        """Retire settled attention items without risking the activity report."""
-        try:
-            await self._notification_recorder.retire_attention(updated)
-        except Exception:
-            logger.exception("retiring attention notifications failed for %s", updated.id)
+            return
+        if (
+            previous_state is SessionActivityState.AWAITING_INPUT
+            and session.activity_state is not SessionActivityState.AWAITING_INPUT
+        ):
+            await self._notification_recorder.retire_attention(session)
 
     @staticmethod
     def _is_new_attention_request(
@@ -641,12 +637,15 @@ class SessionService:
         Fires on the transition into ``awaiting_input``, and again if a new
         pending request (different ``request_id``) arrives while the session is
         still awaiting — so a second question is not swallowed. Re-reports of the
-        same pending request, and Skuld's periodic heartbeats, do not re-fire,
-        avoiding notification spam.
+        same pending request, and Skuld's periodic heartbeats of it, do not
+        re-fire, avoiding notification spam.
+
+        A heartbeat is not excluded as such: Skuld retries an unacknowledged
+        transition as a heartbeat carrying the original request, and only
+        ``update_activity`` writes the activity state, so an awaiting heartbeat
+        over a non-awaiting stored state is exactly that retry and must fire.
         """
         if state is not SessionActivityState.AWAITING_INPUT:
-            return False
-        if metadata.get("heartbeat"):
             return False
         if previous_state is not SessionActivityState.AWAITING_INPUT:
             return True

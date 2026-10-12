@@ -647,7 +647,16 @@ class TestConfigMapTemplate:
             )
             return yaml.safe_load(configmap["data"]["config.yaml"])
 
-        assert "forge_mcp" not in render()
+        # The read-only root filesystem rules out the key file: session credentials
+        # default on only when workload identity signs with a configured key.
+        assert render()["forge_mcp"] == {"session_tokens": {"enabled": False}}
+        signed = render(
+            "--set",
+            "workloadIdentity.enabled=true",
+            "--set",
+            "workloadIdentity.signingKey.existingSecret=wi-key",
+        )
+        assert signed["forge_mcp"] == {"session_tokens": {"enabled": True}}
         config = render(
             "--set-json",
             'forgeMcp={"default_grants":["message"],"session_tokens":{"ttl_seconds":604800},'
@@ -656,6 +665,7 @@ class TestConfigMapTemplate:
         parsed = ForgeMcpConfig.model_validate(config["forge_mcp"])
         assert [grant.value for grant in parsed.default_grants] == ["message"]
         assert parsed.session_tokens.ttl_seconds == 604800
+        assert parsed.session_tokens.enabled is False
         assert parsed.http.allowed_origins == ["https://forge.example.com"]
 
     def test_observability_is_absent_by_default(self):

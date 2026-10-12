@@ -8,6 +8,7 @@ import pytest
 
 from niuu.adapters.notifications.integrations import IntegrationSinkResolver
 from niuu.adapters.notifications.webhook import WebhookNotificationSink
+from volundr.adapters.outbound.notification_sinks import NotificationSinkBuildError
 from volundr.adapters.outbound.push_channels import LoggingNotificationChannel
 from volundr.adapters.outbound.push_notification_sink import PushNotificationSink
 from volundr.config import Settings
@@ -75,10 +76,10 @@ def test_integration_delivery_needs_the_repository_and_credential_store():
     assert delivery.sinks._resolver is None  # noqa: SLF001
 
 
-def test_push_sink_without_its_dependencies_is_skipped():
+def test_push_sink_without_its_dependencies_fails_startup():
     settings = Settings(notifications={"sinks": [{"name": "phone", "adapter": PUSH}]})
-    delivery = build(settings, device_repository=None, push_channel=None)
-    assert delivery.sinks.names == []
+    with pytest.raises(NotificationSinkBuildError, match="'phone'.*push_channel"):
+        build(settings, device_repository=None, push_channel=None)
 
 
 def test_renderer_falls_back_to_the_public_origin():
@@ -116,7 +117,7 @@ def test_push_channel_comes_from_push_config():
         create_push_channel(bad)
 
 
-def test_main_builds_a_push_channel_for_push_sinks(caplog):
+def test_main_builds_a_push_channel_for_push_sinks():
     from volundr.main import _create_notification_delivery
 
     settings = Settings(notifications={"sinks": [{"name": "phone", "adapter": PUSH}]})
@@ -136,8 +137,8 @@ def test_main_builds_a_push_channel_for_push_sinks(caplog):
         push={"adapter": "no.such.Channel"},
         notifications={"sinks": [{"name": "phone", "adapter": PUSH}]},
     )
-    with caplog.at_level("ERROR"):
-        delivery = _create_notification_delivery(
+    with pytest.raises(ImportError):
+        _create_notification_delivery(
             broken,
             MagicMock(),
             public_origin="http://localhost:8080",
@@ -147,5 +148,3 @@ def test_main_builds_a_push_channel_for_push_sinks(caplog):
             push_channel=None,
             attention_push_enabled=False,
         )
-    assert delivery.sinks.names == []
-    assert "Push channel for notification delivery could not be built" in caplog.text

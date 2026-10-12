@@ -238,19 +238,21 @@ async def _project_notifications(
     await notification_service.project_log_entries(session, stored)
 
 
-async def _project_notifications_isolated(
+async def _project_notifications_before_ack(
     notification_service: NotificationService,
     log_repository: SessionEventLogRepository,
     session: Session,
     entries: list[SessionLogEntry],
     conflicts: list[int],
 ) -> None:
-    """Project without ever putting the durable transcript at risk.
+    """Project the batch's notifications; the append is acknowledged only if this succeeds.
 
-    The frames are already stored. A store outage answers 503 so the producer
-    retries the (idempotent) batch and the projection runs again. Any other failure
-    is a defect in the notification path: it is logged loudly, and the append is
-    still acknowledged so one bad notification can never wedge a session's log.
+    The frames are already stored and the append is idempotent, so any failure
+    leaves the batch unacknowledged and the producer retries it, which projects
+    again. A store outage answers 503; any other failure is a defect in the
+    notification path and propagates as a 500. Skuld retries both (5xx is
+    transient to it), so a defect holds the session's log back until it is fixed
+    rather than silently dropping the session's notifications.
     """
     try:
         await _project_notifications(
@@ -266,11 +268,6 @@ async def _project_notifications_isolated(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Notification store unavailable; retry the batch",
         ) from exc
-    except Exception:
-        logger.exception(
-            "notification projection failed for session %s; transcript append kept",
-            session.id,
-        )
 
 
 def create_session_log_router(
@@ -359,7 +356,7 @@ def create_session_log_router(
             )
         # Notifications are projected from the stored rows before the ack.
         if notification_service is not None:
-            await _project_notifications_isolated(
+            await _project_notifications_before_ack(
                 notification_service, log_repository, session, entries, conflicts
             )
         # Projection is committed atomically with the durable insert; this is only a refresh hint.

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 
 from volundr.domain.models import GitSource, SessionActivityState
@@ -98,28 +100,87 @@ async def test_second_question_while_awaiting_is_recorded(service, recorder):
     assert recorder.calls[1]["kind"] == "question" and recorder.calls[1]["prompt"] == ""
 
 
-async def test_recorder_failure_never_breaks_the_activity_report(
-    repository, pod_manager, broadcaster, caplog
-):
-    class FailingRecorder(NotificationRecorder):
-        async def record_attention(self, session, **_kwargs):
-            raise RuntimeError("store down")
+class FlakyRecorder(RecordingRecorder):
+    """Fails each operation the first time it is called."""
 
-    service = SessionService(
+    def __init__(self) -> None:
+        super().__init__()
+        self.record_failures = 1
+        self.retire_failures = 1
+
+    async def record_attention(self, session, **kwargs):
+        if self.record_failures:
+            self.record_failures -= 1
+            raise RuntimeError("store down")
+        await super().record_attention(session, **kwargs)
+
+    async def retire_attention(self, session):
+        if self.retire_failures:
+            self.retire_failures -= 1
+            raise RuntimeError("store down")
+        return await super().retire_attention(session)
+
+
+def _flaky_service(repository, pod_manager, broadcaster, recorder):
+    return SessionService(
         repository=repository,
         pod_manager=pod_manager,
         broadcaster=broadcaster,
-        notification_recorder=FailingRecorder(),
+        notification_recorder=recorder,
         provisioning_initial_delay=0,
         provisioning_timeout=1.0,
     )
+
+
+async def test_record_failure_fails_the_report_and_its_retry_heals(
+    repository, pod_manager, broadcaster
+):
+    recorder = FlakyRecorder()
+    service = _flaky_service(repository, pod_manager, broadcaster, recorder)
     session = await _session(service)
+    since = datetime.now(UTC)
+    meta = {"kind": "question", "prompt": "Which?", "request_id": "q1"}
+
+    with pytest.raises(RuntimeError, match="store down"):
+        await service.update_activity(
+            session.id, SessionActivityState.AWAITING_INPUT, dict(meta), state_since=since
+        )
+    # Nothing about the failed report stuck or was announced.
+    stored = await repository.get(session.id)
+    assert stored.activity_state is not SessionActivityState.AWAITING_INPUT
+    assert not any(event.type.value == "session_needs_input" for event in broadcaster.events)
+
+    # Skuld retries the unacknowledged transition as a heartbeat with its anchors.
     updated = await service.update_activity(
+        session.id,
+        SessionActivityState.AWAITING_INPUT,
+        {**meta, "heartbeat": True},
+        state_since=since,
+    )
+    assert updated.activity_state is SessionActivityState.AWAITING_INPUT
+    assert [(call["request_id"], call["state_since"]) for call in recorder.calls] == [("q1", since)]
+    assert any(event.type.value == "session_needs_input" for event in broadcaster.events)
+
+
+async def test_retire_failure_fails_the_report_and_its_retry_heals(
+    repository, pod_manager, broadcaster
+):
+    recorder = FlakyRecorder()
+    recorder.record_failures = 0
+    service = _flaky_service(repository, pod_manager, broadcaster, recorder)
+    session = await _session(service)
+    await service.update_activity(
         session.id, SessionActivityState.AWAITING_INPUT, {"request_id": "q1"}
     )
-    assert updated.activity_state == SessionActivityState.AWAITING_INPUT
-    assert any(event.type.value == "session_needs_input" for event in broadcaster.events)
-    assert "recording the attention notification failed" in caplog.text
+
+    with pytest.raises(RuntimeError, match="store down"):
+        await service.update_activity(session.id, SessionActivityState.ACTIVE, {})
+    stored = await repository.get(session.id)
+    assert stored.activity_state is SessionActivityState.AWAITING_INPUT
+    assert recorder.retired == []
+
+    await service.update_activity(session.id, SessionActivityState.ACTIVE, {"heartbeat": True})
+    assert recorder.retired == [session.id]
 
 
 async def test_leaving_awaiting_input_retires_its_attention(service, recorder):

@@ -53,17 +53,21 @@ KEY_SOURCE_WORKLOAD_IDENTITY = "workload_identity"
 KEY_SOURCE_KEY_FILE = "key_file"
 
 
+class ForgeSessionCredentialsUnavailableError(RuntimeError):
+    """Forge session credentials are enabled but no signing key is usable."""
+
+
 def _create_forge_session_tokens(
     settings: Settings,
     workload_identity: WorkloadIdentityService,
 ) -> ForgeSessionTokenService | None:
-    """The issuer of scoped session credentials, or ``None`` when there is none.
+    """The issuer of scoped session credentials, or ``None`` when they are disabled.
 
     The workload-identity issuer signs them when it is enabled with a configured
     key: the same key Envoy validates through the workload JWKS. Otherwise (local
-    mini mode) Forge uses its own RSA key file, generated once. When neither is
-    usable Forge mints nothing: brokers keep their own credential and the Forge MCP
-    offers no grants. That is logged once here and reported by the feature flags.
+    mini mode) Forge uses its own RSA key file, generated once. When credentials are
+    enabled but neither key is usable, Forge refuses to start: sessions would run
+    with their broker credential and the Forge MCP would silently offer no grants.
     """
     cfg = settings.forge_mcp.session_tokens
     if not cfg.enabled:
@@ -80,14 +84,11 @@ def _create_forge_session_tokens(
     try:
         pem = load_or_create_rsa_key_pem(cfg.signing_key_file, key_size=cfg.signing_key_bits)
     except SigningKeyFileError as exc:
-        logger.error(
-            "Forge session credentials unavailable: %s. Sessions keep their broker "
-            "credential and get no Forge MCP grants. Fix the key, configure "
-            "workload_identity with a signing key, or set "
-            "forge_mcp.session_tokens.enabled=false to silence this.",
-            exc,
-        )
-        return None
+        raise ForgeSessionCredentialsUnavailableError(
+            f"Forge session credentials are enabled but have no usable signing key: {exc}. "
+            "Fix forge_mcp.session_tokens.signing_key_file, enable workload_identity with "
+            "a signing key, or set forge_mcp.session_tokens.enabled: false."
+        ) from exc
     issuer = WorkloadIdentityService(
         WorkloadIdentityConfig(
             enabled=True,

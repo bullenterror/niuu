@@ -13,6 +13,7 @@ from niuu.service_runtime import create_workload_identity_service
 from volundr.composition_builders import (
     KEY_SOURCE_KEY_FILE,
     KEY_SOURCE_WORKLOAD_IDENTITY,
+    ForgeSessionCredentialsUnavailableError,
     _create_forge_session_tokens,
 )
 from volundr.config import ForgeMcpConfig, ForgeMcpHttpConfig, Settings
@@ -81,17 +82,18 @@ class TestIssuerSelection:
         assert "disabled" in caplog.text
         assert not (tmp_path / "keys").exists()
 
-    def test_unusable_key_degrades_loudly(self, tmp_path, caplog) -> None:
+    def test_unusable_key_refuses_to_start(self, tmp_path) -> None:
         key = tmp_path / "keys" / "forge.pem"
         key.parent.mkdir()
         key.write_text("not a key")
         key.chmod(0o600)
         settings = _settings(tmp_path)
         workload = create_workload_identity_service(settings.workload_identity)
-        assert _create_forge_session_tokens(settings, workload) is None
-        record = next(r for r in caplog.records if r.levelno == logging.ERROR)
-        assert "Forge session credentials unavailable" in record.getMessage()
-        assert "no Forge MCP grants" in record.getMessage()
+        with pytest.raises(
+            ForgeSessionCredentialsUnavailableError,
+            match="no usable signing key.*forge_mcp.session_tokens.enabled: false",
+        ):
+            _create_forge_session_tokens(settings, workload)
         assert key.read_text() == "not a key"  # never overwritten
 
 
