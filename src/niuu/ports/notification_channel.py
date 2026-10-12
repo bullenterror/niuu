@@ -2,8 +2,10 @@
 
 Moved from ``ting.ports.notification_channel`` so the shared channel adapters in
 :mod:`niuu.adapters.notifications` can implement it; Ting re-exports it. Channels
-are best-effort: ``send`` logs failures instead of raising. The Forge delivery
-outbox uses the stricter :class:`niuu.ports.notifications.NotificationSink`.
+raise :class:`niuu.ports.notifications.NotificationDeliveryError` when ``send``
+delivers nothing; Ting's notification service counts and reports those failures.
+The Forge delivery outbox uses :class:`niuu.ports.notifications.NotificationSink`,
+which also reports what was delivered.
 """
 
 from __future__ import annotations
@@ -38,7 +40,11 @@ class NotificationChannel(ABC):
 
     @abstractmethod
     async def send(self, notification: Notification) -> None:
-        """Deliver a notification through this channel."""
+        """Deliver a notification through this channel.
+
+        Raises ``niuu.ports.notifications.NotificationDeliveryError`` when nothing
+        was delivered; its message never carries a credential.
+        """
 
     @abstractmethod
     def should_notify(self, notification: Notification) -> bool:

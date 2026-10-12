@@ -8,11 +8,11 @@ Selected via the dynamic-adapter config (``push.adapter`` + ``kwargs``):
 - ``ApnsNotificationChannel`` — direct Apple Push, token-based (JWT) auth.
   Requires an HTTP/2 client (``h2`` installed); inject one for tests.
 
-Each channel has two entry points. ``send`` is the best-effort path the
-needs-input attention push uses: it logs failures and never raises.
-``deliver`` is the strict path the notification outbox uses (through
-``PushNotificationSink``): it raises ``NotificationDeliveryError`` when nothing
-was delivered, so the outbox can retry or give up honestly.
+Each channel has two entry points, and both raise ``NotificationDeliveryError``
+when nothing was delivered. ``send`` is what the needs-input attention push
+uses (the session service runs it detached and reports a failure); ``deliver``
+is what the notification outbox uses (through ``PushNotificationSink``) and also
+describes what was delivered, so the outbox can retry or give up honestly.
 """
 
 from __future__ import annotations
@@ -79,16 +79,7 @@ class WebhookNotificationChannel(NotificationChannel):
         return self._client
 
     async def send(self, message: PushMessage, devices: list[DeviceToken]) -> None:
-        if not self._url:
-            return
-        try:
-            await self.deliver(message, devices)
-        except Exception as exc:
-            logger.warning(
-                "Push webhook delivery failed for owner %s: %s",
-                message.owner_id,
-                exc if isinstance(exc, NotificationDeliveryError) else type(exc).__name__,
-            )
+        await self.deliver(message, devices)
 
     async def deliver(self, message: PushMessage, devices: list[DeviceToken]) -> str:
         if not self._url:
@@ -181,12 +172,10 @@ class ApnsNotificationChannel(NotificationChannel):
         return self._client
 
     async def send(self, message: PushMessage, devices: list[DeviceToken]) -> None:
+        # An owner without iOS devices has nothing for APNs to deliver to.
         if not any(d.platform is DevicePlatform.IOS for d in devices):
             return
-        try:
-            await self.deliver(message, devices)
-        except NotificationDeliveryError as exc:
-            logger.warning("APNs push failed for owner %s: %s", message.owner_id, exc)
+        await self.deliver(message, devices)
 
     async def deliver(self, message: PushMessage, devices: list[DeviceToken]) -> str:
         ios_devices = [d for d in devices if d.platform is DevicePlatform.IOS]

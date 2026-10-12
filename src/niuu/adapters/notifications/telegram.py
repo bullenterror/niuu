@@ -246,10 +246,11 @@ def _json_or_none(response: httpx.Response) -> dict[str, Any] | None:
 
 
 class TelegramNotificationAdapter(NotificationChannel):
-    """Best-effort Telegram channel for Ting's event notifications.
+    """Telegram channel for Ting's event notifications.
 
-    Keeps Ting's contract: ``should_notify`` filters by urgency, and ``send``
-    logs failures instead of raising. Messages use legacy Markdown formatting.
+    ``should_notify`` filters by urgency, and ``send`` raises
+    :class:`~niuu.ports.notifications.NotificationDeliveryError` when Telegram does
+    not accept the message. Messages use legacy Markdown formatting.
     """
 
     def __init__(
@@ -281,14 +282,8 @@ class TelegramNotificationAdapter(NotificationChannel):
         return _URGENCY_RANK.get(notification.urgency, 0) >= _URGENCY_RANK[self._min_urgency]
 
     async def send(self, notification: Notification) -> None:
-        """Send a formatted message to the Telegram chat; failures are logged."""
-        if not self._bot_token:
-            logger.warning("Cannot send notification — bot_token not configured")
-            return
-        try:
-            await self._sink.send_text(self._format_message(notification), parse_mode="Markdown")
-        except NotificationDeliveryError as exc:
-            logger.warning("Failed to send Telegram notification to %s: %s", self._chat_id, exc)
+        """Send a formatted message to the Telegram chat; raise if it is not accepted."""
+        await self._sink.send_text(self._format_message(notification), parse_mode="Markdown")
 
     async def close(self) -> None:
         """Close the underlying HTTP client."""

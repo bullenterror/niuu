@@ -202,20 +202,21 @@ class TestRelayDeliver:
             await channel.deliver(_message(), [])
         assert info.value.retryable
 
-    async def test_missing_url_is_permanent_but_send_stays_silent(self):
+    async def test_missing_url_is_permanent_for_send_and_deliver(self):
         channel = WebhookNotificationChannel(url="", client=_client())
         with pytest.raises(NotificationDeliveryError):
             await channel.deliver(_message(), [])
-        await channel.send(_message(), [])
+        with pytest.raises(NotificationDeliveryError):
+            await channel.send(_message(), [])
 
-    async def test_send_logs_a_rejected_push(self, caplog):
+    async def test_send_raises_a_rejected_push(self):
         client = _client(httpx.Response(400))
         channel = WebhookNotificationChannel(url="https://relay.example/push", client=client)
-        with caplog.at_level("WARNING"):
+        with pytest.raises(NotificationDeliveryError, match="HTTP 400") as info:
             await channel.send(_message(), [])
-        assert "Push webhook delivery failed" in caplog.text
+        assert not info.value.retryable
 
-    async def test_default_deliver_falls_back_to_send(self):
+    async def test_default_deliver_calls_send(self):
         detail = await LoggingNotificationChannel().deliver(_message(), [ios()])
         assert detail == "handed to LoggingNotificationChannel"
 
@@ -261,8 +262,14 @@ class TestApnsDeliver:
             await channel.deliver(_message(), [ios()])
         assert not info.value.retryable
 
-    async def test_send_swallows_what_deliver_raises(self, caplog):
+    async def test_send_raises_what_deliver_raises(self):
         client = _client(MagicMock(status_code=500))
-        with caplog.at_level("WARNING"):
+        with pytest.raises(NotificationDeliveryError, match="none of 1 devices") as info:
             await self._channel(client).send(_message(), [ios()])
-        assert "APNs push failed" in caplog.text
+        assert info.value.retryable
+
+    async def test_send_without_ios_devices_has_nothing_to_deliver(self):
+        client = _client()
+        web = DeviceToken(owner_id="u", platform=DevicePlatform.WEB, token="w")
+        await self._channel(client).send(_message(), [web])
+        client.post.assert_not_called()

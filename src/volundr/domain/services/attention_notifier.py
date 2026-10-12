@@ -76,11 +76,7 @@ class PushAttentionNotifier(AttentionNotifier):
             urgency=_NEEDS_INPUT_URGENCY,
             request_id=request_id,
         )
-        try:
-            devices = await self._device_repository.list_for_owner(owner_id)
-            await self._channel.send(message, devices)
-        except Exception:
-            # A push failure must never break the session activity path.
-            logger.warning(
-                "Failed to dispatch needs-input push for session %s", session.id, exc_info=True
-            )
+        # Failures propagate: the session service runs this off the activity path
+        # and reports what it raises.
+        devices = await self._device_repository.list_for_owner(owner_id)
+        await self._channel.send(message, devices)

@@ -4,8 +4,9 @@ A MESSAGING ``integration_connection`` names an adapter class path, a credential
 in the credential store, and adapter config. Two consumers read it:
 
 * :class:`NotificationChannelFactory` (Ting's event notifications) builds every
-  enabled connection of an owner as a best-effort
-  :class:`~niuu.ports.notification_channel.NotificationChannel`. It moved here
+  enabled connection of an owner as a
+  :class:`~niuu.ports.notification_channel.NotificationChannel`, and raises when
+  one cannot be built. It moved here
   from ``ting.adapters.notification_channel_factory``, which re-exports it.
 * :class:`IntegrationSinkResolver` (the Forge delivery outbox) builds ONE
   connection, named by a delivery rule, as a strict
@@ -25,7 +26,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from niuu.domain.models import IntegrationConnection, IntegrationType
-from niuu.ports.channel_resolver import ChannelResolverPort
+from niuu.ports.channel_resolver import ChannelResolverPort, NotificationChannelUnavailableError
 from niuu.ports.credentials import CredentialStorePort
 from niuu.ports.integrations import IntegrationRepository
 from niuu.ports.notification_channel import NotificationChannel
@@ -75,7 +76,10 @@ class NotificationChannelFactory(ChannelResolverPort):
 
     Each enabled MESSAGING connection is built from its stored class path (or,
     when that is empty, the default channel for its slug) with its credential
-    and config merged as kwargs. Connections that cannot be built are skipped.
+    and config merged as kwargs. An enabled connection that cannot be built (no
+    credential, no adapter, or a constructor that refuses its kwargs) raises
+    :class:`~niuu.ports.channel_resolver.NotificationChannelUnavailableError`: the
+    owner asked for that channel, so it is fixed or disabled, never left out.
     """
 
     def __init__(
@@ -106,27 +110,33 @@ class NotificationChannelFactory(ChannelResolverPort):
                 CREDENTIAL_OWNER_TYPE, owner_id, conn.credential_name
             )
             if cred is None:
-                logger.debug(
-                    "Skipping channel %s — credential %s not found",
-                    conn.id,
-                    conn.credential_name,
+                raise NotificationChannelUnavailableError(
+                    f"Messaging connection {conn.id} has no credential "
+                    f"{conn.credential_name!r}; store it or disable the connection"
                 )
-                continue
-
             adapter = conn.adapter or self._channel_adapters.get(conn.slug, "")
-            try:
-                cls = import_class(adapter)
-                channel = cls(**{**cred, **conn.config})
-                channels.append(channel)
-            except Exception:
-                logger.warning(
-                    "Failed to instantiate channel %s (%s)",
-                    conn.id,
-                    adapter or "<no adapter>",
-                    exc_info=True,
+            if not adapter:
+                raise NotificationChannelUnavailableError(
+                    f"Messaging connection {conn.id} (slug {conn.slug!r}) names no channel "
+                    "adapter and none is known for its slug; set its adapter or disable it"
                 )
+            channels.append(self._build(conn, adapter, cred))
 
         return channels
+
+    @staticmethod
+    def _build(
+        conn: IntegrationConnection, adapter: str, cred: Mapping[str, Any]
+    ) -> NotificationChannel:
+        try:
+            cls = import_class(adapter)
+            return cls(**{**cred, **conn.config})
+        except Exception as exc:
+            # Only the type: the kwargs are the owner's credential.
+            raise NotificationChannelUnavailableError(
+                f"Messaging connection {conn.id} ({adapter}) could not be built: "
+                f"{type(exc).__name__}; fix or disable the connection"
+            ) from None
 
 
 class IntegrationSinkResolver(NotificationSinkResolver):

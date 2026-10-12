@@ -5,9 +5,10 @@
   POSTs the full notification and raises
   :class:`~niuu.ports.notifications.NotificationDeliveryError` (retryable on 408,
   425, 429, 5xx and network errors; permanent on other 4xx and redirects).
-* :class:`WebhookNotificationAdapter` is the best-effort per-user
-  :class:`~niuu.ports.notification_channel.NotificationChannel` Ting uses. It
-  moved here from ``ting.adapters.webhook_notification``, which re-exports it.
+* :class:`WebhookNotificationAdapter` is the per-user
+  :class:`~niuu.ports.notification_channel.NotificationChannel` Ting uses; it
+  raises the same errors. It moved here from ``ting.adapters.webhook_notification``,
+  which re-exports it.
 
 Both sign the exact request body with HMAC-SHA256 when a ``secret`` is set and
 send it as ``X-Niuu-Signature: sha256=<hex>``. Receivers should reject requests
@@ -133,11 +134,12 @@ class WebhookNotificationSink(NotificationSink):
 
 
 class WebhookNotificationAdapter(NotificationChannel):
-    """Best-effort webhook channel for Ting's event notifications.
+    """Webhook channel for Ting's event notifications.
 
     POSTs Ting's notification JSON to a user-configured URL: a Slack/Discord
-    webhook, a custom backend, an n8n / Zapier hook. ``send`` logs failures
-    instead of raising.
+    webhook, a custom backend, an n8n / Zapier hook. ``send`` raises
+    :class:`~niuu.ports.notifications.NotificationDeliveryError` when the POST is
+    not accepted.
     """
 
     def __init__(
@@ -160,10 +162,11 @@ class WebhookNotificationAdapter(NotificationChannel):
         return _URGENCY_RANK.get(notification.urgency, 0) >= _URGENCY_RANK[self._min_urgency]
 
     async def send(self, notification: Notification) -> None:
-        """POST a JSON payload describing the notification; failures are logged."""
+        """POST a JSON payload describing the notification; raise if it is not accepted."""
         if not self._url:
-            logger.warning("Cannot send webhook — url not configured")
-            return
+            raise NotificationDeliveryError(
+                "Webhook channel has no url configured", retryable=False
+            )
 
         body = _encode(
             {
@@ -180,17 +183,11 @@ class WebhookNotificationAdapter(NotificationChannel):
         target = redact_url(self._url)
         try:
             resp = await self._client.post(self._url, content=body, headers=headers)
-        except Exception as exc:
-            # Best-effort channel: never raise into Ting's event loop. Only the
-            # exception type is logged; httpx messages can carry the full URL.
-            logger.warning(
-                "Failed to deliver webhook notification to %s: %s", target, type(exc).__name__
-            )
-            return
-        if resp.status_code >= httpx.codes.BAD_REQUEST:
-            logger.warning(
-                "Webhook %s returned %d (body: %s)", target, resp.status_code, resp.text[:200]
-            )
+        except httpx.HTTPError as exc:
+            # Only the type: httpx messages can carry the full (secret-bearing) URL.
+            raise transport_failure(exc, target) from None
+        if not resp.is_success:
+            raise status_failure(target, resp)
 
     async def close(self) -> None:
         """Close the underlying HTTP client."""

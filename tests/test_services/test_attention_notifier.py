@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from volundr.domain.models import (
     DevicePlatform,
     DeviceToken,
@@ -99,8 +101,9 @@ async def test_urgency_gate_blocks_low_channels():
     assert channel.sent == []
 
 
-async def test_channel_error_is_swallowed():
+async def test_channel_error_propagates():
     notifier = PushAttentionNotifier(FakeDeviceRepo(), RecordingChannel(raise_error=True))
 
-    # Must not raise — a push failure cannot break the activity path.
-    await notifier.notify_needs_input(_session(), kind="question", prompt="x", request_id="r")
+    # The session service runs this detached and reports the failure.
+    with pytest.raises(RuntimeError, match="channel down"):
+        await notifier.notify_needs_input(_session(), kind="question", prompt="x", request_id="r")

@@ -321,6 +321,41 @@ class TestUpdateActivity:
         assert attention_notifier.calls == [(session.id, "question", "Which DB?", "askq-1")]
 
     @pytest.mark.asyncio
+    async def test_failed_attention_push_is_reported(
+        self, repository, pod_manager, broadcaster, caplog
+    ):
+        """The push runs detached; its failure is logged with its traceback."""
+        from volundr.domain.ports import AttentionNotifier
+
+        class FailingNotifier(AttentionNotifier):
+            async def notify_needs_input(self, session, *, kind, prompt, request_id):
+                raise RuntimeError("relay down")
+
+        service = SessionService(
+            repository=repository,
+            pod_manager=pod_manager,
+            broadcaster=broadcaster,
+            attention_notifier=FailingNotifier(),
+            provisioning_initial_delay=0,
+            provisioning_timeout=1.0,
+        )
+        session = await service.create_session(
+            name="Blocked",
+            model="claude-sonnet-4-20250514",
+            source=GitSource(repo="https://github.com/test/repo", branch="main"),
+        )
+        updated = await service.update_activity(
+            session.id, SessionActivityState.AWAITING_INPUT, {"request_id": "askq-1"}
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert updated.activity_state is SessionActivityState.AWAITING_INPUT
+        failures = [r for r in caplog.records if "Needs-input push failed" in r.getMessage()]
+        assert len(failures) == 1
+        assert failures[0].exc_info[1].args == ("relay down",)
+
+    @pytest.mark.asyncio
     async def test_attention_notifier_not_fired_for_busy(
         self, service_with_notifier, attention_notifier
     ):

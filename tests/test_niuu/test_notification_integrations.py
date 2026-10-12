@@ -22,6 +22,7 @@ from niuu.adapters.notifications.webhook import (
     WebhookNotificationSink,
 )
 from niuu.domain.models import IntegrationConnection, IntegrationType
+from niuu.ports.channel_resolver import NotificationChannelUnavailableError
 from niuu.ports.notifications import (
     DeliveryResult,
     NotificationSink,
@@ -177,12 +178,13 @@ class TestNotificationChannelFactory:
         assert len(channels) == 1 and isinstance(channels[0], TelegramNotificationAdapter)
         await channels[0].close()
 
-    async def test_unknown_slug_without_adapter_is_skipped(self):
+    async def test_unknown_slug_without_adapter_raises(self):
         factory = NotificationChannelFactory(
             StubIntegrationRepo([connection(slug="slack")]),
             StubCredentialStore(values={"user:user-1:tg": {"bot_token": "t", "chat_id": "1"}}),
         )
-        assert await factory.for_owner("user-1") == []
+        with pytest.raises(NotificationChannelUnavailableError, match="'slack'.*no channel"):
+            await factory.for_owner("user-1")
 
 
 class TestTingCompatibility:

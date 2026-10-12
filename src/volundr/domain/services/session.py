@@ -593,6 +593,14 @@ class SessionService:
         )
         self._attention_notify_tasks.add(task)
         task.add_done_callback(self._attention_notify_tasks.discard)
+        task.add_done_callback(self._report_attention_notify_failure)
+
+    @staticmethod
+    def _report_attention_notify_failure(task: asyncio.Task) -> None:
+        """Surface a failed needs-input push: it runs detached, so nothing else would."""
+        if task.cancelled() or task.exception() is None:
+            return
+        logger.error("Needs-input push failed (%s)", task.get_name(), exc_info=task.exception())
 
     async def _settle_attention_feed(
         self,

@@ -740,15 +740,16 @@ class NotificationChannel(ABC):
         """Deliver a push. ``devices`` is the owner's registered devices (may be
         empty for relay channels that resolve recipients themselves).
 
-        Best-effort: failures are logged, never raised."""
+        Raises ``niuu.ports.notifications.NotificationDeliveryError`` when the
+        push was not delivered; a channel with no recipient to try returns."""
 
     async def deliver(self, message: PushMessage, devices: list[DeviceToken]) -> str:
         """Deliver a push and report failures (the notification outbox path).
 
         Raises ``niuu.ports.notifications.NotificationDeliveryError`` when nothing
         was delivered; returns a short, secret-free description of what was.
-        Channels that cannot tell success from failure keep this default, which
-        falls back to the best-effort ``send``.
+        Channels with nothing more to report keep this default, which calls
+        ``send`` and lets its error propagate.
         """
         await self.send(message, devices)
         return f"handed to {type(self).__name__}"
