@@ -310,6 +310,11 @@ registers again. `push.enabled` needs `notifications.enabled` and the named sink
 refuses to start without them. Delivery runs on every host where
 `notifications.dispatcher.enabled` is on.
 
+In the Volundr Helm chart, set `push.enabled`, `push.adapter`, `push.kwargs` and
+`push.secretKwargs` (`{kwarg, secretName, secretKey}`, mounted as `PUSH_SK_<KWARG>`).
+The chart adds the push sink named by `push.attentionSink` to `notifications.sinks`
+unless you already configured one by that name.
+
 APNs results: delivered if at least one device accepted. It is retryable when every
 device failed transiently (429/5xx, network). It is `dead` when the owner has no iOS
 devices or APNs rejected them all.

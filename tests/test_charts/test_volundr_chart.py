@@ -628,6 +628,76 @@ class TestConfigMapTemplate:
         assert parsed.dispatcher.default_rate_limit is None
         assert parsed.sinks[0]["secret_kwargs_env"] == {"secret": "FORGE_OPS_WEBHOOK_SECRET"}
 
+    def test_push_renders_with_the_sink_the_needs_input_push_needs(self):
+        from volundr.config import Settings
+
+        def render(*extra: str) -> list[dict]:
+            result = subprocess.run(
+                ["helm", "template", "test", str(CHART_DIR), *extra],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            return [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+
+        def config(documents: list[dict]) -> dict:
+            configmap = next(
+                doc
+                for doc in documents
+                if doc.get("kind") == "ConfigMap"
+                and doc.get("metadata", {}).get("name") == "test-volundr"
+            )
+            return yaml.safe_load(configmap["data"]["config.yaml"])
+
+        def env(documents: list[dict]) -> dict:
+            deployment = next(
+                doc
+                for doc in documents
+                if doc.get("kind") == "Deployment"
+                and doc.get("metadata", {}).get("name") == "test-volundr"
+            )
+            container = deployment["spec"]["template"]["spec"]["containers"][0]
+            return {item["name"]: item for item in container.get("env", [])}
+
+        off = config(render())
+        assert off["push"]["enabled"] is False
+        assert "notifications" not in off
+        assert Settings(push=off["push"]).push.adapter.endswith("LoggingNotificationChannel")
+
+        documents = render(
+            "--set",
+            "push.enabled=true",
+            "--set",
+            "push.adapter=volundr.adapters.outbound.push_channels.ApnsNotificationChannel",
+            "--set-json",
+            'push.secretKwargs=[{"kwarg":"private_key","secretName":"forge-apns",'
+            '"secretKey":"p8"}]',
+        )
+        on = config(documents)
+        settings = Settings(push=on["push"], notifications=on["notifications"])
+        assert settings.push.enabled and settings.push.attention_sink == "push"
+        assert settings.push.secret_kwargs_env == {"private_key": "PUSH_SK_PRIVATE_KEY"}
+        [sink] = settings.notifications.sinks
+        assert sink["name"] == "push" and sink["adapter"].endswith("PushNotificationSink")
+        secret = env(documents)["PUSH_SK_PRIVATE_KEY"]["valueFrom"]["secretKeyRef"]
+        assert secret == {"name": "forge-apns", "key": "p8"}
+
+        # A sink the operator already configured under that name is kept as is.
+        own = config(
+            render(
+                "--set",
+                "push.enabled=true",
+                "--set",
+                "push.attentionSink=phone",
+                "--set-json",
+                'notifications={"sinks":[{"name":"phone","label":"Mine","adapter":"a.B"}]}',
+            )
+        )
+        assert own["notifications"]["sinks"] == [
+            {"name": "phone", "label": "Mine", "adapter": "a.B"}
+        ]
+        assert Settings(push=own["push"], notifications=own["notifications"])
+
     def test_forge_mcp_section_renders_into_config(self):
         from volundr.config import ForgeMcpConfig
 

@@ -466,13 +466,41 @@ sleipnir:
 #         adapter: niuu.adapters.notifications.webhook.WebhookNotificationSink
 #         url: https://hooks.example.com/forge
 #         secret_kwargs_env: {secret: FORGE_OPS_WEBHOOK_SECRET}
-#       - name: push
-#         label: Forge app push
-#         adapter: volundr.adapters.outbound.push_notification_sink.PushNotificationSink
 #   extraEnv:
 #     - name: FORGE_OPS_WEBHOOK_SECRET
 #       valueFrom: {secretKeyRef: {name: forge-notification-sinks, key: ops-webhook-secret}}
 notifications: {}
+
+# Push to the devices owners register (POST /api/v1/forge/devices), and the
+# needs-input push. `adapter` + `kwargs` build the channel push sinks deliver through
+# (the default only logs). With `enabled`, every session that needs its owner is
+# pushed through the notification outbox: each owner who registers a device gets a
+# "Needs-input pushes" rule targeting the `attentionSink` sink, which the chart adds
+# to notifications.sinks (a PushNotificationSink) unless one by that name is already
+# configured there. Needs notifications enabled (the default). Example (APNs):
+#   push:
+#     enabled: true
+#     adapter: volundr.adapters.outbound.push_channels.ApnsNotificationChannel
+#     kwargs: {team_id: ABCDE12345, key_id: KEY1234567, bundle_id: com.niuu.forge}
+#     secretKwargs:
+#       - {kwarg: private_key, secretName: forge-apns, secretKey: private-key.p8}
+push:
+  # -- Push every session that needs its owner, through the notification outbox
+  enabled: false
+  # -- The notifications sink the per-owner "Needs-input pushes" rule targets
+  attentionSink: push
+  # -- Fully-qualified NotificationChannel class path
+  adapter: volundr.adapters.outbound.push_channels.LoggingNotificationChannel
+  # -- Channel constructor kwargs
+  kwargs: {}
+  # -- Secret kwargs from K8s Secrets, each { kwarg, secretName, secretKey }
+  secretKwargs: []
+  # The push sink the chart adds for `attentionSink` when `enabled`
+  sink:
+    # -- Label shown when owners pick a sink for a rule
+    label: Forge app push
+    # -- Longest push body (APNs caps the whole payload at 4 KB)
+    maxBodyChars: 280
 
 # Forge MCP session credentials and the Forge-hosted MCP endpoint. Rendered verbatim
 # as config.yaml's `forge_mcp:` section (snake_case keys; see ForgeMcpConfig). Empty
