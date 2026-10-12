@@ -149,3 +149,26 @@ async def test_later_forge_cursor_repairs_upstream_authority_and_compute(version
     assert ("000066_compute_leases.up.sql" in names) == (version == 66)
     assert all(int(name[:6]) <= version for name in names)
     conn.execute.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("canonical", "historical"),
+    [
+        ("000074_session_coordination_revision", "000068_session_coordination_revision"),
+        ("000075_session_read_state", "000067_session_read_state"),
+        ("000084_forge_notifications", "000069_forge_notifications"),
+        (
+            "000085_forge_notification_delivery_rate_index",
+            "000070_forge_notification_delivery_rate_index",
+        ),
+        ("000086_forge_notification_reads", "000071_forge_notification_reads"),
+    ],
+)
+def test_renumbered_fork_migrations_alias_their_applied_filenames(canonical, historical):
+    """Forge installs applied these under fork numbers; the canonical file must adopt them."""
+    digest = hashlib.sha256((MIGRATIONS / f"{canonical}.up.sql").read_bytes()).hexdigest()
+    entry = {"filename": f"{historical}.up.sql", "sha256": digest}
+    for directory in (MIGRATIONS, MIGRATIONS.parent / "src/cli/migrations/volundr"):
+        aliases = json.loads((directory / "lineage-aliases.json").read_text())
+        assert entry in aliases[f"{canonical}.up.sql"]
+    assert not (MIGRATIONS / f"{historical}.up.sql").exists()

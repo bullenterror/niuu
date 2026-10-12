@@ -16,6 +16,14 @@ except ImportError:
     _catalog_started = None  # type: ignore[assignment]
     _catalog_failed = None  # type: ignore[assignment]
 
+from niuu.domain.services.forge_session_token import (
+    ForgeSessionTokenService,
+    IssuedForgeSessionToken,
+    new_launch_id,
+)
+from niuu.domain.services.token_scope import FORGE_SESSION_TOKEN_USE
+from niuu.forge_mcp.credentials import grants_from_scopes, normalize_grants
+from niuu.forge_mcp.models import ForgeMcpGrant
 from volundr.domain.execution_catalog import ExecutionCatalogError, ExecutionSelectionError
 from volundr.domain.models import (
     CleanupTarget,
@@ -55,11 +63,20 @@ from volundr.domain.ports import (
     StoragePort,
 )
 from volundr.domain.projects import SessionCoordination
+from volundr.domain.services.forge_session_launch import (
+    ForgeMcpGrantEscalationError,
+    grants_in,
+    launch_id_of,
+    launch_spec_grants,
+    with_forge_mcp,
+    without_forge_mcp,
+)
 from volundr.domain.session_read_state import SessionReadState, SessionReadStateChange
 
 if TYPE_CHECKING:
     from niuu.ports.user_integration import UserIntegrationPort
     from volundr.adapters.outbound.git_registry import GitProviderRegistry
+    from volundr.domain.notification_ports import NotificationRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +174,9 @@ class SessionService:
         execution_resolver: SessionExecutionResolver | None = None,
         public_origin: str = "http://localhost:8080",
         span_repository: SessionSpanRepository | None = None,
+        notification_recorder: NotificationRecorder | None = None,
+        forge_session_tokens: ForgeSessionTokenService | None = None,
+        forge_mcp_default_grants: Iterable[ForgeMcpGrant | str] = (),
         user_integration: UserIntegrationPort | None = None,
     ):
         self._repository = repository
@@ -181,6 +201,9 @@ class SessionService:
         self._communication_route_repository = communication_route_repository
         self._session_communication_port = session_communication_port
         self._span_repository = span_repository
+        self._notification_recorder = notification_recorder
+        self._forge_session_tokens = forge_session_tokens
+        self._forge_mcp_default_grants = frozenset(normalize_grants(forge_mcp_default_grants))
         self._runtime_backend = runtime_backend
         self._execution_resolver = execution_resolver
         normalized_public_origin = public_origin.rstrip("/")
@@ -540,6 +563,21 @@ class SessionService:
                     )
                 )
 
+        # The same "needs the user" transition lands in the notification feed as an
+        # attention notification, deduplicated per request (a retried report of the
+        # same pending request records nothing new).
+        if is_new_attention and self._notification_recorder is not None:
+            await self._record_attention_isolated(updated, session, metadata)
+
+        # ...and once it stops waiting (answered in any client or the terminal, or the
+        # turn ended), its "needs your input" items must not stay unread.
+        if (
+            previous_state is SessionActivityState.AWAITING_INPUT
+            and state is not SessionActivityState.AWAITING_INPUT
+            and self._notification_recorder is not None
+        ):
+            await self._retire_attention_isolated(updated)
+
         # Fan a push out to the owner's devices off the activity hot-path (a slow
         # APNs/webhook call must not delay Skuld's activity report response).
         if is_new_attention and self._attention_notifier is not None:
@@ -562,6 +600,34 @@ class SessionService:
         )
         self._attention_notify_tasks.add(task)
         task.add_done_callback(self._attention_notify_tasks.discard)
+
+    async def _record_attention_isolated(
+        self, updated: Session, previous: Session, metadata: dict
+    ) -> None:
+        """Record the feed's attention notification without risking the activity report.
+
+        The activity transition, its SSE events and the push fan-out must not depend
+        on the notification store, so a failure here is logged and absorbed.
+        """
+        if self._notification_recorder is None:
+            return
+        try:
+            await self._notification_recorder.record_attention(
+                updated,
+                state_since=updated.activity_state_since or previous.activity_state_since,
+                kind=metadata.get("kind", "question"),
+                prompt=metadata.get("prompt", "") or "",
+                request_id=metadata.get("request_id", "") or "",
+            )
+        except Exception:
+            logger.exception("recording the attention notification failed for %s", updated.id)
+
+    async def _retire_attention_isolated(self, updated: Session) -> None:
+        """Retire settled attention items without risking the activity report."""
+        try:
+            await self._notification_recorder.retire_attention(updated)
+        except Exception:
+            logger.exception("retiring attention notifications failed for %s", updated.id)
 
     @staticmethod
     def _is_new_attention_request(
@@ -914,9 +980,12 @@ class SessionService:
         return result
 
     async def update_coordination(
-        self, session: Session, coordination: SessionCoordination, principal: Principal | None
+        self,
+        session: Session,
+        coordination: SessionCoordination | None,
+        principal: Principal | None,
     ) -> Session:
-        """Persist a validated project assignment without touching its runtime."""
+        """Persist a validated project assignment (or its removal) without touching its runtime."""
         from volundr.domain.project_ports import ProjectConflictError
 
         await self._check_access(session, principal, "update")
@@ -1188,6 +1257,12 @@ class SessionService:
         if project_context:
             workload_config = {**(workload_config or {}), "project_context": project_context}
 
+        # Forge MCP grants persist across restarts and every start is a new launch,
+        # which revokes the previous launch's session credential.
+        workload_config = self._with_forge_mcp_launch(
+            session, principal, workload_config, launch_spec
+        )
+
         # Set chat_endpoint eagerly — Flux/Gateway sessions know their public
         # route before the pod is ready; local mode falls back to the root proxy.
         # Refuse here, before the session flips to STARTING, so the caller
@@ -1235,7 +1310,9 @@ class SessionService:
                 system_prompt=system_prompt,
                 initial_prompt=initial_prompt,
                 workload_type=workload_type,
-                workload_config=workload_config,
+                # Contributors never see the credential bookkeeping: an otherwise
+                # empty workload config must still read as empty to them.
+                workload_config=without_forge_mcp(workload_config),
             ),
             name=f"provision-{session_id}",
         )
@@ -1434,7 +1511,9 @@ class SessionService:
             system_prompt=system_prompt,
             initial_prompt=initial_prompt,
             workload_type=workload_type,
-            workload_config=workload_config or {},
+            # Contributors never see the credential bookkeeping: an otherwise
+            # empty workload config must still read as empty to them.
+            workload_config=without_forge_mcp(workload_config),
         )
 
         contributions: list[SessionContribution] = []
@@ -1443,6 +1522,7 @@ class SessionService:
             contributions.append(contribution)
 
         spec = SessionSpec.merge(contributions)
+        spec.forge_session = self._mint_forge_session(session)
         if session.coordination and (
             project_context := session.workload_config.get("project_context")
         ):
@@ -1456,6 +1536,92 @@ class SessionService:
         self._overlay_resume_session(session, spec)
         return await self._pod_manager.start(session, spec=spec)
 
+    def check_forge_mcp_grants(
+        self,
+        principal: Principal | None,
+        requested: Iterable[ForgeMcpGrant | str],
+        *,
+        launch_spec: str | None,
+    ) -> None:
+        """Refuse a new session whose grants exceed a session-credential caller's own.
+
+        Raises :class:`ForgeMcpGrantEscalationError`. Callers that are not session
+        credentials (humans, PATs) may grant anything.
+        """
+        if principal is None or principal.token_use != FORGE_SESSION_TOKEN_USE:
+            return
+        wanted = frozenset(normalize_grants(requested)) | launch_spec_grants(
+            self._launch_spec_for(launch_spec)
+        )
+        beyond = wanted - grants_from_scopes(principal.scopes)
+        if beyond:
+            raise ForgeMcpGrantEscalationError(None, beyond)
+
+    def _with_forge_mcp_launch(
+        self,
+        session: Session,
+        principal: Principal | None,
+        workload_config: dict | None,
+        launch_spec: str | None,
+    ) -> dict:
+        """Merge this start's grants into the stored ones and open a new launch.
+
+        Grants come from the stored session row, the caller (the session-create
+        request) and the launch spec this start applies. A caller holding a session
+        credential may not add grants it does not hold itself.
+        """
+        stored = grants_in(session.workload_config, source=f"session {session.id}")
+        requested = grants_in(workload_config, source="session request")
+        from_spec = launch_spec_grants(self._launch_spec_for(launch_spec))
+        added = (requested | from_spec) - stored
+        if principal is not None and principal.token_use == FORGE_SESSION_TOKEN_USE:
+            beyond = added - grants_from_scopes(principal.scopes)
+            if beyond:
+                raise ForgeMcpGrantEscalationError(session.id, beyond)
+        return with_forge_mcp(
+            workload_config,
+            grants=stored | requested | from_spec,
+            launch_id=new_launch_id(),
+        )
+
+    def _launch_spec_for(self, name: str | None):
+        """The launch spec a start applies (as the launch-spec contributor resolves it)."""
+        if self._launch_spec_provider is None:
+            return None
+        if name:
+            spec = self._launch_spec_provider.get(name)
+            if spec is not None:
+                return spec
+        return self._launch_spec_provider.get_default("session")
+
+    def _mint_forge_session(self, session: Session) -> IssuedForgeSessionToken | None:
+        """Mint this launch's scoped credential, when a broker can receive one."""
+        if self._forge_session_tokens is None:
+            return None
+        if not getattr(self._pod_manager, "delivers_forge_session_token", False):
+            return None
+        launch_id = launch_id_of(session.workload_config)
+        if launch_id is None:
+            raise RuntimeError(f"Session {session.id} started without a Forge MCP launch id")
+        if not session.owner_id:
+            logger.info(
+                "Session %s has no owner; its broker keeps its own Forge credential",
+                session.id,
+            )
+            return None
+        grants = (
+            grants_in(session.workload_config, source=f"session {session.id}")
+            | self._forge_mcp_default_grants
+        )
+        return self._forge_session_tokens.mint(
+            session_id=session.id,
+            session_name=session.name,
+            owner_id=session.owner_id,
+            tenant_id=session.tenant_id,
+            grants=grants,
+            launch_id=launch_id,
+        )
+
     @staticmethod
     def _overlay_resume_session(session: Session, spec: SessionSpec) -> None:
         """Seed the broker with a conversation id to resume, when one exists.
@@ -1465,16 +1631,19 @@ class SessionService:
         transport for their origin. Volundr-born sessions carry the
         ``cli_session_id`` captured from broker activity reports — restarting
         them reloads the prior conversation on whatever transport their
-        definition selects (SDK, persistent subprocess, and Codex WebSocket
+        definition selects (tmux, SDK, persistent subprocess, and Codex WebSocket
         all support resume).
         """
         if session.external_session_id:
             broker = spec.values.setdefault("broker", {})
             broker["resumeSessionId"] = session.external_session_id
             if session.origin == "claude":
+                # Claude Code on Forge runs in tmux so the session stays steerable;
+                # ``claude --resume`` reloads the imported conversation there.
                 broker["cliType"] = "claude"
+                broker["transport"] = "tmux-interactive"
                 broker["transportAdapter"] = (
-                    "skuld.transports.persistent_subprocess.PersistentSubprocessTransport"
+                    "skuld.transports.tmux_interactive.TmuxInteractiveTransport"
                 )
             if session.origin == "codex":
                 broker["cliType"] = "codex-ws"

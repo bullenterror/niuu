@@ -16,13 +16,22 @@ from uuid import UUID, uuid4
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, Response, status
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from niuu.domain.conversation_timeline import resolve_timeline_turn
 from niuu.domain.history_paging import InvalidHistoryCursorError
 from niuu.domain.json_text import json_text_safe
-from niuu.domain.services.token_scope import OPENSHELL_SESSION_TOKEN_USE, require_scope
+from niuu.domain.notifications import notification_visible_to
+from niuu.domain.services.token_scope import (
+    FORGE_NOTIFY_SCOPE,
+    FORGE_SESSION_LIFECYCLE_SCOPE,
+    FORGE_SESSION_MESSAGE_SCOPE,
+    FORGE_SESSION_READ_SCOPE,
+    require_scope,
+)
 from niuu.domain.session_endpoint import public_session_endpoint
 from niuu.domain.text_projection import projection_revision
+from niuu.forge_mcp.models import ForgeMcpGrant
 from niuu.room_access import ROOM_ROLE_HEADER
 from skuld.conversation_shallow import SHALLOW_DETAIL, elide_turns, is_elided_input
 from skuld.conversation_snapshot import (
@@ -38,6 +47,7 @@ from skuld.tool_result_preview import (
     warm_previews_from_turns,
 )
 from volundr.adapters.inbound.auth import extract_principal, require_role
+from volundr.adapters.inbound.forge_session_auth import require_bound_session
 from volundr.adapters.inbound.rest_projects import (
     create_projects_router,
     create_session_projects_router,
@@ -62,12 +72,14 @@ from volundr.domain.models import (
     CleanupTarget,
     DevicePlatform,
     DeviceToken,
+    EventType,
     ExternalSessionRecord,
     GitProviderType,
     GitSource,
     LocalMountSource,
     ModelProvider,
     Principal,
+    RealtimeEvent,
     Session,
     SessionActivityState,
     SessionSource,
@@ -107,6 +119,10 @@ from volundr.domain.services import (
     SessionStateError,
     StatsService,
     TokenService,
+)
+from volundr.domain.services.forge_session_launch import (
+    FORGE_MCP_KEY,
+    ForgeMcpGrantEscalationError,
 )
 from volundr.domain.services.permission_auto_approval import (
     evaluate_permission_auto_approval,
@@ -454,6 +470,21 @@ def _fallback_workspace_transcript(session: Session) -> dict | None:
 _RFC1123_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 
 
+class ForgeMcpSessionOptions(BaseModel):
+    """Forge MCP options for a new session."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    grants: list[ForgeMcpGrant] = Field(
+        default_factory=list,
+        description=(
+            "Operator grants for the session's Forge MCP: 'message' (steer other "
+            "sessions) and 'lifecycle' (create/start/stop sessions). Reading sessions "
+            "and notifying need no grant. They persist across restarts."
+        ),
+    )
+
+
 class SessionCreate(BaseModel):
     """Request model for creating a session."""
 
@@ -571,6 +602,19 @@ class SessionCreate(BaseModel):
         default_factory=dict,
         description="Workload-specific configuration (e.g. personas, mesh, mimir settings)",
     )
+    forge_mcp: ForgeMcpSessionOptions | None = Field(
+        default=None,
+        description="Forge MCP grants for the session (see ForgeMcpSessionOptions).",
+    )
+
+    @field_validator("workload_config")
+    @classmethod
+    def _no_forge_mcp_in_workload_config(cls, value: dict) -> dict:
+        if FORGE_MCP_KEY in value:
+            raise ValueError(
+                "set Forge MCP grants with the top-level forge_mcp field, not workload_config"
+            )
+        return value
 
     @model_validator(mode="before")
     @classmethod
@@ -1640,14 +1684,7 @@ def create_router(
     )
 
     def _require_bound_workload_session(request: Request, session_id: UUID) -> None:
-        if request.headers.get("x-auth-token-use") != OPENSHELL_SESSION_TOKEN_USE:
-            return
-        if request.headers.get("x-auth-workload-session-id") == str(session_id):
-            return
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="OpenShell workload token is not bound to this session",
-        )
+        require_bound_session(request, session_id)
 
     async def _optional_principal(request: Request, *, strict: bool = False) -> Principal | None:
         """Extract principal if identity is configured, else return None.
@@ -1748,16 +1785,29 @@ def create_router(
         settings = request.app.state.settings
         admin = request.app.state.admin_settings
         storage = request.app.state.storage
+        # True exactly when the notification feed routes are served on this host.
+        notifications = getattr(request.app.state, "notification_service", None) is not None
+        session_tokens = getattr(request.app.state, "forge_session_tokens", None)
         return {
             "local_mounts_enabled": settings.local_mounts.enabled,
             "file_manager_enabled": admin.get("storage", {}).get("file_manager_enabled", True),
             "home_volumes_supported": storage.supports_home_volumes,
             "mini_mode": settings.local_mounts.mini_mode,
             "local_mounts_allowed_prefixes": settings.local_mounts.allowed_prefixes,
-            "capabilities": {"local_session_scope": True},
+            "capabilities": {
+                "local_session_scope": True,
+                "notifications": notifications,
+                "forge_session_tokens": session_tokens is not None,
+                "forge_session_token_key": session_tokens.key_source if session_tokens else None,
+                "forge_mcp_http": getattr(request.app.state, "forge_mcp_http", False),
+            },
+            "notifications_enabled": notifications,
             "projects_enabled": project_service is not None,
             "project_assignment_enabled": project_service is not None,
-            "project_contract_version": 1 if project_service is not None else 0,
+            # 2: name-only projects, optional repository, brief, and assignment
+            # with role/parent/detach. Every version-1 request is still accepted.
+            "project_contract_version": 2 if project_service is not None else 0,
+            "project_lightweight": project_service is not None,
             "project_instance_id": project_service.instance_id if project_service else None,
         }
 
@@ -1843,7 +1893,12 @@ def create_router(
             ),
         )
 
-    @router.get("/sessions", response_model=None, tags=["Sessions"])
+    @router.get(
+        "/sessions",
+        response_model=None,
+        tags=["Sessions"],
+        dependencies=[Depends(require_scope(FORGE_SESSION_READ_SCOPE))],
+    )
     async def list_sessions(
         request: Request,
         response: Response,
@@ -1932,6 +1987,7 @@ def create_router(
         - session_deleted: When a session is deleted
         - stats_updated: Periodic stats updates (every 30s)
         - heartbeat: Keep-alive signal (every 30s)
+        - session_notification: A new notification (sent only to its owner or an admin)
 
         Session events are scoped like ``GET /sessions``: a caller receives
         events for its own sessions, or for its tenant's sessions as a tenant
@@ -1960,6 +2016,24 @@ def create_router(
 
         client_host = request.client.host if request.client else "unknown"
         logger.info("SSE stream: client connected from %s", client_host)
+        # Notifications are owner-scoped: only the owner (or an admin of its tenant)
+        # receives one. With no identity adapter at all (bare dev app) nothing is
+        # scoped; with one, an unidentified client gets no notification events.
+        open_stream = getattr(request.app.state, "identity", None) is None
+        viewer = None if open_stream else principal
+
+        def _visible(event: RealtimeEvent) -> bool:
+            if event.type is not EventType.SESSION_NOTIFICATION or open_stream:
+                return True
+            if viewer is None:
+                return False
+            return notification_visible_to(
+                user_id=viewer.user_id,
+                roles=viewer.roles,
+                tenant_id=viewer.tenant_id,
+                owner_id=event.data.get("owner_id"),
+                notification_tenant_id=event.data.get("tenant_id"),
+            )
 
         async def event_generator():
             event_count = 0
@@ -1973,6 +2047,8 @@ def create_router(
                             event_count,
                         )
                         break
+                    if not _visible(event):
+                        continue
 
                     # Format as SSE
                     event_data = json.dumps(event.data)
@@ -2148,7 +2224,9 @@ def create_router(
     async def create_session(
         request: Request,
         data: SessionCreate,
-        _build_scope: None = Depends(require_scope("forge:session:create")),
+        _build_scope: None = Depends(
+            require_scope("forge:session:create", FORGE_SESSION_LIFECYCLE_SCOPE)
+        ),
     ) -> SessionResponse:
         """Create and start a new session.
 
@@ -2164,6 +2242,8 @@ def create_router(
             started = await project_result(
                 forge.create_and_start_session(data, principal=principal)
             )
+        except ForgeMcpGrantEscalationError as e:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
         except RepoValidationError as e:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -2185,6 +2265,7 @@ def create_router(
 
     @router.get(
         "/sessions/{session_id}",
+        dependencies=[Depends(require_scope(FORGE_SESSION_READ_SCOPE))],
         response_model=SessionResponse,
         responses={404: {"model": ErrorResponse}},
         tags=["Sessions"],
@@ -2456,6 +2537,7 @@ def create_router(
 
     @router.post(
         "/sessions/{session_id}/start",
+        dependencies=[Depends(require_scope(FORGE_SESSION_LIFECYCLE_SCOPE))],
         response_model=SessionResponse,
         responses={
             404: {"model": ErrorResponse},
@@ -2467,6 +2549,7 @@ def create_router(
     )
     @router.post(
         "/sessions/{session_id}/resume",
+        dependencies=[Depends(require_scope(FORGE_SESSION_LIFECYCLE_SCOPE))],
         response_model=SessionResponse,
         responses={
             404: {"model": ErrorResponse},
@@ -2498,6 +2581,8 @@ def create_router(
                 integration_ids=data.integration_ids if data else None,
             )
             return _session_response(session)
+        except ForgeMcpGrantEscalationError as e:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
         except SessionAccessDeniedError:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -2523,6 +2608,7 @@ def create_router(
 
     @router.post(
         "/sessions/{session_id}/stop",
+        dependencies=[Depends(require_scope(FORGE_SESSION_LIFECYCLE_SCOPE))],
         response_model=SessionResponse,
         responses={
             404: {"model": ErrorResponse},
@@ -2556,6 +2642,7 @@ def create_router(
 
     @router.post(
         "/sessions/{session_id}/activity",
+        dependencies=[Depends(require_scope(FORGE_NOTIFY_SCOPE))],
         status_code=status.HTTP_204_NO_CONTENT,
         responses={404: {"model": ErrorResponse}, 422: {"model": ErrorResponse}},
         tags=["Sessions"],
@@ -2817,6 +2904,7 @@ def create_router(
 
     @router.post(
         "/sessions/{session_id}/usage",
+        dependencies=[Depends(require_scope(FORGE_NOTIFY_SCOPE))],
         response_model=TokenUsageResponse,
         status_code=status.HTTP_201_CREATED,
         responses={
@@ -3203,6 +3291,7 @@ def create_router(
 
     @router.post(
         "/sessions/{session_id}/messages",
+        dependencies=[Depends(require_scope(FORGE_SESSION_MESSAGE_SCOPE))],
         tags=["Sessions"],
         responses={
             404: {"model": ErrorResponse},
@@ -3431,6 +3520,7 @@ def create_router(
 
     @router.get(
         "/sessions/{session_id}/conversation",
+        dependencies=[Depends(require_scope(FORGE_SESSION_READ_SCOPE))],
         tags=["Sessions"],
         responses={
             404: {"model": ErrorResponse},
@@ -3521,7 +3611,7 @@ def create_router(
                 return payload
             all_turns = payload["turns"]
             if turn_id is not None:
-                turn = next((t for t in all_turns if t.get("id") == turn_id), None)
+                turn = resolve_timeline_turn(all_turns, turn_id)
                 if turn is None:
                     raise HTTPException(404, "History item no longer exists in this projection")
                 return {
@@ -3845,10 +3935,21 @@ def create_router(
                 detail=str(e),
             )
 
-    @router.get("/sessions/{session_id}/conversation/turns/{turn_id}", tags=["Sessions"])
+    @router.get(
+        "/sessions/{session_id}/conversation/turns/{turn_id}",
+        tags=["Sessions"],
+        dependencies=[Depends(require_scope(FORGE_SESSION_READ_SCOPE))],
+    )
     async def get_conversation_item(request: Request, session_id: UUID, turn_id: str) -> dict:
-        """Explicit full-item expansion, never used for automatic history recovery."""
-        return await get_conversation(
+        """Explicit full-item expansion, never used for automatic history recovery.
+
+        Also reports where the turn sits (``index`` of ``total_turns``) in the complete
+        shallow listing, the same absolute index space the windowed read pages through, so
+        a client can open the transcript at it (``after=index-1``). A live broker may answer
+        the item request with only that turn, so the position is never taken from the item
+        response itself. ``index`` is null when the turn is outside the current listing.
+        """
+        item = await get_conversation(
             request=request,
             session_id=session_id,
             detail="full",
@@ -3861,6 +3962,27 @@ def create_router(
             cursor=None,
             turn_id=turn_id,
         )
+        listing = await get_conversation(
+            request=request,
+            session_id=session_id,
+            detail="shallow",
+            limit=0,
+            before=0,
+            after=-1,
+            max_bytes=0,
+            after_id=None,
+            history_protocol=0,
+            cursor=None,
+            turn_id=None,
+        )
+        turns = listing.get("turns") if isinstance(listing, dict) else None
+        turns = turns if isinstance(turns, list) else []
+        resolved_id = item["turn"]["id"]
+        index = next(
+            (i for i, t in enumerate(turns) if isinstance(t, dict) and t.get("id") == resolved_id),
+            None,
+        )
+        return {**item, "index": index, "total_turns": len(turns), "requested_turn_id": turn_id}
 
     async def _fetch_full_tool_result(
         request: Request,
@@ -4470,6 +4592,7 @@ def create_router(
 
     @router.get(
         "/sessions/{session_id}/transcript",
+        dependencies=[Depends(require_scope(FORGE_SESSION_READ_SCOPE))],
         tags=["Sessions"],
         responses={
             404: {"model": ErrorResponse},
@@ -4500,6 +4623,7 @@ def create_router(
 
     @router.get(
         "/sessions/{session_id}/transcript/download",
+        dependencies=[Depends(require_scope(FORGE_SESSION_READ_SCOPE))],
         tags=["Sessions"],
         responses={
             400: {"model": ErrorResponse},

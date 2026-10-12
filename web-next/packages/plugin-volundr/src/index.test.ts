@@ -2,6 +2,7 @@ import { createRootRoute } from '@tanstack/react-router';
 import { UI_MODE_STORAGE_KEY } from '@niuulabs/shell';
 import { afterEach, describe, expect, it } from 'vitest';
 import { volundrPlugin } from './index';
+import { useUnreadNotificationCount } from './ui/hooks/useNotifications';
 
 /** The path a thrown TanStack redirect points at. */
 function redirectTarget(beforeLoad: unknown): string {
@@ -31,6 +32,12 @@ describe('volundrPlugin', () => {
       { id: 'forge', label: 'Forge', path: '/volundr/forge' },
       { id: 'sessions', label: 'Sessions', path: '/volundr/sessions' },
       { id: 'catalog', label: 'Catalog', path: '/volundr/catalog' },
+      {
+        id: 'notifications',
+        label: 'Notifications',
+        path: '/volundr/notifications',
+        useCount: useUnreadNotificationCount,
+      },
     ]);
   });
 
@@ -45,6 +52,7 @@ describe('volundrPlugin', () => {
     expect(paths).toContain('/volundr/sessions/new');
     expect(paths).toContain('/volundr/sessions/$sessionId');
     expect(paths).toContain('/volundr/catalog');
+    expect(paths).toContain('/volundr/notifications');
     expect(paths).not.toContain('/volundr/templates');
     expect(paths).toContain('/volundr/credentials');
     expect(paths).toContain('/volundr/clusters');

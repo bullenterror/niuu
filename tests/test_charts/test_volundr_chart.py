@@ -584,6 +584,80 @@ class TestConfigMapTemplate:
 
         assert config["resident_runtimes"]["profiles"] == []
 
+    def test_notifications_section_renders_into_config(self):
+        from volundr.config import NotificationsConfig
+
+        def render(*extra: str) -> dict:
+            result = subprocess.run(
+                ["helm", "template", "test", str(CHART_DIR), *extra],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            documents = [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+            configmap = next(
+                doc
+                for doc in documents
+                if doc.get("kind") == "ConfigMap"
+                and doc.get("metadata", {}).get("name") == "test-volundr"
+            )
+            return yaml.safe_load(configmap["data"]["config.yaml"])
+
+        assert "notifications" not in render()
+        sinks = '[{"name":"ops","adapter":"a.B","url":"https://x"}]'
+        config = render(
+            "--set-json",
+            f'notifications={{"reply_ready":{{"body_chars":400}},"sinks":{sinks}}}',
+        )
+        parsed = NotificationsConfig.model_validate(config["notifications"])
+        assert parsed.reply_ready.body_chars == 400
+        assert parsed.sinks[0]["url"] == "https://x"
+
+        delivery = render(
+            "--set-json",
+            'notifications={"public_web_url":"https://forge.example.com",'
+            '"dispatcher":{"max_attempts":5,"default_rate_limit":null},'
+            '"integration_sinks":{"telegram":"niuu.adapters.notifications.telegram.'
+            'TelegramNotificationSink"},'
+            '"sinks":[{"name":"ops","adapter":"a.B","url":"https://x",'
+            '"secret_kwargs_env":{"secret":"FORGE_OPS_WEBHOOK_SECRET"}}]}',
+        )
+        parsed = NotificationsConfig.model_validate(delivery["notifications"])
+        assert parsed.public_web_url == "https://forge.example.com"
+        assert parsed.dispatcher.max_attempts == 5
+        assert parsed.dispatcher.default_rate_limit is None
+        assert parsed.sinks[0]["secret_kwargs_env"] == {"secret": "FORGE_OPS_WEBHOOK_SECRET"}
+
+    def test_forge_mcp_section_renders_into_config(self):
+        from volundr.config import ForgeMcpConfig
+
+        def render(*extra: str) -> dict:
+            result = subprocess.run(
+                ["helm", "template", "test", str(CHART_DIR), *extra],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            documents = [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+            configmap = next(
+                doc
+                for doc in documents
+                if doc.get("kind") == "ConfigMap"
+                and doc.get("metadata", {}).get("name") == "test-volundr"
+            )
+            return yaml.safe_load(configmap["data"]["config.yaml"])
+
+        assert "forge_mcp" not in render()
+        config = render(
+            "--set-json",
+            'forgeMcp={"default_grants":["message"],"session_tokens":{"ttl_seconds":604800},'
+            '"http":{"allowed_origins":["https://forge.example.com"]}}',
+        )
+        parsed = ForgeMcpConfig.model_validate(config["forge_mcp"])
+        assert [grant.value for grant in parsed.default_grants] == ["message"]
+        assert parsed.session_tokens.ttl_seconds == 604800
+        assert parsed.http.allowed_origins == ["https://forge.example.com"]
+
     def test_observability_is_absent_by_default(self):
         """config.observability: {} (the default) must not render a block
         that would validate as enabled: false with no endpoints — Helm's

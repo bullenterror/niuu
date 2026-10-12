@@ -1677,6 +1677,54 @@ class TestWorkflowGateProxy:
         assert response.json()["detail"] == "Session archive service not available"
 
 
+class TestConversationTurnPosition:
+    """A turn's position comes from the full listing, even when the broker answers the
+    item request with only that turn (as live brokers do)."""
+
+    @pytest.mark.asyncio
+    async def test_live_turn_reports_its_position_in_the_full_listing(
+        self,
+        client: TestClient,
+        service: SessionService,
+    ) -> None:
+        session = await service.create_session(
+            "live",
+            "claude-sonnet-4",
+            source=GitSource(repo="https://github.com/org/repo", branch="main"),
+        )
+        session = session.with_endpoints(
+            f"ws://localhost:8080/s/{session.id}/session",
+            "https://workspace.example.com/session",
+        ).with_status(SessionStatus.RUNNING)
+        await service._repository.update(session)
+        turns = [
+            {"id": "u1", "role": "user", "content": "hi", "parts": []},
+            {"id": "a1", "role": "assistant", "content": "hello", "parts": []},
+            {"id": "a2", "role": "assistant", "content": "done", "parts": []},
+        ]
+
+        def reply(url, headers=None, params=None):
+            response = MagicMock(spec=httpx.Response)
+            response.status_code = 200
+            response.raise_for_status = MagicMock()
+            only = (params or {}).get("turn_id")
+            body = [t for t in turns if t["id"] == only] if only else turns
+            response.json.return_value = {"turns": body, "is_active": False}
+            return response
+
+        with patch("volundr.adapters.inbound.rest.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.get.side_effect = reply
+            mock_client_cls.return_value.__aenter__.return_value = mock_client
+
+            found = client.get(f"/api/v1/forge/sessions/{session.id}/conversation/turns/a2")
+
+        assert found.status_code == 200
+        body = found.json()
+        assert body["turn"]["id"] == "a2"
+        assert (body["index"], body["total_turns"]) == (2, 3)
+
+
 class TestHelpRequestProxy:
     """Peer help requests (agent questions) proxy to the session pod."""
 
@@ -1875,6 +1923,29 @@ class TestFeatureFlags:
         data = response.json()
         assert "local_mounts_allowed_prefixes" in data
         assert isinstance(data["local_mounts_allowed_prefixes"], list)
+
+    def test_feature_flags_report_notifications_only_when_served(self, client: TestClient):
+        """The flag follows whether the notification feed is composed on this host."""
+        data = client.get("/api/v1/forge/feature-flags").json()
+        assert data["notifications_enabled"] is False
+        assert data["capabilities"]["notifications"] is False
+        client.app.state.notification_service = object()
+        data = client.get("/api/v1/forge/feature-flags").json()
+        assert data["notifications_enabled"] is True
+        assert data["capabilities"]["notifications"] is True
+
+    def test_feature_flags_report_forge_mcp_credentials(self, client: TestClient):
+        """Session credentials and the HTTP MCP are reported, never silently absent."""
+        capabilities = client.get("/api/v1/forge/feature-flags").json()["capabilities"]
+        assert capabilities["forge_session_tokens"] is False
+        assert capabilities["forge_session_token_key"] is None
+        assert capabilities["forge_mcp_http"] is False
+        client.app.state.forge_session_tokens = type("T", (), {"key_source": "key_file"})()
+        client.app.state.forge_mcp_http = True
+        capabilities = client.get("/api/v1/forge/feature-flags").json()["capabilities"]
+        assert capabilities["forge_session_tokens"] is True
+        assert capabilities["forge_session_token_key"] == "key_file"
+        assert capabilities["forge_mcp_http"] is True
 
 
 class TestStatsResponse:

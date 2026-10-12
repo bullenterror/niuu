@@ -77,6 +77,14 @@ data:
       {{- else }}
       secret_kwargs_env: {}
       {{- end }}
+    {{- with .Values.notifications }}
+
+    notifications: {{ toJson . }}
+    {{- end }}
+    {{- with .Values.forgeMcp }}
+
+    forge_mcp: {{ toJson . }}
+    {{- end }}
 
     pod_manager:
       adapter: {{ .Values.podManager.adapter | quote }}
