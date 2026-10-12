@@ -308,8 +308,8 @@ class TestWebhookSink:
         with pytest.raises(NotificationDeliveryError) as info:
             await sink.send(message())
         assert not info.value.retryable
-        assert "T0KEN-PATH" not in str(info.value)
-        assert "https://hooks.example.com" in str(info.value)
+        # Only the scheme and host survive redaction: no token path, no query.
+        assert str(info.value) == f"webhook https://hooks.example.com returned HTTP {status}"
 
     async def test_network_errors_are_retryable_and_redacted(self):
         def handler(request: httpx.Request) -> httpx.Response:
