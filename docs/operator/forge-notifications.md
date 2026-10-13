@@ -315,6 +315,36 @@ In the Volundr Helm chart, set `push.enabled`, `push.adapter`, `push.kwargs` and
 The chart adds the push sink named by `push.attentionSink` to `notifications.sinks`
 unless you already configured one by that name.
 
+**Devices and keys outside mini mode.** Clusters keep integrations and their secrets in
+one place, and push follows that. With `push.device_registry: auto` (the default; chart
+`push.deviceRegistry`), a registered device outside mini mode is the owner's **messaging
+integration** connection (slug `push-device`, listed and disableable with their other
+integrations), and its token is stored in the credential store (OpenBao on the
+clusters). Mini mode keeps the `device_tokens` table. Push devices are never attached to
+sessions and are not built as Ting channels. Set `postgres` or `integrations` to choose
+explicitly.
+
+The APNs signing key belongs in the credential store too: use
+`volundr.adapters.outbound.push_channels.CredentialStoreApnsNotificationChannel` and have a
+tenant admin store a tenant credential named `apns` (`POST /api/v1/credentials/tenant`, or
+Settings → tenant credentials) with `team_id`, `key_id` and `private_key` (the whole .p8,
+PEM header included), optionally `bundle_id` and `use_sandbox`. A device records the tenant
+its owner registered it in, and is pushed with that tenant's key, so nothing names a
+tenant in configuration:
+
+```yaml
+push:
+  enabled: true
+  adapter: volundr.adapters.outbound.push_channels.CredentialStoreApnsNotificationChannel
+  kwargs: {bundle_id: com.niuu.lexi.chat}
+```
+
+The key is read before each delivery, so rotating it needs no restart, and a missing key
+fails the delivery (recorded on the outbox row) rather than Volundr's start. A device that
+registers with `environment` (`sandbox` for development builds, `production` for
+TestFlight/App Store) is pushed through that APNs host; otherwise the channel default
+(`use_sandbox`) applies. APNs requires HTTP/2, which the `httpx[http2]` extra provides.
+
 APNs results: delivered if at least one device accepted. It is retryable when every
 device failed transiently (429/5xx, network). It is `dead` when the owner has no iOS
 devices or APNs rejected them all.

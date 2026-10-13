@@ -285,7 +285,7 @@ def _create_notification_delivery(
     if config.enabled and config.dispatcher.enabled:
         # A broken push.adapter is a configuration error: raise rather than run
         # delivery with every push rule quietly failing.
-        push_channel = create_push_channel(settings)
+        push_channel = create_push_channel(settings, credential_store=credential_store)
     return create_notification_delivery(
         settings,
         pool,
@@ -1008,6 +1008,17 @@ def create_app(
                 )
             else:
                 integration_repo = PostgresIntegrationRepository(integration_pool)
+            # Outside mini mode a push device is an integration: a messaging connection
+            # whose token lives in the credential store with every other integration secret.
+            if settings.push.uses_integration_devices(mini_mode=settings.local_mounts.mini_mode):
+                from volundr.adapters.outbound.integration_device_tokens import (
+                    IntegrationDeviceTokenRepository,
+                )
+
+                device_repository = IntegrationDeviceTokenRepository(
+                    integration_repo, credential_store
+                )
+                logger.info("Push devices: integration connections (credential store)")
             mapping_repository = PostgresMappingRepository(pool)
             notification_service = _create_notification_service(
                 settings, pool, broadcaster=broadcaster, integration_repository=integration_repo

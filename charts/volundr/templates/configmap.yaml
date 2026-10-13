@@ -107,6 +107,7 @@ data:
       attention_sink: {{ .Values.push.attentionSink | default "push" | quote }}
       adapter: {{ .Values.push.adapter | quote }}
       kwargs: {{ .Values.push.kwargs | default dict | toJson }}
+      device_registry: {{ .Values.push.deviceRegistry | default "auto" | quote }}
       {{- if .Values.push.secretKwargs }}
       secret_kwargs_env:
         {{- range .Values.push.secretKwargs }}

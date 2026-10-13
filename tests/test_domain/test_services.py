@@ -822,6 +822,26 @@ class TestSessionServiceStart:
         assert len(pod_manager.stop_calls) == (1 if launch_fails else 0)
         await asyncio.gather(*service._provisioning_tasks.values())
 
+    async def test_push_devices_are_never_session_integrations(
+        self, repository, pod_manager, monkeypatch
+    ):
+        from types import SimpleNamespace
+
+        integrations = AsyncMock()
+        integrations.list_connections.return_value = [
+            SimpleNamespace(id="ai", enabled=True, slug="anthropic"),
+            SimpleNamespace(id="phone", enabled=True, slug="push-device"),
+        ]
+        service = SessionService(repository, pod_manager, integration_repo=integrations)
+        monkeypatch.setattr(service, "_poll_readiness", AsyncMock())
+        session = await service.create_session(name="no-phone", model="claude-sonnet-5")
+        await service._provision_background(
+            session, SimpleNamespace(user_id="owner"), None, None, False
+        )
+        stored = await repository.get(session.id)
+        assert stored.workload_config["integration_ids"] == ["ai"]
+        await asyncio.gather(*service._provisioning_tasks.values())
+
     async def test_provisioning_timeout_reports_error_and_cleans_up(
         self, repository, pod_manager, monkeypatch
     ):

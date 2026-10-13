@@ -115,6 +115,26 @@ def test_push_channel_comes_from_push_config():
         create_push_channel(bad)
 
 
+def test_credential_store_push_channel_is_given_the_store():
+    from niuu.adapters.memory_credential_store import MemoryCredentialStore
+    from volundr.adapters.outbound.push_channels import CredentialStoreApnsNotificationChannel
+
+    store = MemoryCredentialStore()
+    settings = Settings(
+        push={
+            "adapter": (
+                "volundr.adapters.outbound.push_channels.CredentialStoreApnsNotificationChannel"
+            ),
+            "kwargs": {"bundle_id": "com.niuu.lexi.chat"},
+        }
+    )
+    channel = create_push_channel(settings, credential_store=store)
+    assert isinstance(channel, CredentialStoreApnsNotificationChannel)
+    assert channel._credential_store is store  # noqa: SLF001
+    with pytest.raises(ValueError, match="needs a credential store"):
+        create_push_channel(settings)
+
+
 def test_main_builds_a_push_channel_for_push_sinks():
     from volundr.main import _create_notification_delivery
 

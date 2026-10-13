@@ -786,6 +786,21 @@ class PushNotificationConfig(BaseModel):
             bundle_id: "com.niuu.forge"
           secret_kwargs_env:
             private_key: "APNS_PRIVATE_KEY"
+
+    Outside mini mode the key belongs in the credential store with the other
+    integration secrets: use ``CredentialStoreApnsNotificationChannel`` and have a
+    tenant admin store a tenant credential named ``apns`` (``team_id``, ``key_id``,
+    ``private_key``). Each device is pushed with the key of the tenant its owner
+    registered it in, so no tenant is configured::
+
+        push:
+          enabled: true
+          adapter: "volundr.adapters.outbound.push_channels.CredentialStoreApnsNotificationChannel"
+          kwargs:
+            bundle_id: "com.niuu.lexi.chat"   # default topic; a credential's bundle_id wins
+
+    Registered devices are then the owners' push-device integrations
+    (``device_registry``), their tokens in the credential store too.
     """
 
     enabled: bool = Field(
@@ -808,6 +823,20 @@ class PushNotificationConfig(BaseModel):
         default_factory=dict,
         description="Mapping of kwarg names to env var names holding secret values.",
     )
+    device_registry: Literal["auto", "postgres", "integrations"] = Field(
+        default="auto",
+        description=(
+            "Where registered push devices live. 'integrations': each device is the owner's "
+            "messaging integration connection with its token in the credential store. "
+            "'postgres': the device_tokens table. 'auto': postgres in mini mode, else integrations."
+        ),
+    )
+
+    def uses_integration_devices(self, *, mini_mode: bool) -> bool:
+        """Whether push devices are stored as integrations (see ``device_registry``)."""
+        if self.device_registry == "auto":
+            return not mini_mode
+        return self.device_registry == "integrations"
 
 
 class NotificationReplyReadyConfig(BaseModel):

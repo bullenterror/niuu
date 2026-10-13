@@ -16,6 +16,7 @@ except ImportError:
     _catalog_started = None  # type: ignore[assignment]
     _catalog_failed = None  # type: ignore[assignment]
 
+from niuu.domain.models import is_push_device
 from niuu.domain.services.forge_session_token import (
     ForgeSessionTokenService,
     IssuedForgeSessionToken,
@@ -1440,6 +1441,9 @@ class SessionService:
                 principal.user_id,
             )
             resolved_connections = [c for c in all_connections if c.enabled]
+        # Registered push devices are delivery targets, not session integrations: their
+        # token must never be injected into a pod, even when a client selects "all".
+        resolved_connections = [c for c in resolved_connections if not is_push_device(c)]
 
         if integration_ids and self._integration_repo is None:
             raise ValueError("Selected integrations require a configured integration repository")

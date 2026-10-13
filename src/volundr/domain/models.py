@@ -254,6 +254,14 @@ class DeviceToken(BaseModel):
         default=None,
         description="APNs topic (bundle id) to target; falls back to the channel default",
     )
+    environment: str | None = Field(
+        default=None,
+        description="APNs environment of the token: 'sandbox' (development builds) or 'production'",
+    )
+    tenant_id: str | None = Field(
+        default=None,
+        description="Tenant of the owner when the device registered; its push credentials apply",
+    )
     created_at: datetime = Field(default_factory=_utc_now)
     updated_at: datetime = Field(default_factory=_utc_now)
 
