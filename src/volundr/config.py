@@ -14,6 +14,7 @@ All configuration MUST flow through the Settings class.
 """
 
 import os
+import re
 from pathlib import Path
 from typing import Any, Literal
 
@@ -26,6 +27,7 @@ from pydantic_settings import (
 )
 
 from bifrost.config import BifrostConfig
+from niuu.adapters.notifications.integrations import DEFAULT_INTEGRATION_SINKS
 from niuu.config import (
     CorsConfig,
     DynamicAdapterConfig,
@@ -43,7 +45,9 @@ from niuu.config_models import (
     default_session_definitions,
 )
 from niuu.domain.delivery import AcceptancePolicy
+from niuu.domain.notifications import MAX_BODY_CHARS, MAX_TITLE_CHARS
 from niuu.domain.observability import ObservabilityConfig
+from niuu.forge_mcp.models import ForgeMcpGrant
 from ravn.config import LLMConfig, PersonaSourceConfig
 from volundr.compute.config import ComputeConfig
 from volundr.domain.mcp_hosts import normalize_internal_host_pattern
@@ -54,6 +58,12 @@ from volundr.domain.models import (
     ResidentCapability,
     ResidentEngine,
     SecretType,
+)
+from volundr.domain.notifications import (
+    INTEGRATION_SINK,
+    MAX_SINK_NAME_CHARS,
+    SINK_NAME_PATTERN,
+    NotificationRateLimit,
 )
 
 __all__ = ["GitHubInstance", "GitLabInstance"]
@@ -754,18 +764,22 @@ class SleipnirConfig(BaseModel):
 
 
 class PushNotificationConfig(BaseModel):
-    """Push / attention notification fan-out (optional).
+    """The push channel, and the needs-input push (optional).
 
-    When enabled, a session entering ``awaiting_input`` dispatches a push to the
-    owner's registered devices through the configured NotificationChannel
-    adapter. Off by default; the default adapter only logs.
+    ``adapter`` + ``kwargs`` build the NotificationChannel that push sinks deliver
+    through (the default adapter only logs). With ``enabled``, every owner who
+    registers a device gets a "Needs-input pushes" delivery rule targeting
+    ``attention_sink``, so each session entering ``awaiting_input`` is pushed
+    through the notification outbox (retried, recorded, quiet hours honoured).
+    That needs ``notifications.enabled`` and a ``notifications.sinks`` entry
+    named ``attention_sink``.
 
     Example YAML::
 
         push:
           enabled: true
+          attention_sink: push
           adapter: "volundr.adapters.outbound.push_channels.ApnsNotificationChannel"
-          min_urgency: 0.8
           kwargs:
             team_id: "ABCDE12345"
             key_id: "KEY1234567"
@@ -776,7 +790,14 @@ class PushNotificationConfig(BaseModel):
 
     enabled: bool = Field(
         default=False,
-        description="Enable push notifications for sessions that need attention.",
+        description=(
+            "Push every session that needs its owner: give each owner who registers a "
+            "device a delivery rule for it (needs notifications.enabled)."
+        ),
+    )
+    attention_sink: str = Field(
+        default="push",
+        description="The notifications.sinks entry the needs-input push rule delivers through.",
     )
     adapter: str = Field(
         default="volundr.adapters.outbound.push_channels.LoggingNotificationChannel",
@@ -787,12 +808,314 @@ class PushNotificationConfig(BaseModel):
         default_factory=dict,
         description="Mapping of kwarg names to env var names holding secret values.",
     )
-    min_urgency: float = Field(
-        default=0.8,
+
+
+class NotificationReplyReadyConfig(BaseModel):
+    """The automatic ``reply_ready`` notification raised for each final reply.
+
+    Off by default: a notification for every final reply buries the ones agents send on
+    purpose. Agents report a finished task with their own ``milestone`` instead.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description="Record a reply_ready notification for every final assistant reply.",
+    )
+    title_chars: int = Field(
+        default=120,
+        ge=1,
+        le=MAX_TITLE_CHARS,
+        description="Title length (the reply's first line) before it is truncated.",
+    )
+    body_chars: int = Field(
+        default=280,
+        ge=0,
+        le=MAX_BODY_CHARS,
+        description="Length of the reply excerpt kept as the notification body.",
+    )
+
+
+class NotificationDispatcherConfig(BaseModel):
+    """Outbox dispatcher: the background loop that delivers notifications to sinks."""
+
+    enabled: bool = Field(
+        default=True,
+        description=(
+            "Run the outbox dispatcher (needs notifications.enabled). It only sends what "
+            "an owner rule selects, so it is idle until a rule exists."
+        ),
+    )
+    poll_interval_seconds: float = Field(
+        default=2.0, gt=0, description="Pause between outbox polls when nothing is due."
+    )
+    batch_size: int = Field(default=50, ge=1, description="Deliveries claimed per poll.")
+    lease_seconds: float = Field(
+        default=60.0,
+        gt=0,
+        description="How long a claim is held before another worker may re-claim it.",
+    )
+    send_timeout_seconds: float = Field(
+        default=20.0,
+        gt=0,
+        description=(
+            "Upper bound for one sink send. Must be shorter than lease_seconds; a send "
+            "is only started while at least this much of its lease remains."
+        ),
+    )
+    max_concurrent_sends: int = Field(
+        default=8, ge=1, description="Sends in flight at once within one poll."
+    )
+    max_attempts: int = Field(
+        default=8, ge=1, description="Attempts before a delivery is marked dead."
+    )
+    backoff_base_seconds: float = Field(
+        default=5.0, gt=0, description="First retry delay; doubles on each attempt."
+    )
+    backoff_max_seconds: float = Field(
+        default=900.0, gt=0, description="Upper bound for the retry delay."
+    )
+    backoff_jitter_ratio: float = Field(
+        default=0.2,
         ge=0.0,
         le=1.0,
-        description="Drop pushes below this urgency.",
+        description="Random spread applied to each retry delay (0.2 = up to ±20%).",
     )
+    default_rate_limit: NotificationRateLimit | None = Field(
+        default_factory=lambda: NotificationRateLimit(max_count=60, window_seconds=3600),
+        description=(
+            "Rate limit for rules that set no config.rate_limit: at most max_count "
+            "deliveries per rule in any window_seconds. Null disables the default."
+        ),
+    )
+    max_error_chars: int = Field(
+        default=2000, ge=1, description="Longest delivery error kept on the outbox row."
+    )
+
+    @model_validator(mode="after")
+    def _ordered_timing(self) -> "NotificationDispatcherConfig":
+        if self.backoff_base_seconds > self.backoff_max_seconds:
+            raise ValueError("backoff_base_seconds must not exceed backoff_max_seconds")
+        if self.send_timeout_seconds >= self.lease_seconds:
+            raise ValueError("send_timeout_seconds must be shorter than lease_seconds")
+        return self
+
+
+class NotificationsConfig(BaseModel):
+    """Forge session notifications: the feed, the projection and external delivery.
+
+    Nothing is delivered externally by default: a sink must be configured here (or
+    an owner's messaging integration used) and an owner rule must select it.
+
+    Example YAML::
+
+        notifications:
+          enabled: true
+          reply_ready:
+            enabled: false
+            title_chars: 120
+            body_chars: 280
+          public_web_url: "https://forge.example.com"
+          sinks:
+            - name: ops-webhook
+              label: Ops webhook
+              adapter: "niuu.adapters.notifications.webhook.WebhookNotificationSink"
+              url: "https://hooks.example.com/forge"
+              secret_kwargs_env:
+                secret: FORGE_OPS_WEBHOOK_SECRET
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description="Project notifications and serve the notification API.",
+    )
+    reply_ready: NotificationReplyReadyConfig = Field(default_factory=NotificationReplyReadyConfig)
+    default_page_size: int = Field(default=50, ge=1, description="Feed page size default.")
+    max_page_size: int = Field(default=200, ge=1, description="Largest feed page allowed.")
+    dispatcher: NotificationDispatcherConfig = Field(default_factory=NotificationDispatcherConfig)
+    sinks: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "Named delivery sinks (dynamic adapters): each entry has 'name', optional "
+            "'label', 'adapter' (fully-qualified NotificationSink class path), optional "
+            "'secret_kwargs_env' (kwarg name -> env var) and adapter kwargs."
+        ),
+    )
+    integration_sinks: dict[str, str] = Field(
+        default_factory=lambda: dict(DEFAULT_INTEGRATION_SINKS),
+        description=(
+            "Integration slug -> NotificationSink class path used for rules that deliver "
+            "through an owner's messaging integration. A connection whose slug is not "
+            "listed may store a NotificationSink class path as its adapter."
+        ),
+    )
+    public_web_url: str = Field(
+        default="",
+        description=(
+            "Browser-facing Forge web origin used for deep links in delivered messages. "
+            "Empty uses the host's public origin."
+        ),
+    )
+    host_label: str = Field(
+        default="",
+        description="Label for this Forge host in delivered messages; empty uses its hostname.",
+    )
+    session_link_path: str = Field(
+        default="/volundr/session/{session_id}#notification-{notification_id}",
+        description="Deep-link path for a session notification ({session_id}, {notification_id}).",
+    )
+    feed_link_path: str = Field(
+        default="/volundr/notifications",
+        description="Deep-link path for a notification without a session.",
+    )
+
+    @model_validator(mode="after")
+    def _valid(self) -> "NotificationsConfig":
+        if self.default_page_size > self.max_page_size:
+            raise ValueError("notifications.default_page_size must not exceed max_page_size")
+        names: set[str] = set()
+        for sink in self.sinks:
+            name, adapter = sink.get("name"), sink.get("adapter")
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("Every notifications.sinks entry needs a non-empty 'name'")
+            if not isinstance(adapter, str) or "." not in adapter:
+                raise ValueError(f"notifications.sinks[{name!r}] needs an 'adapter' class path")
+            if len(name) > MAX_SINK_NAME_CHARS or not re.fullmatch(SINK_NAME_PATTERN, name):
+                raise ValueError(
+                    f"notifications sink name {name!r} must match {SINK_NAME_PATTERN} "
+                    f"(at most {MAX_SINK_NAME_CHARS} characters)"
+                )
+            if name == INTEGRATION_SINK.name:
+                raise ValueError("'integration' is reserved for messaging-integration rules")
+            if name in names:
+                raise ValueError(f"Duplicate notifications sink name {name!r}")
+            secret_env = sink.get("secret_kwargs_env", {})
+            if not isinstance(secret_env, dict) or not all(
+                isinstance(key, str) and isinstance(value, str) for key, value in secret_env.items()
+            ):
+                raise ValueError(
+                    f"notifications.sinks[{name!r}].secret_kwargs_env must map kwarg names "
+                    "to environment variable names"
+                )
+            names.add(name)
+        for slug, adapter in self.integration_sinks.items():
+            if not slug or "." not in adapter:
+                raise ValueError(
+                    f"notifications.integration_sinks[{slug!r}] needs a sink class path"
+                )
+        try:
+            self.session_link_path.format(session_id="s", notification_id="n")
+            self.feed_link_path.format()
+        except (KeyError, IndexError, ValueError) as exc:
+            raise ValueError(
+                "notifications link paths may only use {session_id} and {notification_id}"
+            ) from exc
+        return self
+
+
+class ForgeMcpSessionTokenConfig(BaseModel):
+    """The scoped ``forge_session`` credential Forge mints for each session launch.
+
+    The token is signed by the workload-identity issuer when that is enabled with a
+    configured key (``workload_identity.signing_key_pem`` / ``signing_key_env``).
+    Otherwise, as in local mini mode, Forge keeps its own RSA key in
+    ``signing_key_file``, generated once with mode 0600 and never overwritten.
+
+    Its lifetime is tied to the session launch: every start mints a new token and
+    revokes the previous one, and Forge checks each presented token against the live
+    session row, so ``ttl_seconds`` is only a backstop.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description="Mint a scoped session credential at launch (false: brokers keep "
+        "their own credential and the Forge MCP offers no grants).",
+    )
+    ttl_seconds: int = Field(
+        default=30 * 24 * 3600,
+        ge=300,
+        description="Backstop lifetime of a session credential; a restart re-mints it.",
+    )
+    signing_key_file: str = Field(
+        default="~/.niuu/forge-session-signing-key.pem",
+        description="Private RSA key used when workload identity has no configured key.",
+    )
+    signing_key_bits: int = Field(
+        default=2048, ge=2048, description="Size of a generated signing key."
+    )
+    issuer: str = Field(
+        default="niuu-forge-session",
+        min_length=1,
+        description="Issuer of tokens signed with signing_key_file.",
+    )
+    key_id: str = Field(
+        default="niuu-forge-session", min_length=1, description="kid of signing_key_file."
+    )
+    audiences: list[str] = Field(
+        default_factory=lambda: ["volundr-api"],
+        min_length=1,
+        description="Audiences of tokens signed with signing_key_file.",
+    )
+
+
+class ForgeMcpHttpConfig(BaseModel):
+    """The Forge-hosted MCP endpoint (``POST /api/v1/forge/mcp``) for external agents."""
+
+    enabled: bool = Field(default=True, description="Serve the HTTP MCP endpoint.")
+    allowed_origins: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Browser origins allowed to call the endpoint (exact scheme://host[:port]). "
+            "Requests without an Origin header (agents, CLIs) are always allowed; any "
+            "other Origin is refused with 403 to stop DNS-rebinding and CSRF."
+        ),
+    )
+    list_default_limit: int = Field(default=20, ge=1, description="Default list size.")
+    list_max_limit: int = Field(default=50, ge=1, description="Upper bound for list tools.")
+    transcript_default_turns: int = Field(default=10, ge=1, description="Default turns.")
+    transcript_max_turns: int = Field(default=30, ge=1, description="Upper bound on turns.")
+    transcript_turn_max_chars: int = Field(default=2000, ge=1, description="Chars per turn.")
+    output_max_chars: int = Field(default=24000, ge=1024, description="Tool result bound.")
+    request_timeout_seconds: float = Field(
+        default=20.0, gt=0, description="Timeout for one Forge REST call made by a tool."
+    )
+    max_body_bytes: int = Field(
+        default=1024 * 1024, ge=1024, description="Largest JSON-RPC request accepted."
+    )
+
+    @model_validator(mode="after")
+    def _ordered_limits(self) -> "ForgeMcpHttpConfig":
+        if self.list_default_limit > self.list_max_limit:
+            raise ValueError("forge_mcp.http.list_default_limit must not exceed list_max_limit")
+        if self.transcript_default_turns > self.transcript_max_turns:
+            raise ValueError(
+                "forge_mcp.http.transcript_default_turns must not exceed transcript_max_turns"
+            )
+        return self
+
+
+class ForgeMcpConfig(BaseModel):
+    """Forge MCP credentials and grants.
+
+    Example YAML::
+
+        forge_mcp:
+          default_grants: []          # message, lifecycle: added to every session
+          session_tokens:
+            enabled: true
+            ttl_seconds: 2592000
+            signing_key_file: ~/.niuu/forge-session-signing-key.pem
+          http:
+            enabled: true
+            allowed_origins: []
+    """
+
+    default_grants: list[ForgeMcpGrant] = Field(
+        default_factory=list,
+        description="Grants every session's credential carries (on top of the launch "
+        "spec's and the session-create request's).",
+    )
+    session_tokens: ForgeMcpSessionTokenConfig = Field(default_factory=ForgeMcpSessionTokenConfig)
+    http: ForgeMcpHttpConfig = Field(default_factory=ForgeMcpHttpConfig)
 
 
 class IdentityConfig(BaseModel):
@@ -1528,6 +1851,9 @@ def _default_integration_definitions() -> list[IntegrationDefinitionConfig]:
             name="Telegram",
             description="Telegram bot — notifications, session alerts, and dispatch commands",
             integration_type="messaging",
+            # Ting's per-user channel; Forge delivery picks its sink by slug
+            # (notifications.integration_sinks), whatever the stored adapter.
+            adapter="niuu.adapters.notifications.telegram.TelegramNotificationAdapter",
             icon="telegram",
             credential_schema={
                 "required": ["bot_token", "chat_id"],
@@ -2309,6 +2635,8 @@ class Settings(BaseSettings):
     replay: ReplayConfig = Field(default_factory=ReplayConfig)
     sleipnir: SleipnirConfig = Field(default_factory=SleipnirConfig)
     push: PushNotificationConfig = Field(default_factory=PushNotificationConfig)
+    notifications: NotificationsConfig = Field(default_factory=NotificationsConfig)
+    forge_mcp: ForgeMcpConfig = Field(default_factory=ForgeMcpConfig)
     identity: IdentityConfig = Field(default_factory=IdentityConfig)
     authorization: AuthorizationConfig = Field(default_factory=AuthorizationConfig)
     auth_mode: str = Field(
@@ -2413,6 +2741,26 @@ class Settings(BaseSettings):
         if value:
             LLMConfig.model_validate(value)
         return value
+
+    @model_validator(mode="after")
+    def _needs_input_push_has_its_sink(self) -> "Settings":
+        """``push.enabled`` delivers through the outbox; refuse it without one."""
+        if not self.push.enabled:
+            return self
+        if not self.notifications.enabled:
+            raise ValueError(
+                "push.enabled delivers needs-input pushes through notifications; set "
+                "notifications.enabled: true, or push.enabled: false"
+            )
+        sink_names = {sink.get("name") for sink in self.notifications.sinks}
+        if self.push.attention_sink not in sink_names:
+            raise ValueError(
+                f"push.enabled needs a notifications.sinks entry named "
+                f"{self.push.attention_sink!r} (push.attention_sink), e.g. adapter "
+                "volundr.adapters.outbound.push_notification_sink.PushNotificationSink; "
+                "or set push.enabled: false"
+            )
+        return self
 
     @model_validator(mode="after")
     def _merge_built_in_session_definitions(self) -> "Settings":

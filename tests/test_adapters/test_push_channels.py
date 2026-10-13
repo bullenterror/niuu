@@ -3,6 +3,10 @@
 from unittest.mock import AsyncMock, MagicMock
 from urllib.parse import urlparse
 
+import httpx
+import pytest
+
+from niuu.ports.notifications import NotificationDeliveryError
 from volundr.adapters.outbound.push_channels import (
     ApnsNotificationChannel,
     LoggingNotificationChannel,
@@ -66,22 +70,33 @@ class TestWebhookChannel:
         headers = client.post.call_args[1]["headers"]
         assert headers["X-Niuu-Signature"].startswith("sha256=")
 
-    async def test_no_url_is_noop(self):
+    async def test_no_url_raises(self):
         client = MagicMock()
         client.post = AsyncMock()
         channel = WebhookNotificationChannel(url="", client=client)
 
-        await channel.send(_message(), [])
+        with pytest.raises(NotificationDeliveryError, match="no url configured"):
+            await channel.send(_message(), [])
 
         client.post.assert_not_called()
 
-    async def test_delivery_error_is_swallowed(self):
+    async def test_delivery_error_raises_without_the_url(self):
         client = MagicMock()
-        client.post = AsyncMock(side_effect=RuntimeError("down"))
+        client.post = AsyncMock(side_effect=httpx.ConnectError("down: /push/secret"))
+        channel = WebhookNotificationChannel(url="https://relay.example/push/secret", client=client)
+
+        with pytest.raises(NotificationDeliveryError, match="ConnectError") as raised:
+            await channel.send(_message(), [])
+        assert "secret" not in str(raised.value)
+
+    async def test_rejected_push_raises(self):
+        client = MagicMock()
+        client.post = AsyncMock(return_value=httpx.Response(502))
         channel = WebhookNotificationChannel(url="https://relay.example/push", client=client)
 
-        # Must not raise.
-        await channel.send(_message(), [])
+        with pytest.raises(NotificationDeliveryError, match="HTTP 502") as raised:
+            await channel.send(_message(), [])
+        assert raised.value.retryable is True
 
 
 class TestApnsChannel:

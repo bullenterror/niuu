@@ -98,6 +98,7 @@ from skuld.file_routes import (  # noqa: F401
     upload_file_raw,
     upload_files,
 )
+from skuld.forge_mcp.integration import ForgeSessionMixin
 from skuld.history_hydration import fetch_durable_history, merge_history_turns
 from skuld.service_manager import (  # noqa: F401
     ServiceCreateRequest,
@@ -533,6 +534,7 @@ def _sanitize_directed_metadata(
 
 class Broker(
     EffortControlMixin,
+    ForgeSessionMixin,
     TransportLifecycleMixin,
     WebSocketLifecycleMixin,
     EventLogMixin,
@@ -643,6 +645,14 @@ class Broker(
         self._event_log_lock = asyncio.Lock()
         self._event_log_task: asyncio.Task[None] | None = None
         self._event_log_stopping = False
+        # id(entry) -> (entry, future): callers (Forge MCP notify) waiting to learn
+        # whether one specific frame reached Forge. See _watch_event_log_entry.
+        self._event_log_receipts: dict[int, tuple[dict, asyncio.Future[bool]]] = {}
+        # Per-start runtime dir + loopback secret, session tools and Forge MCP
+        # toolbox — created lazily (ForgeSessionMixin).
+        self._session_runtime_cache = None
+        self._session_tools_cache = None
+        self._forge_mcp_toolbox_cache = None
         self._activity_state: str = "idle"
         # Wall-clock epoch seconds (UTC) of when the session ENTERED its current
         # activity_state. Stamped only when the state actually CHANGES (see
@@ -852,11 +862,11 @@ class Broker(
         except Exception:
             logger.warning("Failed to save conversation history to %s", path, exc_info=True)
 
-    def _append_turn(self, turn: ConversationTurn) -> None:
-        """Append a turn and persist to disk."""
+    def _append_turn(self, turn: ConversationTurn) -> dict | None:
+        """Append a turn and persist to disk; return its durable-log entry (if logging)."""
         self._conversation_turns.append(turn)
         self._save_conversation_history()
-        self._enqueue_event_log(
+        return self._enqueue_event_log(
             {
                 "type": "conversation.turn",
                 "turn": asdict(turn),

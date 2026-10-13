@@ -86,12 +86,15 @@ class TransportLifecycleMixin:
             "cli_binary": self._settings.cli_binary,
             "session_name": self._settings.session.name,
             "remote_control_permission_mode": self._settings.remote_control_permission_mode,
+            "claude_permission_mode": self._settings.claude_permission_mode,
             "agent_teams": self._settings.agent_teams,
             "system_prompt": self._settings.session.system_prompt,
             "initial_prompt": (
                 "" if self._has_workflow_trigger() else self._settings.session.initial_prompt
             ),
-            "mcp_servers": self._settings.mcp_servers,
+            # Configured servers plus the built-in forge MCP (merged by name).
+            "mcp_servers": self._effective_mcp_servers(),
+            "session_tools": self._session_tools(),
             "resume_session_id": self._settings.session.resume_session_id,
             "ask_user_question_enabled": self._settings.ask_user_question_enabled,
             "acp_prompt_timeout_s": self._settings.acp_prompt_timeout_s,
@@ -103,6 +106,9 @@ class TransportLifecycleMixin:
             "pi_turn_timeout_s": self._settings.pi.turn_timeout_s,
             "pi_shutdown_timeout_s": self._settings.pi.shutdown_timeout_s,
             "question_transcript_max_bytes": self._settings.tmux_question_transcript_max_bytes,
+            "workspace_trust_stable_s": self._settings.tmux_workspace_trust_stable_s,
+            "workspace_trust_settle_s": self._settings.tmux_workspace_trust_settle_s,
+            "workspace_trust_max_attempts": self._settings.tmux_workspace_trust_max_attempts,
             "question_result_history_limit": self._settings.tmux_question_result_history_limit,
             "native_text_wait_s": self._settings.tmux_native_text_wait_s,
             "native_text_poll_s": self._settings.tmux_native_text_poll_s,
@@ -157,7 +163,20 @@ class TransportLifecycleMixin:
             kwargs["codex_auth_provider"] = self._create_codex_auth_provider()
         filtered = {k: v for k, v in kwargs.items() if k in sig.parameters}
         logger.info("Using %s (adapter: %s)", cls.__name__, adapter_path)
+        if "claude_permission_mode" in sig.parameters:
+            self._log_claude_permission_mode()
         return cls(**filtered)
+
+    def _log_claude_permission_mode(self) -> None:
+        """Say which permission mode Claude gets and whether the node chose it."""
+        mode = self._settings.claude_permission_mode
+        if "claude_permission_mode" in self._settings.model_fields_set:
+            logger.info("Claude permission mode: %s (set by this node)", mode)
+            return
+        logger.warning(
+            "Claude permission mode: %s (default; set claude_permission_mode in the node config)",
+            mode,
+        )
 
     async def _ensure_transport_started(self) -> None:
         """Join any in-flight startup before accepting messages on any channel."""
@@ -470,6 +489,9 @@ class TransportLifecycleMixin:
         # Stop transport
         if self._transport:
             await self._transport.stop()
+
+        # The loopback secret dies with this broker start.
+        self._revoke_session_runtime()
 
         await self._finish_trace_span(
             self._trace_session_span_id,

@@ -151,9 +151,11 @@ class SessionRepository(ABC):
 
     @abstractmethod
     async def update_coordination(
-        self, session: Session, coordination: SessionCoordination
+        self, session: Session, coordination: SessionCoordination | None
     ) -> Session | None:
         """Atomically replace membership if its revision and access scope still match.
+
+        ``None`` removes the session from its project.
 
         Preserve runtime fields; invalidate the old launch brief. None means conflict.
         Ordinary updates must never overwrite this independently managed state.
@@ -542,6 +544,16 @@ class PodManager(ABC):
         """
         return await self.capacity()
 
+    @property
+    def delivers_forge_session_token(self) -> bool:
+        """Whether ``start`` hands ``spec.forge_session`` to the broker privately.
+
+        Forge mints a session credential only for a pod manager that can deliver it
+        without exposing it (process env, never argv, logs or the model's env). A
+        manager that cannot keeps the broker on its own credential.
+        """
+        return False
+
     def initial_chat_endpoint(self, session: Session) -> str | None:
         """Return the deterministic chat endpoint before pods are ready, if known."""
         return None
@@ -726,26 +738,21 @@ class NotificationChannel(ABC):
     @abstractmethod
     async def send(self, message: PushMessage, devices: list[DeviceToken]) -> None:
         """Deliver a push. ``devices`` is the owner's registered devices (may be
-        empty for relay channels that resolve recipients themselves)."""
+        empty for relay channels that resolve recipients themselves).
 
+        Raises ``niuu.ports.notifications.NotificationDeliveryError`` when the
+        push was not delivered; a channel with no recipient to try returns."""
 
-class AttentionNotifier(ABC):
-    """Port the session service calls when a session needs the user.
+    async def deliver(self, message: PushMessage, devices: list[DeviceToken]) -> str:
+        """Deliver a push and report failures (the notification outbox path).
 
-    Decouples session logic from the push delivery mechanism: the session
-    service emits the intent, an adapter resolves devices and dispatches.
-    """
-
-    @abstractmethod
-    async def notify_needs_input(
-        self,
-        session: Session,
-        *,
-        kind: str,
-        prompt: str,
-        request_id: str,
-    ) -> None:
-        """Alert the session owner that the session is blocked awaiting them."""
+        Raises ``niuu.ports.notifications.NotificationDeliveryError`` when nothing
+        was delivered; returns a short, secret-free description of what was.
+        Channels with nothing more to report keep this default, which calls
+        ``send`` and lets its error propagate.
+        """
+        await self.send(message, devices)
+        return f"handed to {type(self).__name__}"
 
 
 class LaunchSpecProvider(ABC):
@@ -1107,6 +1114,20 @@ class SessionEventLogRepository(ABC):
     @abstractmethod
     async def latest_seq(self, session_id: UUID) -> int:
         """Return the highest seq stored for a session, or 0 if none."""
+
+    async def read_seqs(self, session_id: UUID, seqs: list[int]) -> list[SessionLogEntry]:
+        """Return the STORED rows for exactly these seqs, ordered by seq.
+
+        Seqs with no stored row are omitted. This concrete default is built on
+        :meth:`read_after` (one bounded range read) so in-memory fakes inherit it;
+        SQL adapters override it with a single ``seq = ANY(...)`` lookup.
+        """
+        wanted = set(seqs)
+        if not wanted:
+            return []
+        low = min(wanted) - 1
+        rows = await self.read_after(session_id, after_seq=low, limit=max(wanted) - low)
+        return [row for row in rows if row.seq in wanted]
 
     async def import_history(
         self, session_id: UUID, source_id: str, entries: list[SessionLogEntry]
