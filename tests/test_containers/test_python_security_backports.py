@@ -73,8 +73,8 @@ def vex_inputs():
                 "artifact": {
                     "name": "python",
                     "type": "binary",
-                    "version": "3.14.7",
-                    "purl": "pkg:generic/python@3.14.7",
+                    "version": manifest["python_version"],
+                    "purl": f"pkg:generic/python@{manifest['python_version']}",
                     "locations": [
                         {
                             "path": "/usr/local/bin/python3.14",
@@ -94,17 +94,19 @@ def vex_inputs():
 
 
 @pytest.mark.parametrize("library_evidence", ["primary", "supporting"])
-def test_vex_is_limited_to_verified_image_component_and_six_cves(vex_inputs, library_evidence):
+def test_vex_is_limited_to_verified_image_component_and_its_cves(vex_inputs, library_evidence):
     for match in vex_inputs[2]["matches"]:
         match["artifact"]["locations"][1]["annotations"]["evidence"] = library_evidence
     result = load("vex").document(*vex_inputs)
     image, _, _, manifest = vex_inputs
     assert {s["vulnerability"]["name"] for s in result["statements"]} == set(manifest["cves"])
-    assert len(result["statements"]) == 6
+    assert len(result["statements"]) == len(manifest["cves"])
     for statement in result["statements"]:
         assert statement["status"] == "fixed"
         assert image.split("@", 1)[1] in statement["products"][0]["@id"]
-        assert statement["products"][0]["subcomponents"] == [{"@id": "pkg:generic/python@3.14.7"}]
+        assert statement["products"][0]["subcomponents"] == [
+            {"@id": f"pkg:generic/python@{manifest['python_version']}"}
+        ]
 
 
 @pytest.mark.parametrize(
