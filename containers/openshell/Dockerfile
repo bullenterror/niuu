@@ -6,6 +6,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends patch \
 
 FROM ghcr.io/astral-sh/uv:0.12.24@sha256:3af4716e991d6956a41e573eab705d0ee08500cd829ed30293eb8472f372c65a AS uv
 
+# The sandbox base ships gh v2.102.0 (the latest release), built with Go 1.27.1 and
+# golang.org/x/net v0.58.0 (GO-2026-6603/6604/6611/6612). Replace it with the same
+# release built with Go 1.27.2 and the patched module until upstream ships them.
+FROM --platform=$BUILDPLATFORM golang:1.27.2-alpine3.23@sha256:9e45f0eb4a63ed37ad6e604950407558b7c738e34e015ae77a5d4ad369cde079 AS gh-build
+ARG TARGETARCH
+WORKDIR /src
+RUN wget -q https://github.com/cli/cli/archive/refs/tags/v2.102.0.tar.gz -O /tmp/gh.tar.gz \
+    && echo "08bf0ef8b4409893889175e0f5279d30d6edd96465816042c0d7c72eac598158  /tmp/gh.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/gh.tar.gz --strip-components=1 \
+    && go get golang.org/x/net@v0.60.0 \
+    && CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH go build -trimpath \
+        -ldflags '-s -w -X github.com/cli/cli/v2/internal/build.Version=2.102.0-niuu.1 -X github.com/cli/cli/v2/internal/build.Date=2026-09-30' \
+        -o /out/gh ./cmd/gh
+
 FROM ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:aeef1c63f00e2913ea002ccb3aaf925f338b5c5d70e63576f0d95c16a138044e AS base
 
 USER root
@@ -48,6 +62,10 @@ RUN cd /opt/openshell-tools && GROK_HOME=/tmp/grok-install npm ci --omit=dev --l
     && ln -s /opt/openshell-tools/node_modules/@hono /usr/lib/node_modules/@hono \
     && ln -s /opt/openshell-tools/node_modules/tar /usr/lib/node_modules/tar \
     && ln -sf /opt/openshell-tools/node_modules/.bin/copilot /usr/local/bin/copilot
+
+# Replace the base's gh before the filesystem is exported, so its layer is not kept.
+COPY --from=gh-build /out/gh /usr/bin/gh
+RUN gh --version
 
 # Remove superseded upstream agents and installation caches before exporting
 # the base filesystem. Deleting them in the final image would retain their layers.
