@@ -2,6 +2,7 @@
 
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
@@ -676,6 +677,28 @@ async def test_an_unprepared_runtime_is_logged_surfaced_and_named_on_timeout(set
     runtime.start.side_effect = None
     assert await manager.stop(session)
     assert session.id not in manager._wait_reasons
+
+
+async def test_a_lease_expiring_while_the_runtime_is_unprepared_still_names_it(setup):
+    """The durable lease deadline may fire before the wait's own timeout."""
+    _, _, repository, _, runtime, _, session = setup
+    manager = _manager(setup, provisioning_timeout_seconds=30)
+    reason = "Runner has no Skuld venv"
+
+    async def unprepared(*_args, **_kwargs):
+        # The lease's deadline passes while the guest is still unprepared.
+        for lease_id, lease in list(repository.leases.items()):
+            repository.leases[lease_id] = lease.model_copy(
+                update={"provision_deadline": datetime.now(UTC) - timedelta(seconds=1)}
+            )
+        raise VmRuntimeUnavailableError(reason)
+
+    runtime.start.side_effect = unprepared
+    with pytest.raises(RuntimeError) as raised:
+        await manager.start(session, SessionSpec(values={}, pod_spec=PodSpecAdditions()))
+    message = str(raised.value)
+    assert message.startswith(f"VM runtime did not become ready within 30s: {reason}. ")
+    assert message.endswith("Provisioning expired; preserve data and release the allocation")
 
 
 def test_runtime_wait_reporting_counts_must_be_positive():

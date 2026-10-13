@@ -451,10 +451,7 @@ class VmPodManager(PodManager):
             except TimeoutError:
                 if wait["reason"] is None:
                     raise
-                raise RuntimeError(
-                    f"VM runtime did not become ready within {self._provisioning_timeout:g}s: "
-                    f"{wait['reason']}"
-                ) from None
+                raise RuntimeError(self._runtime_not_ready(wait["reason"])) from None
             return PodStartResult(
                 chat_endpoint=self.initial_chat_endpoint(session),
                 code_endpoint=None,
@@ -505,9 +502,12 @@ class VmPodManager(PodManager):
                 await asyncio.sleep(self._poll)
                 continue
             if lease.state in {LeaseState.FAILED, LeaseState.DRAINING, LeaseState.RELEASED}:
-                raise RuntimeError(
-                    lease.error or "VM allocation cannot start; inspect its durable lease"
-                )
+                error = lease.error or "VM allocation cannot start; inspect its durable lease"
+                if wait["reason"] is not None:
+                    # The lease's durable deadline can expire just before this wait's
+                    # own timeout: either way the guest never became ready, so say why.
+                    error = f"{self._runtime_not_ready(wait['reason'])}. {error}"
+                raise RuntimeError(error)
             if (
                 lease.machine
                 and lease.machine.state == MachineState.RUNNING
@@ -535,6 +535,9 @@ class VmPodManager(PodManager):
                     if wait["count"] >= self._runtime_wait_surface_after:
                         self._wait_reasons[session.id] = f"Runtime not ready: {wait['reason']}"
             await asyncio.sleep(self._poll)
+
+    def _runtime_not_ready(self, reason: str) -> str:
+        return f"VM runtime did not become ready within {self._provisioning_timeout:g}s: {reason}"
 
     async def _retry_failed_runtime(self, lease_id: UUID):
         """Re-open only a failed guest-runtime start on the same running machine."""
