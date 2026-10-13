@@ -25,7 +25,7 @@ import logging
 from collections.abc import Mapping
 from typing import Any
 
-from niuu.domain.models import IntegrationConnection, IntegrationType
+from niuu.domain.models import IntegrationConnection, IntegrationType, is_push_device
 from niuu.ports.channel_resolver import ChannelResolverPort, NotificationChannelUnavailableError
 from niuu.ports.credentials import CredentialStorePort
 from niuu.ports.integrations import IntegrationRepository
@@ -103,7 +103,8 @@ class NotificationChannelFactory(ChannelResolverPort):
 
         channels: list[NotificationChannel] = []
         for conn in connections:
-            if not conn.enabled:
+            # Push devices are delivered to by the push sink, not built as channels.
+            if not conn.enabled or is_push_device(conn):
                 continue
 
             cred = await self._credential_store.get_value(

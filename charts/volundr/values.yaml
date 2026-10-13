@@ -489,10 +489,15 @@ push:
   enabled: false
   # -- The notifications sink the per-owner "Needs-input pushes" rule targets
   attentionSink: push
-  # -- Fully-qualified NotificationChannel class path
+  # -- Fully-qualified NotificationChannel class path. Outside mini mode use
+  # CredentialStoreApnsNotificationChannel: the APNs key is a tenant credential (`apns`)
+  # in the credential store, like every other integration secret
   adapter: volundr.adapters.outbound.push_channels.LoggingNotificationChannel
-  # -- Channel constructor kwargs
+  # -- Channel constructor kwargs (e.g. credential_owner_id, bundle_id)
   kwargs: {}
+  # -- Where registered devices live: auto (postgres in mini mode, else integrations),
+  # integrations (messaging connections, tokens in the credential store) or postgres
+  deviceRegistry: auto
   # -- Secret kwargs from K8s Secrets, each { kwarg, secretName, secretKey }
   secretKwargs: []
   # The push sink the chart adds for `attentionSink` when `enabled`

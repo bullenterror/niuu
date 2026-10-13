@@ -873,6 +873,10 @@ class DeviceRegistration(BaseModel):
     platform: str = Field(description="Device platform (ios/android/web)")
     token: str = Field(min_length=1, max_length=512, description="Push token / endpoint")
     app_bundle_id: str | None = Field(default=None, description="APNs topic (bundle id) to target")
+    environment: Literal["sandbox", "production"] | None = Field(
+        default=None,
+        description="APNs environment of the token; omitted uses the push channel's default",
+    )
 
 
 class DeviceResponse(BaseModel):
@@ -2756,6 +2760,7 @@ def create_router(
             platform=platform,
             token=data.token,
             app_bundle_id=data.app_bundle_id,
+            environment=data.environment,
         )
         stored = await device_repository.upsert(device)
         if on_device_registered is not None:

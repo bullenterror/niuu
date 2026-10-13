@@ -88,6 +88,17 @@ class IntegrationConnection:
     slug: str = ""  # references IntegrationDefinition.slug
 
 
+#: Slug of a registered push device (``volundr.adapters.outbound.integration_device_tokens``).
+#: A push device is a messaging connection only the push sink delivers to: it is not a
+#: Ting channel and never a session integration.
+PUSH_DEVICE_SLUG = "push-device"
+
+
+def is_push_device(connection: IntegrationConnection) -> bool:
+    """Whether ``connection`` is a registered push device rather than a channel."""
+    return getattr(connection, "slug", "") == PUSH_DEVICE_SLUG
+
+
 @dataclass(frozen=True)
 class RegisteredInstance:
     """A registered runtime instance visible to one or more principals."""
