@@ -6,12 +6,9 @@ from urllib.parse import urlparse
 import httpx
 import pytest
 
-from niuu.adapters.memory_credential_store import MemoryCredentialStore
-from niuu.domain.models import SecretType
 from niuu.ports.notifications import NotificationDeliveryError
 from volundr.adapters.outbound.push_channels import (
     ApnsNotificationChannel,
-    CredentialStoreApnsNotificationChannel,
     LoggingNotificationChannel,
     WebhookNotificationChannel,
 )
@@ -205,74 +202,3 @@ class TestApnsDeviceEnvironment:
 
         hosts = [urlparse(call[0][0]).hostname for call in client.post.call_args_list]
         assert hosts == ["api.sandbox.push.apple.com", "api.push.apple.com", "api.push.apple.com"]
-
-
-class TestCredentialStoreApnsChannel:
-    @staticmethod
-    async def _key(store: MemoryCredentialStore, key_id: str = "KEY123", **extra):
-        await store.store(
-            "system",
-            "push",
-            "apns",
-            SecretType.GENERIC,
-            {"team_id": "TEAM123", "key_id": key_id, "private_key": _TEST_P8, **extra},
-        )
-
-    @staticmethod
-    def _client():
-        client = MagicMock()
-        client.post = AsyncMock(return_value=MagicMock(status_code=200))
-        return client
-
-    async def test_signs_with_the_platform_key_from_the_credential_store(self):
-        store = MemoryCredentialStore()
-        await self._key(store, bundle_id="com.niuu.lexi.chat")
-        client = self._client()
-        channel = CredentialStoreApnsNotificationChannel(credential_store=store, client=client)
-
-        detail = await channel.deliver(_message(), [_ios_device("d1"), _ios_device("d2")])
-
-        assert "accepted 2 of 2" in detail
-        headers = client.post.call_args[1]["headers"]
-        assert headers["authorization"].startswith("bearer ")
-        assert headers["apns-topic"] == "com.niuu.lexi.chat"
-        assert channel.credential_path == "systems/push/apns"
-
-    async def test_missing_key_fails_the_delivery_permanently(self):
-        client = self._client()
-        channel = CredentialStoreApnsNotificationChannel(
-            credential_store=MemoryCredentialStore(), client=client
-        )
-
-        with pytest.raises(NotificationDeliveryError, match="systems/push/apns") as error:
-            await channel.deliver(_message(), [_ios_device()])
-
-        assert not error.value.retryable
-        client.post.assert_not_called()
-
-    async def test_incomplete_key_is_rejected(self):
-        store = MemoryCredentialStore()
-        await self._key(store, key_id="")
-        channel = CredentialStoreApnsNotificationChannel(
-            credential_store=store, client=self._client()
-        )
-
-        with pytest.raises(NotificationDeliveryError, match="needs team_id, key_id"):
-            await channel.deliver(_message(), [_ios_device()])
-
-    async def test_a_rotated_key_signs_a_new_provider_token(self):
-        store = MemoryCredentialStore()
-        await self._key(store, key_id="KEY1")
-        client = self._client()
-        channel = CredentialStoreApnsNotificationChannel(credential_store=store, client=client)
-        await channel.deliver(_message(), [_ios_device()])
-        first = client.post.call_args[1]["headers"]["authorization"]
-
-        await self._key(store, key_id="KEY2")
-        await channel.deliver(_message(), [_ios_device()])
-
-        assert client.post.call_args[1]["headers"]["authorization"] != first
-
-    def test_requires_a_credential_store(self):
-        with pytest.raises(ValueError, match="needs a credential store"):
-            CredentialStoreApnsNotificationChannel(credential_store=None)

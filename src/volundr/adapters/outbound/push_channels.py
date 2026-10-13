@@ -7,9 +7,6 @@ Selected via the dynamic-adapter config (``push.adapter`` + ``kwargs``):
   owns device fan-out). HTTP/1.1, no extra dependencies.
 - ``ApnsNotificationChannel`` — direct Apple Push, token-based (JWT) auth.
   APNs only speaks HTTP/2, so httpx needs ``h2`` (the ``httpx[http2]`` extra).
-- ``CredentialStoreApnsNotificationChannel`` — the same, with the app's signing
-  key (team id, key id, .p8) read from the credential store (OpenBao on the
-  clusters, at ``systems/push/apns``) instead of process configuration.
 
 A device registered with an ``environment`` ("sandbox" for development builds,
 "production" for TestFlight/App Store) is pushed through that APNs host; one
@@ -274,82 +271,3 @@ class ApnsNotificationChannel(NotificationChannel):
                 status_code=resp.status_code,
             )
         return None
-
-
-class CredentialStoreApnsNotificationChannel(ApnsNotificationChannel):
-    """APNs with the app's signing key kept in the credential store (OpenBao on the clusters).
-
-    The key belongs to the app, not to a user or tenant: one key pushes to every device
-    with the app. It is a platform record at ``systems/push/<credential_name>`` (default
-    ``apns``) with the fields ``team_id``, ``key_id`` and ``private_key`` (the whole .p8,
-    PEM header included), and optionally ``bundle_id`` and ``use_sandbox``
-    ("true"/"false"). With OpenBao that is
-    ``bao kv put -mount=volundr systems/push/apns team_id=… key_id=… private_key=@AuthKey.p8``.
-
-    The key is read before each delivery, so a rotated key applies without a restart,
-    and a missing one fails the delivery with a clear reason instead of stopping
-    Volundr from starting.
-    """
-
-    #: Platform-owned credentials live under ``systems/`` in the credential store.
-    OWNER_TYPE = "system"
-    OWNER_ID = "push"
-
-    def __init__(
-        self,
-        *,
-        credential_store: Any = None,
-        credential_name: str = "apns",
-        bundle_id: str = "",
-        use_sandbox: bool = False,
-        token_ttl_seconds: int = 3000,
-        client: httpx.AsyncClient | None = None,
-    ):
-        if credential_store is None:
-            raise ValueError("CredentialStoreApnsNotificationChannel needs a credential store")
-        super().__init__(
-            team_id="",
-            key_id="",
-            private_key="",
-            bundle_id=bundle_id,
-            use_sandbox=use_sandbox,
-            token_ttl_seconds=token_ttl_seconds,
-            client=client,
-        )
-        self._credential_store = credential_store
-        self._credential_name = credential_name
-
-    @property
-    def credential_path(self) -> str:
-        return f"{self.OWNER_TYPE}s/{self.OWNER_ID}/{self._credential_name}"
-
-    async def _load_key(self) -> None:
-        data = await self._credential_store.get_value(
-            self.OWNER_TYPE, self.OWNER_ID, self._credential_name
-        )
-        if not data:
-            raise NotificationDeliveryError(
-                f"The APNs key {self.credential_path} is not in the credential store",
-                retryable=False,
-            )
-        team_id = str(data.get("team_id", "")).strip()
-        key_id = str(data.get("key_id", "")).strip()
-        private_key = str(data.get("private_key", "")).strip()
-        if not (team_id and key_id and private_key):
-            raise NotificationDeliveryError(
-                f"The APNs key {self.credential_path} needs team_id, key_id and private_key",
-                retryable=False,
-            )
-        if (team_id, key_id, private_key) != (self._team_id, self._key_id, self._private_key):
-            self._team_id, self._key_id, self._private_key = team_id, key_id, private_key
-            self._jwt_cache = None  # a rotated key signs a new provider token
-        if data.get("bundle_id"):
-            self._bundle_id = str(data["bundle_id"]).strip()
-        if "use_sandbox" in data:
-            sandbox = str(data["use_sandbox"]).strip().lower() in {"1", "true", "yes"}
-            self._host = self._SANDBOX_HOST if sandbox else self._PROD_HOST
-
-    async def deliver(self, message: PushMessage, devices: list[DeviceToken]) -> str:
-        if any(d.platform is DevicePlatform.IOS for d in devices):
-            await self._load_key()
-        return await super().deliver(message, devices)

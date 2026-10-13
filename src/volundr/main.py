@@ -285,7 +285,7 @@ def _create_notification_delivery(
     if config.enabled and config.dispatcher.enabled:
         # A broken push.adapter is a configuration error: raise rather than run
         # delivery with every push rule quietly failing.
-        push_channel = create_push_channel(settings, credential_store=credential_store)
+        push_channel = create_push_channel(settings)
     return create_notification_delivery(
         settings,
         pool,
