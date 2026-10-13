@@ -1,10 +1,10 @@
 # Security fixes awaiting stable CPython releases; no interpreter ABI changes.
-FROM --platform=$BUILDPLATFORM python:3.14-slim-bookworm@sha256:82bc3c539b8813ada9d68c63b40158fa002f7f33de9bf3312a3dfdc0620dff56 AS python-security
+FROM --platform=$BUILDPLATFORM python:3.14-slim-bookworm@sha256:48b13b003dda20b16f9442b8475aa05fe21bf6579a8c881db92ffb4d8fd20f83 AS python-security
 COPY containers/python-security/ /security/
 RUN apt-get update && apt-get install -y --no-install-recommends patch \
     && python /security/build.py /patched-stdlib
 
-FROM ghcr.io/astral-sh/uv:0.12.20@sha256:100047e74f30778ab704942321a09750d6158739573ff58bf3924085cc6cd2d8 AS uv
+FROM ghcr.io/astral-sh/uv:0.12.24@sha256:3af4716e991d6956a41e573eab705d0ee08500cd829ed30293eb8472f372c65a AS uv
 
 FROM ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:aeef1c63f00e2913ea002ccb3aaf925f338b5c5d70e63576f0d95c16a138044e AS base
 
@@ -19,11 +19,11 @@ ARG OS_PACKAGES_REFRESH=
 RUN apt-get update && apt-get upgrade -y \
     && rm -rf /var/lib/apt/lists/* \
     && UV_PYTHON_INSTALL_DIR=/sandbox/.uv/python uv python upgrade 3.14 \
-    && PYTHON_BIN=$(UV_PYTHON_INSTALL_DIR=/sandbox/.uv/python uv python find 3.14.7) \
+    && PYTHON_BIN=$(UV_PYTHON_INSTALL_DIR=/sandbox/.uv/python uv python find 3.14.8) \
     && ln -sf "$PYTHON_BIN" /usr/local/bin/python \
     && ln -sf "$PYTHON_BIN" /usr/local/bin/python3 \
     && ln -sf "$PYTHON_BIN" /sandbox/.venv/bin/python \
-    && sed -i 's/3.14.3/3.14.7/g' /sandbox/.venv/pyvenv.cfg \
+    && sed -i 's/3.14.3/3.14.8/g' /sandbox/.venv/pyvenv.cfg \
     && UV_PYTHON_INSTALL_DIR=/sandbox/.uv/python uv python uninstall 3.14.3 \
     && uv pip install --python /sandbox/.venv/bin/python pip==26.2.1
 

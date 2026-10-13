@@ -74,8 +74,8 @@ def document(image: str, evidence: dict, scan: dict, manifest: dict) -> dict:
                     ],
                     "status": "fixed",
                     "status_notes": (
-                        "Upstream CPython security backports installed; all five module SHA-256 "
-                        "hashes and exploit regressions verified inside this exact image. "
+                        "Upstream CPython security backports installed; every backported module's "
+                        "SHA-256 hash and exploit regressions verified inside this exact image. "
                         "See the retained python-security evidence and raw Grype report."
                     ),
                     "timestamp": timestamp,

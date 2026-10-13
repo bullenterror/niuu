@@ -1,4 +1,4 @@
-FROM ubuntu:26.04@sha256:da6fc2be547864451aa253836dd926da33623312df4a9a243e35dc877c378a78 AS builder
+FROM ubuntu:26.04@sha256:f144425ff09be612d6d9ad965196e9cdc23dae1f42110a8a11a3e9a8198759f7 AS builder
 
 ARG TARGETARCH
 
@@ -51,9 +51,25 @@ COPY vendor/ /app/vendor/
 RUN uv build --wheel --out-dir /dist
 
 # ---------------------------------------------------------------------------
+# gh v2.102.0 (the latest release) is built with Go 1.27.1 and golang.org/x/net
+# v0.58.0 (GO-2026-6603/6604/6611/6612). Build the same release with Go 1.27.2 and
+# the patched module; return to GitHub's apt package once a release ships them.
+# ---------------------------------------------------------------------------
+FROM --platform=$BUILDPLATFORM golang:1.27.2-alpine3.23@sha256:9e45f0eb4a63ed37ad6e604950407558b7c738e34e015ae77a5d4ad369cde079 AS gh-build
+ARG TARGETARCH
+WORKDIR /src
+RUN wget -q https://github.com/cli/cli/archive/refs/tags/v2.102.0.tar.gz -O /tmp/gh.tar.gz \
+    && echo "08bf0ef8b4409893889175e0f5279d30d6edd96465816042c0d7c72eac598158  /tmp/gh.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/gh.tar.gz --strip-components=1 \
+    && go get golang.org/x/net@v0.60.0 \
+    && CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH go build -trimpath \
+        -ldflags '-s -w -X github.com/cli/cli/v2/internal/build.Version=2.102.0-niuu.1 -X github.com/cli/cli/v2/internal/build.Date=2026-09-30' \
+        -o /out/gh ./cmd/gh
+
+# ---------------------------------------------------------------------------
 # Runtime — Node.js stays (needed for claude-code/codex CLI at runtime)
 # ---------------------------------------------------------------------------
-FROM ubuntu:26.04@sha256:da6fc2be547864451aa253836dd926da33623312df4a9a243e35dc877c378a78
+FROM ubuntu:26.04@sha256:f144425ff09be612d6d9ad965196e9cdc23dae1f42110a8a11a3e9a8198759f7
 
 
 LABEL org.opencontainers.image.title="skuld"
@@ -94,6 +110,10 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
     python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
+# The Ubuntu rock ships Pebble as its service manager. Skuld runs its own
+# entrypoint and never starts it, so drop the unused binary and its Go CVEs.
+RUN rm -f /usr/bin/pebble
+
 # Install Node.js 24 LTS (pinned keyring + apt source instead of curl|bash)
 RUN curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
     -o /usr/share/keyrings/nodesource.asc \
@@ -102,20 +122,14 @@ RUN curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
     && apt-get update && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# GitHub CLI (gh) from GitHub's apt repository: sessions open and inspect PRs with it.
-RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-    -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
-    && chmod 0644 /usr/share/keyrings/githubcli-archive-keyring.gpg \
-    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-    > /etc/apt/sources.list.d/github-cli.list \
-    && apt-get update && apt-get install -y --no-install-recommends gh \
-    && rm -rf /var/lib/apt/lists/* \
-    && gh --version
+# GitHub CLI (gh): sessions open and inspect PRs with it.
+COPY --from=gh-build /out/gh /usr/local/bin/gh
+RUN gh --version
 
 # GitLab CLI (glab), pinned release .deb per architecture: the GitLab counterpart of gh.
 # ARG values do not cross stages; TARGETARCH must be declared again here.
 ARG TARGETARCH
-ARG GLAB_VERSION=1.119.0
+ARG GLAB_VERSION=1.122.0
 RUN curl -fsSL -o /tmp/glab.deb \
     "https://gitlab.com/api/v4/projects/gitlab-org%2Fcli/packages/generic/glab/${GLAB_VERSION}/glab_${GLAB_VERSION}_linux_${TARGETARCH}.deb" \
     && dpkg -i /tmp/glab.deb && rm -f /tmp/glab.deb \

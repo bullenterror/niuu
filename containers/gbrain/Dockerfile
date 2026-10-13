@@ -10,8 +10,14 @@ RUN apt-get update && apt-get upgrade -y --no-install-recommends \
     && apt-get install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /opt/gbrain
+# Upstream's own lockfile fixes on top of the pinned ref, until GBRAIN_REF moves past
+# them: proxy-addr 2.0.8 (GHSA-jqcg-44mw-7w3h, upstream bafdd269) and
+# @modelcontextprotocol/sdk 1.31.0 (GHSA-6qxp-vccf-f47h, upstream a5a38302). The
+# frozen install below rejects the result if the patched lockfile is inconsistent.
+COPY containers/gbrain/security-deps.patch /tmp/security-deps.patch
 RUN git init && git remote add origin https://github.com/garrytan/gbrain.git \
     && git fetch --depth 1 origin "$GBRAIN_REF" && git checkout FETCH_HEAD \
+    && git apply /tmp/security-deps.patch && rm /tmp/security-deps.patch \
     && bun install --frozen-lockfile \
     && bun pm cache rm \
     && printf '#!/bin/sh\nexec bun /opt/gbrain/src/cli.ts "$@"\n' > /usr/local/bin/gbrain \
