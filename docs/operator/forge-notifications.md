@@ -324,23 +324,22 @@ clusters). Mini mode keeps the `device_tokens` table. Push devices are never att
 sessions and are not built as Ting channels. Set `postgres` or `integrations` to choose
 explicitly.
 
-The APNs signing key belongs in the credential store too: use
-`volundr.adapters.outbound.push_channels.CredentialStoreApnsNotificationChannel` and have a
-tenant admin store a tenant credential named `apns` (`POST /api/v1/credentials/tenant`, or
-Settings → tenant credentials) with `team_id`, `key_id` and `private_key` (the whole .p8,
-PEM header included), optionally `bundle_id` and `use_sandbox`. A device records the tenant
-its owner registered it in, and is pushed with that tenant's key, so nothing names a
-tenant in configuration:
+The APNs signing key belongs to the app, not to a user or tenant, so it is platform
+configuration like any other app-wide secret: keep it in the cluster's secret source (for
+example Doppler through an ExternalSecret) and hand it to `ApnsNotificationChannel` with the
+chart's `push.secretKwargs`:
 
 ```yaml
 push:
   enabled: true
-  adapter: volundr.adapters.outbound.push_channels.CredentialStoreApnsNotificationChannel
-  kwargs: {bundle_id: com.niuu.lexi.chat}
+  adapter: volundr.adapters.outbound.push_channels.ApnsNotificationChannel
+  kwargs: {team_id: TEAMID, bundle_id: com.niuu.lexi.chat}
+  secretKwargs:
+    - {kwarg: key_id, secretName: volundr-apns, secretKey: key-id}
+    - {kwarg: private_key, secretName: volundr-apns, secretKey: private-key}
 ```
 
-The key is read before each delivery, so rotating it needs no restart, and a missing key
-fails the delivery (recorded on the outbox row) rather than Volundr's start. A device that
+A device that
 registers with `environment` (`sandbox` for development builds, `production` for
 TestFlight/App Store) is pushed through that APNs host; otherwise the channel default
 (`use_sandbox`) applies. APNs requires HTTP/2, which the `httpx[http2]` extra provides.

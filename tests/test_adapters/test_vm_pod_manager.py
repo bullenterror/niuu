@@ -664,7 +664,16 @@ async def test_an_unprepared_runtime_is_logged_surfaced_and_named_on_timeout(set
         runtime_wait_surface_after=2,
     )
     reason = "Runner has no Skuld venv at /home/horde/.niuu-runner/venv-bc174c8d/bin/python"
-    runtime.start.side_effect = VmRuntimeUnavailableError(reason)
+    details: list[str | None] = []
+
+    async def unprepared(*_args, **_kwargs):
+        # Read the detail while the session is still provisioning: after the timeout the
+        # lease's own deadline may already have failed it, and a failed lease shows none.
+        if len(runtime.start.await_args_list) > 2 and not details:
+            details.append(await manager.status_detail(session))
+        raise VmRuntimeUnavailableError(reason)
+
+    runtime.start.side_effect = unprepared
 
     with caplog.at_level("WARNING", logger="volundr.adapters.outbound.vm_pod_manager"):
         with pytest.raises(RuntimeError, match="did not become ready within 0.2s: Runner has no"):
@@ -672,8 +681,8 @@ async def test_an_unprepared_runtime_is_logged_surfaced_and_named_on_timeout(set
 
     warnings = [r for r in caplog.records if "VM runtime not ready" in r.getMessage()]
     assert len(warnings) == 1 and reason in warnings[0].getMessage()
-    # The session shows why it is still provisioning; a stop clears the reason.
-    assert await manager.status_detail(session) == f"Runtime not ready: {reason}"
+    # The session showed why it was still provisioning; a stop clears the reason.
+    assert details == [f"Runtime not ready: {reason}"]
     runtime.start.side_effect = None
     assert await manager.stop(session)
     assert session.id not in manager._wait_reasons

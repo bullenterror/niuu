@@ -787,20 +787,10 @@ class PushNotificationConfig(BaseModel):
           secret_kwargs_env:
             private_key: "APNS_PRIVATE_KEY"
 
-    Outside mini mode the key belongs in the credential store with the other
-    integration secrets: use ``CredentialStoreApnsNotificationChannel`` and have a
-    tenant admin store a tenant credential named ``apns`` (``team_id``, ``key_id``,
-    ``private_key``). Each device is pushed with the key of the tenant its owner
-    registered it in, so no tenant is configured::
-
-        push:
-          enabled: true
-          adapter: "volundr.adapters.outbound.push_channels.CredentialStoreApnsNotificationChannel"
-          kwargs:
-            bundle_id: "com.niuu.lexi.chat"   # default topic; a credential's bundle_id wins
-
-    Registered devices are then the owners' push-device integrations
-    (``device_registry``), their tokens in the credential store too.
+    The APNs key belongs to the app, so it is platform configuration (a Kubernetes
+    Secret, e.g. from an ExternalSecret), not a credential-store record. Registered
+    devices are per user: outside mini mode they are the owners' push-device
+    integrations (``device_registry``), their tokens in the credential store.
     """
 
     enabled: bool = Field(

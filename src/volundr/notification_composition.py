@@ -5,7 +5,6 @@ Kept out of ``main.py`` so the wiring can be built (and tested) from config alon
 
 from __future__ import annotations
 
-import inspect
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -33,20 +32,10 @@ from volundr.domain.services.notification_dispatcher import (
 logger = logging.getLogger(__name__)
 
 
-def create_push_channel(
-    settings: Settings, *, credential_store: CredentialStorePort | None = None
-) -> NotificationChannel:
-    """Build the configured push channel (``push.adapter`` + kwargs).
-
-    A channel whose constructor takes ``credential_store`` (its secrets live there,
-    e.g. ``CredentialStoreApnsNotificationChannel``) is given the platform's store.
-    """
+def create_push_channel(settings: Settings) -> NotificationChannel:
+    """Build the configured push channel (``push.adapter`` + kwargs)."""
     channel_cls = import_class(settings.push.adapter)
-    # A copy: the resolved kwargs can be the configuration's own dict.
-    kwargs = dict(resolve_secret_kwargs(settings.push.kwargs, settings.push.secret_kwargs_env))
-    wants_store = "credential_store" in inspect.signature(channel_cls).parameters
-    if credential_store is not None and wants_store:
-        kwargs.setdefault("credential_store", credential_store)
+    kwargs = resolve_secret_kwargs(settings.push.kwargs, settings.push.secret_kwargs_env)
     channel = channel_cls(**kwargs)
     if not isinstance(channel, NotificationChannel):
         raise TypeError(f"{settings.push.adapter} is not a NotificationChannel")
