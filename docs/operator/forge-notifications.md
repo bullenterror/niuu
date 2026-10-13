@@ -324,13 +324,18 @@ clusters). Mini mode keeps the `device_tokens` table. Push devices are never att
 sessions and are not built as Ting channels. Set `postgres` or `integrations` to choose
 explicitly.
 
-The APNs signing key belongs in the credential store too: use
-`volundr.adapters.outbound.push_channels.CredentialStoreApnsNotificationChannel` and have a
-tenant admin store a tenant credential named `apns` (`POST /api/v1/credentials/tenant`, or
-Settings → tenant credentials) with `team_id`, `key_id` and `private_key` (the whole .p8,
-PEM header included), optionally `bundle_id` and `use_sandbox`. A device records the tenant
-its owner registered it in, and is pushed with that tenant's key, so nothing names a
-tenant in configuration:
+The APNs signing key belongs to the app, not to a user or tenant, and lives in the
+credential store as a platform record: use
+`volundr.adapters.outbound.push_channels.CredentialStoreApnsNotificationChannel`, which reads
+`systems/push/apns` with `team_id`, `key_id` and `private_key` (the whole .p8, PEM header
+included), optionally `bundle_id` and `use_sandbox`. With OpenBao (the `volundr` mount; the
+`volundr-default` policy already covers `systems/*`):
+
+```bash
+bao kv put -mount=volundr systems/push/apns team_id=TEAMID key_id=KEYID private_key=@AuthKey_KEYID.p8
+```
+
+Configure the channel:
 
 ```yaml
 push:

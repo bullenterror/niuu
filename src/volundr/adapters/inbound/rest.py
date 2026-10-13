@@ -2761,7 +2761,6 @@ def create_router(
             token=data.token,
             app_bundle_id=data.app_bundle_id,
             environment=data.environment,
-            tenant_id=principal.tenant_id or None,
         )
         stored = await device_repository.upsert(device)
         if on_device_registered is not None:

@@ -209,16 +209,10 @@ class TestApnsDeviceEnvironment:
 
 class TestCredentialStoreApnsChannel:
     @staticmethod
-    def _device(token: str = "d1", tenant: str | None = "acme") -> DeviceToken:
-        return DeviceToken(
-            owner_id="user-1", platform=DevicePlatform.IOS, token=token, tenant_id=tenant
-        )
-
-    @staticmethod
-    async def _key(store: MemoryCredentialStore, tenant: str, key_id: str = "KEY123", **extra):
+    async def _key(store: MemoryCredentialStore, key_id: str = "KEY123", **extra):
         await store.store(
-            "tenant",
-            tenant,
+            "system",
+            "push",
             "apns",
             SecretType.GENERIC,
             {"team_id": "TEAM123", "key_id": key_id, "private_key": _TEST_P8, **extra},
@@ -230,69 +224,52 @@ class TestCredentialStoreApnsChannel:
         client.post = AsyncMock(return_value=MagicMock(status_code=200))
         return client
 
-    async def test_each_device_is_signed_with_its_own_tenants_key(self):
+    async def test_signs_with_the_platform_key_from_the_credential_store(self):
         store = MemoryCredentialStore()
-        await self._key(store, "acme", bundle_id="com.niuu.lexi.chat")
-        await self._key(store, "globex", key_id="KEY999")
+        await self._key(store, bundle_id="com.niuu.lexi.chat")
         client = self._client()
         channel = CredentialStoreApnsNotificationChannel(credential_store=store, client=client)
 
-        detail = await channel.deliver(
-            _message(), [self._device("a1", "acme"), self._device("g1", "globex")]
-        )
+        detail = await channel.deliver(_message(), [_ios_device("d1"), _ios_device("d2")])
 
-        assert detail.count("accepted 1 of 1") == 2
-        topics = [call[1]["headers"]["apns-topic"] for call in client.post.call_args_list]
-        assert topics == ["com.niuu.lexi.chat", ""]
-        auths = {call[1]["headers"]["authorization"] for call in client.post.call_args_list}
-        assert len(auths) == 2  # two keys, two provider tokens
+        assert "accepted 2 of 2" in detail
+        headers = client.post.call_args[1]["headers"]
+        assert headers["authorization"].startswith("bearer ")
+        assert headers["apns-topic"] == "com.niuu.lexi.chat"
+        assert channel.credential_path == "systems/push/apns"
 
-    async def test_a_tenant_without_a_key_does_not_block_the_others(self):
-        store = MemoryCredentialStore()
-        await self._key(store, "acme")
-        client = self._client()
-        channel = CredentialStoreApnsNotificationChannel(credential_store=store, client=client)
-
-        detail = await channel.deliver(
-            _message(), [self._device("a1", "acme"), self._device("n1", "no-key")]
-        )
-
-        assert "accepted 1 of 1" in detail
-        assert client.post.call_count == 1
-
-    async def test_missing_key_or_tenant_fails_the_delivery_permanently(self):
+    async def test_missing_key_fails_the_delivery_permanently(self):
         client = self._client()
         channel = CredentialStoreApnsNotificationChannel(
             credential_store=MemoryCredentialStore(), client=client
         )
 
-        with pytest.raises(NotificationDeliveryError, match="no APNs key credential") as error:
-            await channel.deliver(_message(), [self._device()])
+        with pytest.raises(NotificationDeliveryError, match="systems/push/apns") as error:
+            await channel.deliver(_message(), [_ios_device()])
+
         assert not error.value.retryable
-        with pytest.raises(NotificationDeliveryError, match="without a tenant"):
-            await channel.deliver(_message(), [self._device(tenant=None)])
         client.post.assert_not_called()
 
     async def test_incomplete_key_is_rejected(self):
         store = MemoryCredentialStore()
-        await self._key(store, "acme", key_id="")
+        await self._key(store, key_id="")
         channel = CredentialStoreApnsNotificationChannel(
             credential_store=store, client=self._client()
         )
 
         with pytest.raises(NotificationDeliveryError, match="needs team_id, key_id"):
-            await channel.deliver(_message(), [self._device()])
+            await channel.deliver(_message(), [_ios_device()])
 
     async def test_a_rotated_key_signs_a_new_provider_token(self):
         store = MemoryCredentialStore()
-        await self._key(store, "acme", key_id="KEY1")
+        await self._key(store, key_id="KEY1")
         client = self._client()
         channel = CredentialStoreApnsNotificationChannel(credential_store=store, client=client)
-        await channel.deliver(_message(), [self._device()])
+        await channel.deliver(_message(), [_ios_device()])
         first = client.post.call_args[1]["headers"]["authorization"]
 
-        await self._key(store, "acme", key_id="KEY2")
-        await channel.deliver(_message(), [self._device()])
+        await self._key(store, key_id="KEY2")
+        await channel.deliver(_message(), [_ios_device()])
 
         assert client.post.call_args[1]["headers"]["authorization"] != first
 

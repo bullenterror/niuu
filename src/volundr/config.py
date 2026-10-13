@@ -788,10 +788,9 @@ class PushNotificationConfig(BaseModel):
             private_key: "APNS_PRIVATE_KEY"
 
     Outside mini mode the key belongs in the credential store with the other
-    integration secrets: use ``CredentialStoreApnsNotificationChannel`` and have a
-    tenant admin store a tenant credential named ``apns`` (``team_id``, ``key_id``,
-    ``private_key``). Each device is pushed with the key of the tenant its owner
-    registered it in, so no tenant is configured::
+    secrets: use ``CredentialStoreApnsNotificationChannel``, which reads the app's key
+    from the platform record ``systems/push/apns`` (``team_id``, ``key_id``,
+    ``private_key``)::
 
         push:
           enabled: true
