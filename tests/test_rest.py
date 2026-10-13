@@ -121,7 +121,9 @@ class TestDeviceEndpoints:
         listed = client.get("/api/v1/forge/devices", headers=self._AUTH)
         assert len(listed.json()) == 1
 
-    def test_register_keeps_the_token_environment_and_ignores_unknown_fields(self, client):
+    def test_register_keeps_environment_and_tenant_and_ignores_unknown_fields(
+        self, client, device_repo
+    ):
         resp = client.post(
             "/api/v1/forge/devices",
             json={
@@ -130,9 +132,11 @@ class TestDeviceEndpoints:
                 "environment": "sandbox",
                 "kind": "alert",  # what the Lexi app also sends; not part of this API
             },
-            headers=self._AUTH,
+            headers={**self._AUTH, "x-auth-tenant": "acme"},
         )
         assert resp.status_code == 201
+        assert device_repo.devices[-1].environment == "sandbox"
+        assert device_repo.devices[-1].tenant_id == "acme"
         bad = client.post(
             "/api/v1/forge/devices",
             json={"platform": "ios", "token": "t", "environment": "staging"},

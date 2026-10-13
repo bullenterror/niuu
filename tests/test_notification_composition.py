@@ -125,7 +125,7 @@ def test_credential_store_push_channel_is_given_the_store():
             "adapter": (
                 "volundr.adapters.outbound.push_channels.CredentialStoreApnsNotificationChannel"
             ),
-            "kwargs": {"credential_owner_id": "default", "bundle_id": "com.niuu.lexi.chat"},
+            "kwargs": {"bundle_id": "com.niuu.lexi.chat"},
         }
     )
     channel = create_push_channel(settings, credential_store=store)

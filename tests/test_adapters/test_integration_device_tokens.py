@@ -36,7 +36,7 @@ class TestIntegrationDeviceTokenRepository:
     async def test_register_creates_a_messaging_connection_and_a_credential(self, stores):
         integrations, credentials, repo = stores
 
-        stored = await repo.upsert(_device(environment="sandbox"))
+        stored = await repo.upsert(_device(environment="sandbox", tenant_id="acme"))
 
         [connection] = await integrations.list_connections("user-1")
         assert connection.integration_type == IntegrationType.MESSAGING
@@ -46,6 +46,7 @@ class TestIntegrationDeviceTokenRepository:
             "platform": "ios",
             "app_bundle_id": "com.niuu.lexi.chat",
             "environment": "sandbox",
+            "tenant_id": "acme",
         }
         # The token is a secret: only the credential store holds it.
         assert "apns-token-1" not in repr(connection)
@@ -53,6 +54,7 @@ class TestIntegrationDeviceTokenRepository:
         assert secret == {"device_token": "apns-token-1"}
         assert stored.token == "apns-token-1"
         assert stored.environment == "sandbox"
+        assert stored.tenant_id == "acme"
         assert str(stored.id) == connection.id
 
     async def test_registering_again_updates_one_connection_and_keeps_it_disabled(self, stores):

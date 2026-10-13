@@ -325,16 +325,18 @@ sessions and are not built as Ting channels. Set `postgres` or `integrations` to
 explicitly.
 
 The APNs signing key belongs in the credential store too: use
-`volundr.adapters.outbound.push_channels.CredentialStoreApnsNotificationChannel` and have an
-admin store a tenant credential named `apns` (`POST /api/v1/credentials/tenant`, or
+`volundr.adapters.outbound.push_channels.CredentialStoreApnsNotificationChannel` and have a
+tenant admin store a tenant credential named `apns` (`POST /api/v1/credentials/tenant`, or
 Settings → tenant credentials) with `team_id`, `key_id` and `private_key` (the whole .p8,
-PEM header included), optionally `bundle_id` and `use_sandbox`:
+PEM header included), optionally `bundle_id` and `use_sandbox`. A device records the tenant
+its owner registered it in, and is pushed with that tenant's key, so nothing names a
+tenant in configuration:
 
 ```yaml
 push:
   enabled: true
   adapter: volundr.adapters.outbound.push_channels.CredentialStoreApnsNotificationChannel
-  kwargs: {credential_owner_id: default, bundle_id: com.niuu.lexi.chat}
+  kwargs: {bundle_id: com.niuu.lexi.chat}
 ```
 
 The key is read before each delivery, so rotating it needs no restart, and a missing key

@@ -95,6 +95,8 @@ class IntegrationDeviceTokenRepository(DeviceTokenRepository):
             config["app_bundle_id"] = device.app_bundle_id
         if device.environment:
             config["environment"] = device.environment
+        if device.tenant_id:
+            config["tenant_id"] = device.tenant_id
         connection = IntegrationConnection(
             id=connection_id,
             owner_id=device.owner_id,
@@ -157,6 +159,7 @@ class IntegrationDeviceTokenRepository(DeviceTokenRepository):
             token=token,
             app_bundle_id=config.get("app_bundle_id") or None,
             environment=config.get("environment") or None,
+            tenant_id=config.get("tenant_id") or None,
             created_at=connection.created_at,
             updated_at=connection.updated_at,
         )
