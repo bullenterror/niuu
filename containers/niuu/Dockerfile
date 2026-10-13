@@ -1,27 +1,42 @@
 # Security fixes awaiting stable CPython releases; no interpreter ABI changes.
-FROM --platform=$BUILDPLATFORM python:3.14-slim-bookworm@sha256:82bc3c539b8813ada9d68c63b40158fa002f7f33de9bf3312a3dfdc0620dff56 AS python-security
+FROM --platform=$BUILDPLATFORM python:3.14-slim-bookworm@sha256:48b13b003dda20b16f9442b8475aa05fe21bf6579a8c881db92ffb4d8fd20f83 AS python-security
 COPY containers/python-security/ /security/
 RUN apt-get update && apt-get install -y --no-install-recommends patch \
     && python /security/build.py /patched-stdlib
 
-# Compose's published v5.5.1 binary embeds vulnerable containerd v2.3.4.
-# Build the same release with the patched module until upstream ships it.
-FROM --platform=$BUILDPLATFORM golang:1.27.1-alpine3.23@sha256:0908ac9b9319e09d7c238aabe914e0395c51d63c4e3d0ae8c554fda9158a5769 AS compose-build
+# Compose's published v5.5.1 binary embeds vulnerable containerd v2.3.4 and
+# golang.org/x/net v0.58.0 (GO-2026-6603/6611/6612); v5.6.0 still pins that x/net.
+# Build the release with the patched modules and Go 1.27.2 until upstream ships them.
+FROM --platform=$BUILDPLATFORM golang:1.27.2-alpine3.23@sha256:9e45f0eb4a63ed37ad6e604950407558b7c738e34e015ae77a5d4ad369cde079 AS compose-build
 ARG TARGETARCH
 WORKDIR /src
 RUN wget -q https://github.com/docker/compose/archive/refs/tags/v5.5.1.tar.gz -O /tmp/compose.tar.gz \
     && echo "311077662698fd8e34769a894f9d5240befb1730990efa8ed58e0fa8725d2d84  /tmp/compose.tar.gz" | sha256sum -c - \
     && tar -xzf /tmp/compose.tar.gz --strip-components=1 \
-    && go get github.com/containerd/containerd/v2@v2.3.6 \
+    && go get github.com/containerd/containerd/v2@v2.3.6 golang.org/x/net@v0.60.0 \
     && CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH go build -trimpath -tags e2e \
-        -ldflags '-w -X github.com/docker/compose/v5/internal.Version=v5.5.1-niuu.1' \
+        -ldflags '-w -X github.com/docker/compose/v5/internal.Version=v5.5.1-niuu.2' \
         -o /out/docker-compose ./cmd
+
+# gh v2.102.0 (the latest release) is built with Go 1.27.1 and golang.org/x/net
+# v0.58.0 (GO-2026-6603/6604/6611/6612). Build the same release with Go 1.27.2 and
+# the patched module; return to GitHub's apt package once a release ships them.
+FROM --platform=$BUILDPLATFORM golang:1.27.2-alpine3.23@sha256:9e45f0eb4a63ed37ad6e604950407558b7c738e34e015ae77a5d4ad369cde079 AS gh-build
+ARG TARGETARCH
+WORKDIR /src
+RUN wget -q https://github.com/cli/cli/archive/refs/tags/v2.102.0.tar.gz -O /tmp/gh.tar.gz \
+    && echo "08bf0ef8b4409893889175e0f5279d30d6edd96465816042c0d7c72eac598158  /tmp/gh.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/gh.tar.gz --strip-components=1 \
+    && go get golang.org/x/net@v0.60.0 \
+    && CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH go build -trimpath \
+        -ldflags '-s -w -X github.com/cli/cli/v2/internal/build.Version=2.102.0-niuu.1 -X github.com/cli/cli/v2/internal/build.Date=2026-09-30' \
+        -o /out/gh ./cmd/gh
 
 # BuildKit keeps the native wheel in its existing per-platform CI cache.
 # Only the installed Python environment reaches the final image.
 FROM rust:1.98.1-slim-trixie@sha256:f47a8de237dcbb0b0ce1099901e60a89728e3d51f24e664b40e947171538ade7 AS rust-toolchain
 
-FROM python:3.14-slim-trixie@sha256:51dafde81dbdb6ebde285137a295cf18a47ca95234fe388a343719cb97305b3d AS python-build
+FROM python:3.14-slim-trixie@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170 AS python-build
 
 ARG TARGETARCH
 
@@ -109,7 +124,7 @@ RUN --mount=type=bind,from=switchyard-wheel,source=/wheels,target=/wheels \
     && /opt/venv/bin/python -m pytest tests/test_bifrost -q \
     && touch /switchyard-tests-passed
 
-FROM python:3.14-slim-trixie@sha256:51dafde81dbdb6ebde285137a295cf18a47ca95234fe388a343719cb97305b3d
+FROM python:3.14-slim-trixie@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170
 
 RUN --mount=type=bind,from=python-security,source=/patched-stdlib,target=/patched-stdlib \
     --mount=type=bind,source=containers/python-security,target=/security \
@@ -131,7 +146,7 @@ RUN apt-get update && apt-get upgrade -y \
 # CLI (`niuu up` runs from a container against the host's Docker socket, see
 # scripts/install.sh), and `niuu up` drives `docker compose`.
 ARG TARGETARCH
-ARG DOCKER_CLI_VERSION=29.8.0
+ARG DOCKER_CLI_VERSION=29.9.0
 RUN set -eu; \
     case "$TARGETARCH" in \
       amd64) arch=x86_64 ;; \
@@ -148,14 +163,8 @@ COPY --from=compose-build /out/docker-compose /usr/local/lib/docker/cli-plugins/
 RUN docker compose version
 
 # GitHub CLI (gh): the platform's git workflow reads PR status with it.
-RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-    -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
-    && chmod 0644 /usr/share/keyrings/githubcli-archive-keyring.gpg \
-    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-    > /etc/apt/sources.list.d/github-cli.list \
-    && apt-get update && apt-get install -y --no-install-recommends gh \
-    && rm -rf /var/lib/apt/lists/* \
-    && gh --version
+COPY --from=gh-build /out/gh /usr/local/bin/gh
+RUN gh --version
 
 LABEL org.opencontainers.image.title="niuu"
 LABEL org.opencontainers.image.description="Niuu — unified Python control plane services"
