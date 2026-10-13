@@ -48,6 +48,7 @@ from skuld.tool_result_preview import (
     warm_previews_from_turns,
 )
 from volundr.adapters.inbound.auth import extract_principal, require_role
+from volundr.adapters.inbound.durable_transcripts import DurableTranscripts
 from volundr.adapters.inbound.forge_session_auth import require_bound_session
 from volundr.adapters.inbound.rest_projects import (
     create_projects_router,
@@ -329,13 +330,18 @@ _DURABLE_WARMING: set[str] = set()
 
 
 async def _warm_durable_count(
-    forge: ForgeService, session_id: UUID, seq: int, sid_str: str
+    forge: ForgeService,
+    durable_transcripts: DurableTranscripts,
+    session_id: UUID,
+    seq: int,
+    sid_str: str,
 ) -> None:
     """Background: rebuild the durable transcript ONCE to populate the count cache at ``seq`` so
     the next conversation poll can detect a desync WITHOUT blocking the (cold) open. Fire-and-
     forget; never raises into the event loop."""
     try:
-        durable = await forge.get_transcript(session_id)
+        # The shallow rebuild has the same turns as the full one, and warms its cache.
+        durable = await durable_transcripts.shallow(forge, session_id)
         turns = durable.get("turns") if isinstance(durable, dict) else None
         _durable_count_cache_put(
             sid_str,
@@ -1639,6 +1645,7 @@ def create_router(
     openshell_internal_gateway_url: str = DEFAULT_OPENSHELL_INTERNAL_GATEWAY_URL,
     preview_cache: PreviewCache | None = None,
     preview_cache_dir: FilePath | str = DEFAULT_PREVIEW_CACHE_DIR,
+    durable_transcripts: DurableTranscripts | None = None,
     project_service=None,
     runtime_build: dict | None = None,
     runtime_health_timeout: float = 3.0,
@@ -1650,6 +1657,8 @@ def create_router(
     router = APIRouter(prefix=prefix)
     if preview_cache is None:
         preview_cache = PreviewCache(preview_cache_dir)
+    if durable_transcripts is None:
+        durable_transcripts = DurableTranscripts()
     event_stream = None
     if broadcaster is not None:
         if stats_service is None:
@@ -3857,7 +3866,9 @@ def create_router(
                                 if seq > 0 and sid_str not in _DURABLE_WARMING:
                                     _DURABLE_WARMING.add(sid_str)
                                     asyncio.create_task(
-                                        _warm_durable_count(forge, session_id, seq, sid_str)
+                                        _warm_durable_count(
+                                            forge, durable_transcripts, session_id, seq, sid_str
+                                        )
                                     )
                             elif durable_count > live_count and durable_tail != live_tail:
                                 # WARM + desync: rebuild to return the fuller durable body (rare).
@@ -3875,7 +3886,11 @@ def create_router(
                                 # mismatch, not a count surplus, selects the durable body.
                                 t_dur = time.perf_counter()
                                 try:
-                                    durable = await forge.get_transcript(session_id)
+                                    durable = await (
+                                        durable_transcripts.shallow(forge, session_id)
+                                        if shallow
+                                        else durable_transcripts.full(forge, session_id)
+                                    )
                                 except (RuntimeError, ValueError):
                                     durable = None
                                 timings["fault_c_rebuild_ms"] = round(
@@ -3931,7 +3946,11 @@ def create_router(
             )
 
         try:
-            return _maybe_elide(await forge.get_transcript(session_id))
+            # Shallow reads (every client poll) come from the per-seq cache; a stopped session
+            # rebuilds once, not on every poll. Full reads are single-flight per session.
+            if shallow and turn_id is None:
+                return _maybe_elide(await durable_transcripts.shallow(forge, session_id))
+            return _maybe_elide(await durable_transcripts.full(forge, session_id))
         except RuntimeError as e:
             fallback = _fallback_workspace_transcript(session)
             if fallback is not None:
@@ -4117,7 +4136,7 @@ def create_router(
 
         # (3) Durable-log rebuild → workspace fallback (stopped/seed-only sessions).
         try:
-            transcript = await forge.get_transcript(session_id)
+            transcript = await durable_transcripts.full(forge, session_id)
         except (RuntimeError, ValueError):
             transcript = _fallback_workspace_transcript(session) or {"turns": []}
         turns = transcript.get("turns", []) if isinstance(transcript, dict) else []
@@ -4615,7 +4634,7 @@ def create_router(
     ) -> dict:
         """Return the persisted session transcript directly from workspace storage."""
         try:
-            return await forge.get_transcript(session_id)
+            return await durable_transcripts.full(forge, session_id)
         except LookupError:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
