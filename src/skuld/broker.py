@@ -645,6 +645,8 @@ class Broker(
         self._event_log_lock = asyncio.Lock()
         self._event_log_task: asyncio.Task[None] | None = None
         self._event_log_stopping = False
+        # Set once the stored head is known; until then nothing is flushed.
+        self._event_log_head_known = False
         # id(entry) -> (entry, future): callers (Forge MCP notify) waiting to learn
         # whether one specific frame reached Forge. See _watch_event_log_entry.
         self._event_log_receipts: dict[int, tuple[dict, asyncio.Future[bool]]] = {}

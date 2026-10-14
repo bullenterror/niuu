@@ -34,7 +34,6 @@ from skuld.broker import (
     send_message_to_session,
 )
 from skuld.config import SkuldSettings
-from skuld.event_log import EventLogRejectedError
 from skuld.transports import (
     CodexSubprocessTransport,
     SDKTransport,
@@ -5285,14 +5284,18 @@ class TestShutdownEdgeCases:
                 await test_broker.shutdown()
 
     @pytest.mark.asyncio
-    async def test_startup_with_unreachable_volundr_fails_loudly(self, test_broker):
-        """A configured durable log that cannot start is fatal, not degraded.
+    async def test_startup_with_unreachable_volundr_starts_and_keeps_retrying(self, test_broker):
+        """An unreachable Volundr is retryable: exiting would only crash-loop the pod.
 
-        volundr_api_url names a backend that must hold the transcript; booting
-        without it would silently record nothing.
+        The broker starts and asks for the durable head in the background; until it
+        has it, nothing is flushed, so no output is written at a guessed seq.
         """
-        with pytest.raises(EventLogRejectedError):
-            await test_broker.startup()
+        await test_broker.startup()
+        try:
+            assert test_broker._event_log_task is not None
+            assert not test_broker._event_log_head_known
+        finally:
+            await test_broker.shutdown()
 
     @pytest.mark.asyncio
     async def test_startup_without_event_log_succeeds(self, tmp_path):

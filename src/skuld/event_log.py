@@ -35,6 +35,10 @@ class EventLogRejectedError(RuntimeError):
     """
 
 
+class _EventLogHeadUnavailableError(Exception):
+    """The event-log head fetch failed in a way a retry can fix (network, 5xx, 401, 408, 429)."""
+
+
 def sanitize_log(value: object) -> str:
     """Sanitize a value for safe log output (prevent log injection)."""
     return str(value).replace("\\n", "\\\\n").replace("\\r", "\\\\r")
@@ -619,10 +623,19 @@ class EventLogMixin:
             except Exception:
                 logger.debug("event log flush iteration failed", exc_info=True)
 
+    #: Head-fetch backoff while Volundr or its identity provider is unavailable.
+    EVENT_LOG_RESUME_INITIAL_DELAY = 2.0
+    EVENT_LOG_RESUME_MAX_DELAY = 60.0
+
     @staticmethod
     def _is_transient_status(status: int) -> bool:
-        """5xx, timeouts, and rate limits recover on retry; other rejections never do."""
-        return status >= 500 or status in (408, 429)
+        """5xx, timeouts, rate limits and 401 recover on retry; other rejections never do.
+
+        A 401 is what an identity outage looks like: Volundr's proxy answers it when it
+        cannot fetch the keys that verify the workload token (``Jwks remote fetch is
+        failed``), and the workload token itself is refreshed before every request.
+        """
+        return status >= 500 or status in (401, 408, 429)
 
     async def _flush_event_log(self) -> None:
         """Serialize flushes and acknowledge only the sequence range actually sent."""
@@ -690,26 +703,48 @@ class EventLogMixin:
         appends would hit ON CONFLICT DO NOTHING and silently vanish. Seeding
         from the stored head keeps the sequence monotonic across restarts.
 
-        Runs during broker startup, so a head fetch that cannot succeed fails
-        the boot: guessing seq 0 instead risks exactly the silent swallow the
-        resume exists to prevent, and a permanent rejection here means every
-        later flush would fail too.
+        A head fetch that a retry can fix (Volundr or its identity provider
+        down) does not fail the boot: the broker starts, frames wait in the
+        buffer with provisional seqs, and a background task keeps asking for
+        the head. Nothing is flushed before the head is known, so the
+        provisional seqs are re-based above it exactly as for the capture
+        window (``_resume_seq_from_head``). A permanent rejection (wrong
+        session id or URL, malformed head) still fails the boot.
         """
         if not self._settings.event_log_enabled or not self.volundr_api_url:
             return
+        try:
+            head = await self._fetch_event_log_head()
+        except _EventLogHeadUnavailableError as exc:
+            logger.warning(
+                "Durable event log head unavailable (%s); starting without it and retrying "
+                "in the background. Output is buffered until Volundr answers.",
+                sanitize_log(exc),
+            )
+            self._event_log_task = asyncio.create_task(self._event_log_resume_loop())
+            self._event_log_task.add_done_callback(self._on_event_log_worker_done)
+            return
+        await self._resume_seq_from_head(head)
+        self._event_log_head_known = True
+        self._event_log_task = asyncio.create_task(self._event_log_flush_loop())
+        self._event_log_task.add_done_callback(self._on_event_log_worker_done)
+        logger.info("Durable event log started (resume seq=%d)", self._event_log_seq)
+
+    async def _fetch_event_log_head(self) -> int:
+        """GET the stored head; a retryable failure raises ``_EventLogHeadUnavailableError``."""
         client = await self._get_http_client()
         path = self.FORGE_LOG_PATH_TEMPLATE.format(sid=self.session_id) + "/head"
         try:
             response = await client.get(path)
         except httpx.HTTPError as exc:
-            raise EventLogRejectedError(
-                f"Volundr is unreachable for the event-log head fetch at "
-                f"{self.volundr_api_url}{path}: {exc}. The durable event log is "
-                "configured (volundr_api_url is set) so it must work — fix "
-                "connectivity, or unset volundr_api_url / set event_log_enabled: "
-                "false to run without a durable log."
+            raise _EventLogHeadUnavailableError(
+                f"Volundr is unreachable at {self.volundr_api_url}{path}: {exc}"
             ) from exc
         if response.status_code >= 300:
+            if self._is_transient_status(response.status_code):
+                raise _EventLogHeadUnavailableError(
+                    f"Volundr answered {response.status_code}: {response.text[:200]}"
+                )
             raise EventLogRejectedError(
                 f"Volundr rejected the durable event log head fetch for session "
                 f"{self.session_id} ({response.status_code}): {response.text[:200]}. "
@@ -727,10 +762,34 @@ class EventLogMixin:
                 f"Cannot initialize durable event log for session {self.session_id}: "
                 "a valid head is required before starting the agent"
             ) from exc
-        await self._resume_seq_from_head(head)
-        self._event_log_task = asyncio.create_task(self._event_log_flush_loop())
-        self._event_log_task.add_done_callback(self._on_event_log_worker_done)
-        logger.info("Durable event log started (resume seq=%d)", self._event_log_seq)
+        return head
+
+    async def _event_log_resume_loop(self) -> None:
+        """Background: fetch the head with backoff, then run the flush loop.
+
+        One task for both phases, so shutdown cancels whichever is running and a
+        permanent rejection in either takes the broker down (``_on_event_log_worker_done``).
+        """
+        delay = self.EVENT_LOG_RESUME_INITIAL_DELAY
+        while not self._event_log_stopping:
+            await asyncio.sleep(delay)
+            try:
+                head = await self._fetch_event_log_head()
+            except _EventLogHeadUnavailableError as exc:
+                delay = min(delay * 2, self.EVENT_LOG_RESUME_MAX_DELAY)
+                logger.warning(
+                    "Durable event log head still unavailable (%s); %d frames buffered, "
+                    "retrying in %.0fs",
+                    sanitize_log(exc),
+                    len(self._event_log_buffer),
+                    delay,
+                )
+                continue
+            await self._resume_seq_from_head(head)
+            self._event_log_head_known = True
+            logger.info("Durable event log started (resume seq=%d)", self._event_log_seq)
+            await self._event_log_flush_loop()
+            return
 
     @staticmethod
     def _on_event_log_worker_done(task: asyncio.Task) -> None:
@@ -786,6 +845,14 @@ class EventLogMixin:
             self._event_log_task.cancel()
             await asyncio.gather(self._event_log_task, return_exceptions=True)
             self._event_log_task = None
+        if not self._event_log_head_known:
+            # Provisional seqs could collide with stored rows: never flush them blind.
+            if self._event_log_buffer:
+                logger.critical(
+                    "Durable event log head never fetched — %d frames lost on shutdown",
+                    len(self._event_log_buffer),
+                )
+            return
         # Final best-effort drain so the last turn isn't lost on shutdown.
         for _ in range(self._settings.event_log_max_buffer):
             async with self._event_log_lock:
