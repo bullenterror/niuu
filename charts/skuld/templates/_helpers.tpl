@@ -60,6 +60,20 @@ Resident persona (required when resident.enabled).
 {{- end }}
 
 {{/*
+Resident workload-token exchange: always the platform's
+(resident.platform.workloadExchangeUrl, else resident.platform.baseUrl). The
+cluster's own Volundr (volundr.apiUrl) serves the resident's cluster-local
+calls; it is not where the resident's identity is exchanged.
+*/}}
+{{- define "skuld.residentWorkloadExchangeUrl" -}}
+{{- if .Values.resident.platform.workloadExchangeUrl -}}
+{{- .Values.resident.platform.workloadExchangeUrl -}}
+{{- else -}}
+{{- printf "%s/api/v1/tokens/workload/exchange" (required "resident.platform.baseUrl is required when resident.platform.enabled=true" .Values.resident.platform.baseUrl | trimSuffix "/") -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Resident display name (defaults to the persona).
 */}}
 {{- define "skuld.residentName" -}}

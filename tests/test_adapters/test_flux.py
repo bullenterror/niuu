@@ -1651,6 +1651,85 @@ def test_inject_workload_exchange_env_updates_builtin_and_extra_containers():
     assert values["extraContainers"][1]["env"][0]["value"] == "https://override/exchange"
 
 
+_CLUSTER_API_URL = "https://volundr.cluster.example"
+_EXCHANGE_PATH = "/api/v1/tokens/workload/exchange"
+
+
+def _cluster_pod_manager() -> FluxPodManager:
+    """A controller whose session pods reach this cluster's own Völundr."""
+    return FluxPodManager(
+        namespace="test-ns",
+        session_defaults={
+            "volundr": {"apiUrl": _CLUSTER_API_URL},
+            "affinity": {"podAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": []}},
+            "image": {"tag": "session"},
+        },
+    )
+
+
+def _env(values: dict, name: str) -> str:
+    return next(entry["value"] for entry in values["envVars"] if entry["name"] == name)
+
+
+class TestFluxResidentClusterVolundr:
+    """Cluster-local calls go to this cluster's Völundr; the platform keeps
+    platform APIs and the workload-token exchange."""
+
+    async def _deploy(self, pod_manager: FluxPodManager, profile, mock_api) -> dict:
+        with patch.object(pod_manager, "_get_api", return_value=mock_api):
+            await pod_manager.deploy(_resident_runtime(), profile)
+        return mock_api.create_namespaced_custom_object.call_args.kwargs["body"]["spec"]["values"]
+
+    async def test_resident_gets_the_session_pods_volundr_api_url(self, mock_api) -> None:
+        values = await self._deploy(_cluster_pod_manager(), _resident_profile(), mock_api)
+
+        assert values["volundr"]["apiUrl"] == _CLUSTER_API_URL
+        # Only the URL is shared; session scheduling and images stay sessions'.
+        assert "affinity" not in values
+        assert "image" not in values
+        assert values["resident"]["platform"]["baseUrl"] == "https://niuu.example.test"
+
+    async def test_token_exchange_stays_at_the_platform(self, mock_api) -> None:
+        values = await self._deploy(_cluster_pod_manager(), _resident_profile(), mock_api)
+
+        assert _env(values, "NIUU_WORKLOAD_IDENTITY_EXCHANGE_URL") == (
+            f"https://niuu.example.test{_EXCHANGE_PATH}"
+        )
+
+    async def test_explicit_platform_exchange_url_is_used(self, mock_api) -> None:
+        profile = _resident_profile()
+        profile.deployment["values"]["resident"]["platform"]["workloadExchangeUrl"] = (
+            "https://exchange.example/x"
+        )
+        values = await self._deploy(_cluster_pod_manager(), profile, mock_api)
+
+        assert _env(values, "NIUU_WORKLOAD_IDENTITY_EXCHANGE_URL") == "https://exchange.example/x"
+
+    async def test_a_profile_volundr_api_url_is_kept(self, mock_api) -> None:
+        profile = _resident_profile()
+        profile.deployment["values"]["volundr"] = {"apiUrl": "https://profile.example"}
+        values = await self._deploy(_cluster_pod_manager(), profile, mock_api)
+
+        assert values["volundr"]["apiUrl"] == "https://profile.example"
+
+    async def test_no_cluster_url_configured_adds_none(self, pod_manager, mock_api) -> None:
+        values = await self._deploy(pod_manager, _resident_profile(), mock_api)
+
+        assert "volundr" not in values
+        assert _env(values, "NIUU_WORKLOAD_IDENTITY_EXCHANGE_URL") == (
+            f"https://niuu.example.test{_EXCHANGE_PATH}"
+        )
+
+    async def test_resident_without_platform_exchanges_at_its_volundr(self, mock_api) -> None:
+        profile = _resident_profile()
+        del profile.deployment["values"]["resident"]["platform"]
+        values = await self._deploy(_cluster_pod_manager(), profile, mock_api)
+
+        assert _env(values, "NIUU_WORKLOAD_IDENTITY_EXCHANGE_URL") == (
+            f"{_CLUSTER_API_URL}{_EXCHANGE_PATH}"
+        )
+
+
 class TestFluxPodManagerRejectsExecutionFlagsWithoutBaseUrl:
     """resident_triggers_enabled/resident_budget_enabled without
     resident_platform_base_url used to be silently ignored — _resident_values

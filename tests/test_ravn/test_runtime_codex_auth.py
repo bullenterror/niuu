@@ -213,7 +213,9 @@ def test_configured_platform_still_wins_for_mimir(monkeypatch) -> None:
     assert exchange_url == "https://volundr.example.test/api/v1/tokens/workload/exchange"
 
 
-def test_a_rendered_resident_ravn_config_builds_the_brokered_provider(tmp_path) -> None:
+async def test_a_rendered_resident_ravn_config_builds_the_brokered_provider(
+    tmp_path, monkeypatch
+) -> None:
     """The skuld chart's resident ravn config.yaml, loaded as Ravn loads it,
     gives the persona's Codex transport the broker, not the host login."""
     from tests.test_charts.test_skuld_chart import render_resident_ravn_config
@@ -230,8 +232,48 @@ def test_a_rendered_resident_ravn_config_builds_the_brokered_provider(tmp_path) 
     )
     config["runtime_executor"]["transport_adapter"] = _CODEX
     settings = Settings.model_validate(config)
+    from niuu.adapters.outbound.http_auth import WorkloadIdentityBearerTokenAuthAdapter
+
+    monkeypatch.setattr(WorkloadIdentityBearerTokenAuthAdapter, "headers", lambda self: {})
 
     provider = _runtime_cli_transport_kwargs(_CODEX, settings)["codex_auth_provider"]
+    auth = provider._http_client_provider.__closure__[0].cell_contents
 
     assert type(provider).__name__ == "VolundrCodexAuthProvider"
     assert provider._token_path == token_path
+    # Broker on the cluster's Völundr (the chart's volundr.apiUrl), token
+    # exchanged at the platform (resident.platform.baseUrl).
+    async with await provider._http_client_provider() as client:
+        assert str(client.base_url).rstrip("/") == "https://volundr.example"
+    assert auth._resolved_exchange_url() == (
+        "http://niuu-volundr.volundr.svc.cluster.local:80/api/v1/tokens/workload/exchange"
+    )
+
+
+async def test_broker_is_the_runtime_volundr_not_the_platform(monkeypatch) -> None:
+    """A resident's platform (gateway.platform) need not serve the broker; the
+    Völundr its own Skuld calls does. The token is still exchanged at the
+    platform."""
+    from niuu.adapters.outbound.http_auth import WorkloadIdentityBearerTokenAuthAdapter
+
+    monkeypatch.delenv("NIUU_WORKLOAD_IDENTITY_EXCHANGE_URL", raising=False)
+    monkeypatch.setattr(WorkloadIdentityBearerTokenAuthAdapter, "headers", lambda self: {})
+    settings = Settings.model_validate(
+        {
+            "runtime_executor": {
+                "transport_adapter": _CODEX,
+                "codex_auth_adapter": "skuld.codex_auth.VolundrCodexAuthProvider",
+                "volundr_api_url": "https://volundr.cluster.example",
+            },
+            "gateway": {"platform": {"base_url": "https://platform.example"}},
+        }
+    )
+
+    provider = _runtime_cli_transport_kwargs(_CODEX, settings)["codex_auth_provider"]
+    auth = provider._http_client_provider.__closure__[0].cell_contents
+
+    async with await provider._http_client_provider() as client:
+        assert str(client.base_url).rstrip("/") == "https://volundr.cluster.example"
+    assert auth._resolved_exchange_url() == (
+        "https://platform.example/api/v1/tokens/workload/exchange"
+    )

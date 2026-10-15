@@ -486,24 +486,28 @@ def _codex_auth_provider(settings: Settings) -> Any | None:
         return None
 
     platform = settings.gateway.platform
-    base_url = platform.base_url.strip()
     # Explicitly configured, not merely defaulted. base_url falls back to
     # http://localhost:8080, which is right for a developer running Völundr
     # locally and meaningless inside a flock pod — building a provider against
     # it would turn a missing-config error into a confusing connection failure
     # at the first model call.
-    if "base_url" not in platform.model_fields_set or not base_url:
-        # Flock personas share Skuld's platform origin. OpenShell authenticates
-        # that HTTP path through its provider proxy and has no projected
-        # workload-token exchange URL. Native Kubernetes still supplies one.
-        base_url = (
-            settings.runtime_executor.volundr_api_url.strip()
-            or _platform_origin_from_exchange_url()
-        )
+    platform_url = platform.base_url.strip() if "base_url" in platform.model_fields_set else ""
+    # The broker is cluster-local: it is the Völundr this runtime's own Skuld
+    # calls (SKULD__VOLUNDR_API_URL / runtime_executor.volundr_api_url), the
+    # Forge that runs this pod. gateway.platform is the platform, which a
+    # resident uses for platform APIs and which need not serve the broker at
+    # all. OpenShell authenticates that HTTP path through its provider proxy
+    # and has no projected workload-token exchange URL. Native Kubernetes
+    # still supplies one.
+    base_url = (
+        settings.runtime_executor.volundr_api_url.strip()
+        or platform_url
+        or _platform_origin_from_exchange_url()
+    )
     if not base_url:
         raise RuntimeError(
-            "Configured Codex auth requires gateway.platform.base_url, "
-            "runtime_executor.volundr_api_url (SKULD__VOLUNDR_API_URL), or "
+            "Configured Codex auth requires runtime_executor.volundr_api_url "
+            "(SKULD__VOLUNDR_API_URL), gateway.platform.base_url, or "
             "NIUU_WORKLOAD_IDENTITY_EXCHANGE_URL"
         )
 
@@ -514,7 +518,9 @@ def _codex_auth_provider(settings: Settings) -> Any | None:
     # kubernetes.io service-account token, whose audience the exchange rejects.
     # Handing over the default silently replaced a working credential with one
     # that could only ever 401.
-    auth_kwargs: dict[str, Any] = {"base_url": base_url}
+    # The workload token is exchanged at the platform when one is configured;
+    # only the broker call itself goes to the cluster's Völundr.
+    auth_kwargs: dict[str, Any] = {"base_url": platform_url or base_url}
     if "workload_token_file" in platform.model_fields_set:
         auth_kwargs["token_file"] = platform.workload_token_file
     if "workload_exchange_url" in platform.model_fields_set:
