@@ -802,6 +802,73 @@ class TestResidentWorkloadIdentityConfigFirst:
         assert "NIUU_WORKLOAD_IDENTITY" not in rendered
 
 
+_VOLUNDR_CODEX_AUTH = "skuld.codex_auth.VolundrCodexAuthProvider"
+_BROKER_TOKEN_PATH = "https://volundr.example/api/v1/internal/credentials/codex/tokens"
+
+
+def render_resident_ravn_config(tmp_path: Path, *, broker: dict, platform: bool = True) -> dict:
+    """The resident's rendered ravn config.yaml, with ``broker`` values set."""
+    values = json.loads(json.dumps(TestResidentWorkloadIdentityConfigFirst.RESIDENT_VALUES))
+    values["broker"] = broker
+    values["resident"]["platform"]["enabled"] = platform
+    rendered = _render_skuld_chart(tmp_path, values)
+    for doc in yaml.safe_load_all(rendered):
+        if (
+            isinstance(doc, dict)
+            and doc.get("kind") == "ConfigMap"
+            and doc["metadata"]["name"].endswith("-ravn-config")
+        ):
+            return yaml.safe_load(doc["data"]["config.yaml"])
+    pytest.fail("ravn config was not rendered")
+    raise AssertionError("ravn config was not rendered")
+
+
+class TestResidentRavnCodexAuth:
+    """The ravn container's Codex transport uses the skuld container's broker."""
+
+    def test_ravn_config_carries_the_same_codex_auth_as_the_broker(self, tmp_path):
+        broker = {
+            "codexAuth": {
+                "adapter": _VOLUNDR_CODEX_AUTH,
+                "kwargs": {"token_path": _BROKER_TOKEN_PATH},
+            }
+        }
+        values = json.loads(json.dumps(TestResidentWorkloadIdentityConfigFirst.RESIDENT_VALUES))
+        values["broker"] = broker
+        rendered = _render_skuld_chart(tmp_path, values)
+        configs = [
+            yaml.safe_load(doc["data"]["config.yaml"])
+            for doc in yaml.safe_load_all(rendered)
+            if isinstance(doc, dict)
+            and doc.get("kind") == "ConfigMap"
+            and "config.yaml" in doc.get("data", {})
+        ]
+        broker_cfg = next(config for config in configs if "transport_adapter" in config)
+        ravn_cfg = next(config for config in configs if "persona" in config)
+
+        assert ravn_cfg["runtime_executor"] == {
+            "codex_auth_adapter": broker_cfg["codex_auth"]["adapter"],
+            "codex_auth_kwargs": broker_cfg["codex_auth"]["kwargs"],
+        }
+        assert ravn_cfg["runtime_executor"]["codex_auth_kwargs"] == {
+            "token_path": _BROKER_TOKEN_PATH
+        }
+
+    @pytest.mark.parametrize(
+        ("broker", "platform"),
+        [
+            ({}, True),
+            ({"codexAuth": {"adapter": "skuld.codex_auth.HostCodexAuthProvider"}}, True),
+            ({"codexAuth": {"adapter": _VOLUNDR_CODEX_AUTH}}, False),
+        ],
+        ids=["no-codex-auth", "host-login", "no-workload-identity"],
+    )
+    def test_host_login_residents_render_no_codex_auth(self, tmp_path, broker, platform):
+        config = render_resident_ravn_config(tmp_path, broker=broker, platform=platform)
+
+        assert "runtime_executor" not in config
+
+
 class TestResidentTriggersAndBudget:
     """resident.triggers / resident.budget — render resident_triggers /
     resident_budget into the ravn config, gated on resident.platform."""

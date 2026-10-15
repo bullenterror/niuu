@@ -211,3 +211,27 @@ def test_configured_platform_still_wins_for_mimir(monkeypatch) -> None:
 
     assert token_file == "/custom/token"
     assert exchange_url == "https://volundr.example.test/api/v1/tokens/workload/exchange"
+
+
+def test_a_rendered_resident_ravn_config_builds_the_brokered_provider(tmp_path) -> None:
+    """The skuld chart's resident ravn config.yaml, loaded as Ravn loads it,
+    gives the persona's Codex transport the broker, not the host login."""
+    from tests.test_charts.test_skuld_chart import render_resident_ravn_config
+
+    token_path = "https://volundr.example/api/v1/internal/credentials/codex/tokens"
+    config = render_resident_ravn_config(
+        tmp_path,
+        broker={
+            "codexAuth": {
+                "adapter": "skuld.codex_auth.VolundrCodexAuthProvider",
+                "kwargs": {"token_path": token_path},
+            }
+        },
+    )
+    config["runtime_executor"]["transport_adapter"] = _CODEX
+    settings = Settings.model_validate(config)
+
+    provider = _runtime_cli_transport_kwargs(_CODEX, settings)["codex_auth_provider"]
+
+    assert type(provider).__name__ == "VolundrCodexAuthProvider"
+    assert provider._token_path == token_path
