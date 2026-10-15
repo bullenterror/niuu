@@ -38,9 +38,11 @@ DEFAULT_MAX_SESSIONS = 16
 
 
 class _TranscriptSource(Protocol):
-    async def get_transcript(self, session_id: UUID) -> dict: ...
+    async def get_transcript(self, session_id: UUID) -> dict:
+        """The full durable transcript (``ForgeService.get_transcript``)."""
 
-    async def durable_latest_seq(self, session_id: UUID) -> int: ...
+    async def durable_latest_seq(self, session_id: UUID) -> int:
+        """The event log's ``MAX(seq)``, 0 without one."""
 
 
 class DurableTranscripts:
