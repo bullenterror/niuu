@@ -233,3 +233,26 @@ def test_every_captured_turn_terminates_exactly_once(fixture: str) -> None:
     _, events = run_turn(load(fixture))
     terminals = [e for e in events if e["state"] in {"final", "error", "aborted"}]
     assert len(terminals) == 1, f"{fixture} produced {len(terminals)} terminal events"
+
+
+class TestNativeGatewayFields:
+    """The fields Volundr's OpenClaw session controller reads off a native gateway."""
+
+    def test_messages_carry_flat_answer_content_without_thinking_or_tools(self) -> None:
+        tr = TurnTranslator(session_key="agent:main:niuu-1", run_id="run-1")
+        tr.ingest({"type": "thought", "payload": {"text": "hmm", "thinking": True}})
+        tr.ingest({"type": "tool_start", "payload": {"tool_name": "bash", "input": {}}})
+        tr.ingest({"type": "tool_result", "payload": {"tool_name": "bash", "result": "out"}})
+        events = tr.ingest({"type": "response", "payload": {"text": "done"}})
+        assert events[-1]["message"]["content"] == "done"
+
+    def test_error_terminals_carry_error_message(self) -> None:
+        tr = TurnTranslator(session_key="agent:main:niuu-1", run_id="run-1")
+        [event] = tr.ingest({"type": "error", "payload": {"message": "model down"}})
+        assert event["errorMessage"] == "model down"
+        assert event["error"]["message"] == "model down"
+
+    def test_aborted_terminals_carry_no_error_message(self) -> None:
+        tr = TurnTranslator(session_key="agent:main:niuu-1", run_id="run-1")
+        [event] = tr.aborted()
+        assert "errorMessage" not in event

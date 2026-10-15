@@ -1772,3 +1772,179 @@ class TestFluxResidentPlatformTriggersAndBudget:
         values = mock_api.create_namespaced_custom_object.call_args.kwargs["body"]["spec"]["values"]
         assert "triggers" not in values["resident"]
         assert "budget" not in values["resident"]
+
+
+_OPENCLAW_MASTER = "master-0a1b2c3d4e5f60718293a4b5c6d7e8f9"
+
+
+def _openclaw_profile() -> ResidentDeploymentProfile:
+    profile = _resident_profile()
+    profile.deployment["values"]["resident"]["openclaw"] = {"enabled": True}
+    return profile
+
+
+def _bind_ravn_sessions(pod_manager: FluxPodManager) -> None:
+    """Wire the Ravn session controller the way composition does: it hands over the tokens."""
+    from niuu.adapters.memory_credential_store import MemoryCredentialStore
+    from volundr.adapters.outbound.ravn_gateway import RavnResidentSessionController
+
+    RavnResidentSessionController(
+        pod_manager, MemoryCredentialStore(), gateway_token=_OPENCLAW_MASTER
+    )
+
+
+class TestFluxResidentOpenClawToken:
+    """Each Ravn resident's shim gets its own derived token Secret; never the master."""
+
+    async def test_deploy_writes_the_residents_own_token_before_the_release(
+        self,
+        pod_manager: FluxPodManager,
+        mock_api,
+        core_api: AsyncMock,
+    ) -> None:
+        import hashlib
+        import hmac
+        import json
+
+        _bind_ravn_sessions(pod_manager)
+        runtime = _resident_runtime()
+        order: list[str] = []
+        core_api.create_namespaced_secret.side_effect = lambda **kwargs: order.append(
+            kwargs["body"]["metadata"]["name"]
+        )
+        mock_api.create_namespaced_custom_object.side_effect = lambda **kwargs: order.append(
+            kwargs["body"]["metadata"]["name"]
+        )
+        with patch.object(pod_manager, "_get_api", return_value=mock_api):
+            await pod_manager.deploy(runtime, _openclaw_profile())
+
+        name = f"resident-{runtime.id}-openclaw"
+        assert order == [name, f"resident-{runtime.id}"]
+        secret = core_api.create_namespaced_secret.call_args.kwargs["body"]
+        expected = hmac.new(
+            _OPENCLAW_MASTER.encode(), str(runtime.id).encode(), hashlib.sha256
+        ).hexdigest()
+        assert secret["stringData"] == {"token": expected}
+        assert secret["metadata"]["namespace"] == "test-ns"
+        assert secret["metadata"]["labels"] == {
+            "app.kubernetes.io/managed-by": "volundr",
+            "niuu.world/resident-id": str(runtime.id),
+            "niuu.world/owner-id": "user-a",
+            "niuu.world/tenant-id": "tenant-a",
+        }
+        values = mock_api.create_namespaced_custom_object.call_args.kwargs["body"]["spec"]["values"]
+        assert values["resident"]["openclaw"] == {
+            "enabled": True,
+            "tokenSecret": {"name": name, "key": "token"},
+        }
+        rendered = json.dumps(values)
+        assert _OPENCLAW_MASTER not in rendered
+        assert expected not in rendered
+
+    async def test_no_secret_without_resident_openclaw(
+        self,
+        pod_manager: FluxPodManager,
+        mock_api,
+        core_api: AsyncMock,
+    ) -> None:
+        _bind_ravn_sessions(pod_manager)
+        with patch.object(pod_manager, "_get_api", return_value=mock_api):
+            await pod_manager.deploy(_resident_runtime(), _resident_profile())
+
+        core_api.create_namespaced_secret.assert_not_awaited()
+        values = mock_api.create_namespaced_custom_object.call_args.kwargs["body"]["spec"]["values"]
+        assert "openclaw" not in values["resident"]
+
+    async def test_openclaw_without_a_ravn_session_controller_fails_the_deploy(
+        self,
+        pod_manager: FluxPodManager,
+        mock_api,
+        core_api: AsyncMock,
+    ) -> None:
+        with (
+            patch.object(pod_manager, "_get_api", return_value=mock_api),
+            pytest.raises(ValueError, match="RavnResidentSessionController"),
+        ):
+            await pod_manager.deploy(_resident_runtime(), _openclaw_profile())
+
+        core_api.create_namespaced_secret.assert_not_awaited()
+        mock_api.create_namespaced_custom_object.assert_not_awaited()
+
+    async def test_redeploy_refreshes_the_residents_own_secret(
+        self,
+        pod_manager: FluxPodManager,
+        mock_api,
+        core_api: AsyncMock,
+    ) -> None:
+        _bind_ravn_sessions(pod_manager)
+        runtime = _resident_runtime()
+        core_api.create_namespaced_secret.side_effect = _ApiError(409)
+        core_api.read_namespaced_secret.return_value = SimpleNamespace(
+            metadata=SimpleNamespace(
+                labels={
+                    "app.kubernetes.io/managed-by": "volundr",
+                    "niuu.world/resident-id": str(runtime.id),
+                }
+            )
+        )
+        with patch.object(pod_manager, "_get_api", return_value=mock_api):
+            await pod_manager.deploy(runtime, _openclaw_profile())
+
+        created = core_api.create_namespaced_secret.call_args.kwargs["body"]["stringData"]
+        core_api.patch_namespaced_secret.assert_awaited_once_with(
+            name=f"resident-{runtime.id}-openclaw",
+            namespace="test-ns",
+            body={"stringData": created},
+        )
+        mock_api.create_namespaced_custom_object.assert_awaited_once()
+
+    async def test_a_foreign_secret_with_the_residents_name_fails_the_deploy(
+        self,
+        pod_manager: FluxPodManager,
+        mock_api,
+        core_api: AsyncMock,
+    ) -> None:
+        _bind_ravn_sessions(pod_manager)
+        core_api.create_namespaced_secret.side_effect = _ApiError(409)
+        core_api.read_namespaced_secret.return_value = SimpleNamespace(
+            metadata=SimpleNamespace(labels={"niuu.world/resident-id": str(uuid4())})
+        )
+        with (
+            patch.object(pod_manager, "_get_api", return_value=mock_api),
+            pytest.raises(ValueError, match="is not resident"),
+        ):
+            await pod_manager.deploy(_resident_runtime(), _openclaw_profile())
+
+        core_api.patch_namespaced_secret.assert_not_awaited()
+        mock_api.create_namespaced_custom_object.assert_not_awaited()
+
+    async def test_delete_removes_the_secret_and_tolerates_its_absence(
+        self,
+        pod_manager: FluxPodManager,
+        mock_api,
+        core_api: AsyncMock,
+    ) -> None:
+        runtime = _resident_runtime()
+        _bind_ravn_sessions(pod_manager)
+        with patch.object(pod_manager, "_get_api", return_value=mock_api):
+            await pod_manager.delete(runtime)
+            core_api.delete_namespaced_secret.assert_awaited_once_with(
+                name=f"resident-{runtime.id}-openclaw", namespace="test-ns"
+            )
+            core_api.delete_namespaced_secret.side_effect = _ApiError(404)
+            await pod_manager.delete(runtime)
+
+            core_api.delete_namespaced_secret.side_effect = _ApiError(403)
+            with pytest.raises(_ApiError):
+                await pod_manager.delete(runtime)
+
+    async def test_delete_leaves_secrets_alone_without_ravn_sessions(
+        self,
+        pod_manager: FluxPodManager,
+        mock_api,
+        core_api: AsyncMock,
+    ) -> None:
+        with patch.object(pod_manager, "_get_api", return_value=mock_api):
+            await pod_manager.delete(_resident_runtime())
+
+        core_api.delete_namespaced_secret.assert_not_awaited()

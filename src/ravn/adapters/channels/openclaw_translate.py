@@ -40,6 +40,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from ravn.adapters.channels.openclaw_store import flatten_text
+
 #: Ravn event types we translate. Everything else is passed through as an
 #: unknown block so a new DriveLoop type shows up as data rather than vanishing.
 THOUGHT = "thought"
@@ -83,11 +85,15 @@ class TurnTranslator:
     # -- helpers -----------------------------------------------------------
 
     def _message(self) -> dict[str, Any]:
+        blocks = [dict(b) for b in self.blocks]
         return {
             "messageId": self.run_id,
             "id": self.run_id,
             "role": "assistant",
-            "blocks": [dict(b) for b in self.blocks],
+            "blocks": blocks,
+            # The native gateway's flat answer text. LexiChat reads ``blocks``; Volundr's
+            # OpenClaw session controller reads ``content``, so both see the same answer.
+            "content": flatten_text(blocks),
         }
 
     def _event(self, state: str, **extra: Any) -> dict[str, Any]:
@@ -98,6 +104,10 @@ class TurnTranslator:
             "message": self._message(),
         }
         payload.update(extra)
+        error = extra.get("error")
+        if isinstance(error, dict) and error.get("message"):
+            # The native gateway's field name, read by Volundr's OpenClaw session controller.
+            payload["errorMessage"] = str(error["message"])
         return payload
 
     def _ensure_text_block(self) -> int:

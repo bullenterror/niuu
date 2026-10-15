@@ -155,3 +155,54 @@ subjects:
     name: {{ include "volundr.serviceAccountName" . }}
     namespace: {{ .Release.Namespace }}
 {{- end }}
+{{- /*
+Ravn resident sessions: the Flux resident controller writes each Ravn resident's
+own shim token Secret (resident-<id>-openclaw) into the residents' namespace.
+Namespaced on purpose, like workflowExecutionCredentials above: never Secret
+writes cluster-wide.
+*/}}
+{{- $ravnSessions := false -}}
+{{- range .Values.residentRuntimeSessionControllers -}}
+{{- if contains "RavnResidentSessionController" .adapter -}}
+{{- $ravnSessions = true -}}
+{{- end -}}
+{{- end -}}
+{{- $residentNamespace := "" -}}
+{{- if contains "FluxPodManager" .Values.podManager.adapter -}}
+{{- $residentNamespace = (.Values.podManager.kwargs).namespace | default .Release.Namespace -}}
+{{- end -}}
+{{- range .Values.residentRuntimeControllers -}}
+{{- if and (not $residentNamespace) (contains "FluxPodManager" .adapter) -}}
+{{- $residentNamespace = (.kwargs).namespace | default $.Release.Namespace -}}
+{{- end -}}
+{{- end -}}
+{{- if and .Values.rbac.create $ravnSessions $residentNamespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "volundr.fullname" . }}-resident-openclaw
+  namespace: {{ $residentNamespace }}
+  labels:
+    {{- include "volundr.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "volundr.fullname" . }}-resident-openclaw
+  namespace: {{ $residentNamespace }}
+  labels:
+    {{- include "volundr.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "volundr.fullname" . }}-resident-openclaw
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "volundr.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

@@ -174,6 +174,18 @@ class RavnGateway:
         logger.debug("Created gateway session %r.", session_id)
         return session
 
+    def drop_session(self, session_id: str) -> bool:
+        """Forget *session_id*'s agent and its conversation context.
+
+        A turn already running keeps its own reference and finishes; the next
+        message to this id starts a fresh conversation. Returns whether the
+        session existed.
+        """
+        dropped = self._sessions.pop(session_id, None) is not None
+        if dropped:
+            logger.debug("Dropped gateway session %r.", session_id)
+        return dropped
+
     # ------------------------------------------------------------------
     # Message handling
     # ------------------------------------------------------------------

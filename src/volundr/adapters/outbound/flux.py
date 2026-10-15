@@ -7,6 +7,7 @@ adapter pattern in config YAML.
 
 import copy
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -63,6 +64,8 @@ RESIDENT_VOLUME_KINDS = ("home", "workspace")
 RESIDENT_VOLUME_SETTINGS = frozenset({"storageClass", "size", "accessMode"})
 _HTTP_NOT_FOUND = 404
 _HTTP_CONFLICT = 409
+#: Key of a Ravn resident's own OpenClaw shim token Secret (resident.openclaw.tokenSecret).
+RESIDENT_OPENCLAW_TOKEN_KEY = "token"
 
 
 @dataclass(frozen=True)
@@ -147,6 +150,9 @@ class FluxPodManager(
         # Defaults for each resident's own home and workspace PVCs; a profile
         # overrides them per volume in deployment.volumes.<home|workspace>.
         # An empty storage class means the cluster's default class.
+        # Each Ravn resident's own OpenClaw shim token, derived from Volundr's master by
+        # the Ravn session controller (set_resident_openclaw_tokens). None: not configured.
+        self._resident_openclaw_token: Callable[[ResidentRuntime], str] | None = None
         self._resident_volume_defaults = {
             "home": {
                 "size": resident_home_size,
@@ -657,6 +663,97 @@ class FluxPodManager(
                     raise
                 logger.debug("Resident %s PVC %s is already absent", kind, name)
 
+    def set_resident_openclaw_tokens(
+        self,
+        resident_token: Callable[[ResidentRuntime], str],
+    ) -> None:
+        """Provision each Ravn resident's own shim token (RavnResidentSessionController)."""
+        self._resident_openclaw_token = resident_token
+
+    @staticmethod
+    def _resident_openclaw_secret_name(runtime: ResidentRuntime) -> str:
+        return f"resident-{runtime.id}-openclaw"
+
+    @staticmethod
+    def _resident_openclaw_enabled(profile: ResidentDeploymentProfile) -> bool:
+        values = profile.deployment.get("values") or {}
+        resident = values.get("resident") if isinstance(values, dict) else None
+        shim = resident.get("openclaw") if isinstance(resident, dict) else None
+        return isinstance(shim, dict) and bool(shim.get("enabled"))
+
+    async def _ensure_resident_openclaw_secret(
+        self,
+        runtime: ResidentRuntime,
+        profile: ResidentDeploymentProfile,
+    ) -> None:
+        """Write the resident's own shim token; the pod never sees Volundr's master."""
+        if not self._resident_openclaw_enabled(profile):
+            return
+        if self._resident_openclaw_token is None:
+            raise ValueError(
+                f"Resident profile {profile.id} enables resident.openclaw, but no "
+                "RavnResidentSessionController is configured to provide its token; add one "
+                "to resident_runtimes.session_controllers or disable resident.openclaw"
+            )
+        name = self._resident_openclaw_secret_name(runtime)
+        token = {RESIDENT_OPENCLAW_TOKEN_KEY: self._resident_openclaw_token(runtime)}
+        api = await self._get_core_api()
+        try:
+            await api.create_namespaced_secret(
+                namespace=self._namespace,
+                body={
+                    "apiVersion": "v1",
+                    "kind": "Secret",
+                    "type": "Opaque",
+                    "metadata": {
+                        "name": name,
+                        "namespace": self._namespace,
+                        "labels": {
+                            LABEL_MANAGED_BY: self._managed_by,
+                            LABEL_RESIDENT_ID: str(runtime.id),
+                            LABEL_RESIDENT_OWNER_ID: runtime.owner_id,
+                            LABEL_RESIDENT_TENANT_ID: runtime.tenant_id,
+                        },
+                    },
+                    "stringData": token,
+                },
+            )
+            logger.info("Created resident shim token Secret %s/%s", self._namespace, name)
+            return
+        except Exception as exc:
+            if getattr(exc, "status", None) != _HTTP_CONFLICT:
+                raise
+        existing = await api.read_namespaced_secret(name=name, namespace=self._namespace)
+        labels = existing.metadata.labels or {}
+        if not (
+            labels.get(LABEL_MANAGED_BY) == self._managed_by
+            and labels.get(LABEL_RESIDENT_ID) == str(runtime.id)
+        ):
+            raise ValueError(
+                f"Secret {self._namespace}/{name} exists but is not resident "
+                f"{runtime.id}'s own shim token; delete or rename it before deploying"
+            )
+        # Keep it in step with the master Volundr derives from now.
+        await api.patch_namespaced_secret(
+            name=name,
+            namespace=self._namespace,
+            body={"stringData": token},
+        )
+
+    async def _delete_resident_openclaw_secret(self, runtime: ResidentRuntime) -> None:
+        if self._resident_openclaw_token is None:
+            # Without Ravn sessions Volundr writes no such Secret (and holds no Role for it).
+            return
+        name = self._resident_openclaw_secret_name(runtime)
+        api = await self._get_core_api()
+        try:
+            await api.delete_namespaced_secret(name=name, namespace=self._namespace)
+            logger.info("Deleted resident shim token Secret %s", name)
+        except Exception as exc:
+            if getattr(exc, "status", None) != _HTTP_NOT_FOUND:
+                raise
+            logger.debug("Resident shim token Secret %s is already absent", name)
+
     def _resident_values(
         self,
         runtime: ResidentRuntime,
@@ -709,6 +806,13 @@ class FluxPodManager(
             }
         if realm_slug:
             resident_values["realm"] = {"slug": realm_slug}
+        if self._resident_openclaw_enabled(profile):
+            resident_values["openclaw"] = {
+                "tokenSecret": {
+                    "name": self._resident_openclaw_secret_name(runtime),
+                    "key": RESIDENT_OPENCLAW_TOKEN_KEY,
+                }
+            }
 
         flock_labels = resident_flock_labels(runtime, prefix="niuu.world")
         mesh_labels, mesh_annotations = resident_mesh_pod_metadata(runtime)
@@ -758,6 +862,7 @@ class FluxPodManager(
         release_name = self._resident_release_name(runtime)
         realm_slug = await self._resolve_realm_slug(runtime)
         await self._ensure_resident_claims(runtime, self._resident_claims(runtime, profile))
+        await self._ensure_resident_openclaw_secret(runtime, profile)
         await self._apply_helmrelease(
             release_name,
             self._resident_values(runtime, profile, realm_slug),
@@ -850,9 +955,10 @@ class FluxPodManager(
         return await self._observe_after_lifecycle(runtime)
 
     async def delete(self, runtime: ResidentRuntime) -> bool:
-        """Delete the HelmRelease, then the resident's own home and workspace PVCs."""
+        """Delete the HelmRelease, then the resident's own PVCs and shim token Secret."""
         existed = await self._delete_helmrelease(self._resident_release_name(runtime))
         await self._delete_resident_claims(runtime)
+        await self._delete_resident_openclaw_secret(runtime)
         return existed
 
     async def _set_replica_count(self, runtime: ResidentRuntime, replicas: int) -> None:

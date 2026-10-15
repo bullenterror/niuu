@@ -81,6 +81,18 @@ data:
           host: "0.0.0.0"
           port: 7781
           resident_hud_enabled: {{ .Values.resident.hudEnabled | default false }}
+        {{- if .Values.resident.openclaw.enabled }}
+        # Sessions for Volundr's resident sessions API. agent_id "main" is the
+        # session-key grammar the controller addresses (agent:main:niuu-<uuid>).
+        openclaw:
+          enabled: true
+          host: "0.0.0.0"
+          port: {{ .Values.resident.openclaw.port }}
+          token_env: RAVN_OPENCLAW_TOKEN
+          agent_id: main
+          max_live_sessions: {{ .Values.resident.openclaw.maxSessions }}
+          store_path: {{ .Values.resident.openclaw.storePath | quote }}
+        {{- end }}
       {{- if .Values.resident.platform.enabled }}
       platform:
         enabled: true

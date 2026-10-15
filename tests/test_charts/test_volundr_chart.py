@@ -959,6 +959,115 @@ class TestConfigMapTemplate:
             }
         ]
 
+    def test_resident_session_controller_secret_kwargs_reach_the_container(self):
+        result = subprocess.run(
+            [
+                "helm",
+                "template",
+                "test",
+                str(CHART_DIR),
+                "--set",
+                (
+                    "residentRuntimeSessionControllers[0].adapter="
+                    "volundr.adapters.outbound.ravn_gateway.RavnResidentSessionController"
+                ),
+                "--set",
+                "residentRuntimeSessionControllers[0].runtimeBackend=helmrelease",
+                "--set",
+                "residentRuntimeSessionControllers[0].secretKwargs[0].kwarg=gateway_token",
+                "--set",
+                (
+                    "residentRuntimeSessionControllers[0].secretKwargs[0].secretName="
+                    "volundr-ravn-openclaw"
+                ),
+                "--set",
+                "residentRuntimeSessionControllers[0].secretKwargs[0].secretKey=token",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        documents = [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+        configmap = next(
+            doc
+            for doc in documents
+            if doc.get("kind") == "ConfigMap"
+            and doc.get("metadata", {}).get("name") == "test-volundr"
+        )
+        config = yaml.safe_load(configmap["data"]["config.yaml"])
+        env_name = "RESIDENT_SESSION_CONTROLLER_0_SK_GATEWAY_TOKEN"
+        assert config["resident_runtimes"]["session_controllers"][0]["secret_kwargs_env"] == {
+            "gateway_token": env_name
+        }
+        deployment = next(doc for doc in documents if doc.get("kind") == "Deployment")
+        env = {
+            item["name"]: item
+            for container in deployment["spec"]["template"]["spec"]["containers"]
+            for item in container.get("env", [])
+        }
+        assert env[env_name]["valueFrom"]["secretKeyRef"] == {
+            "name": "volundr-ravn-openclaw",
+            "key": "token",
+        }
+
+    @staticmethod
+    def _rbac(*overrides: str) -> list[dict]:
+        result = subprocess.run(
+            ["helm", "template", "test", str(CHART_DIR), *overrides],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+
+    def test_ravn_sessions_grant_secret_writes_only_in_the_residents_namespace(self):
+        documents = self._rbac(
+            "--set",
+            "podManager.adapter=volundr.adapters.outbound.flux.FluxPodManager",
+            "--set",
+            "podManager.kwargs.namespace=skuld",
+            "--set",
+            "rbac.clusterWide=true",
+            "--set",
+            (
+                "residentRuntimeSessionControllers[0].adapter="
+                "volundr.adapters.outbound.ravn_gateway.RavnResidentSessionController"
+            ),
+            "--set",
+            "residentRuntimeSessionControllers[0].runtimeBackend=helmrelease",
+        )
+        role = next(
+            doc
+            for doc in documents
+            if doc["kind"] == "Role" and doc["metadata"]["name"] == "test-volundr-resident-openclaw"
+        )
+        assert role["metadata"]["namespace"] == "skuld"
+        assert role["rules"] == [
+            {
+                "apiGroups": [""],
+                "resources": ["secrets"],
+                "verbs": ["get", "create", "patch", "delete"],
+            }
+        ]
+        binding = next(
+            doc
+            for doc in documents
+            if doc["kind"] == "RoleBinding"
+            and doc["metadata"]["name"] == "test-volundr-resident-openclaw"
+        )
+        assert binding["metadata"]["namespace"] == "skuld"
+        assert binding["roleRef"]["name"] == "test-volundr-resident-openclaw"
+        cluster_role = next(doc for doc in documents if doc["kind"] == "ClusterRole")
+        assert all("secrets" not in rule["resources"] for rule in cluster_role["rules"])
+
+    def test_no_resident_secret_role_without_a_ravn_session_controller(self):
+        documents = self._rbac(
+            "--set",
+            "podManager.adapter=volundr.adapters.outbound.flux.FluxPodManager",
+        )
+        names = {doc["metadata"]["name"] for doc in documents}
+        assert "test-volundr-resident-openclaw" not in names
+
 
 class TestPreviewCacheStorage:
     """Tests for the tool-result image preview cache mount.
