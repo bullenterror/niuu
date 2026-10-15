@@ -465,6 +465,12 @@ envoy:
       methods:
       - POST
       required_scope: ting:workflow:launch
+    # Ting's A2A Agent Card at the origin root (a2a-card-api). Without this
+    # entry the gateway denies it, and no A2A client can discover Ting.
+    - path: /.well-known/agent-card.json
+      methods:
+      - GET
+      - HEAD
     - path: /api/v1/ting
       prefix: true
       methods:
