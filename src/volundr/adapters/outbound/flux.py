@@ -763,7 +763,7 @@ class FluxPodManager(
         configured_values = profile.deployment.get("values") or {}
         if not isinstance(configured_values, dict):
             raise ValueError(f"Resident profile {profile.id} deployment.values must be an object")
-        values = copy.deepcopy(configured_values)
+        values = self._with_cluster_volundr_api_url(configured_values)
         configured_resident = values.get("resident")
         configured_persona = ""
         if isinstance(configured_resident, dict):
@@ -850,8 +850,32 @@ class FluxPodManager(
             runtime_values["session"]["model"] = runtime.model
         _deep_merge(values, runtime_values)
         values = self._with_brokered_credential_values(values)
-        _inject_workload_exchange_env(values)
+        _inject_workload_exchange_env(
+            values,
+            exchange_url=_resident_platform_exchange_url(values),
+        )
         _inject_codex_auth_env(values)
+        return values
+
+    def _with_cluster_volundr_api_url(self, configured_values: dict[str, Any]) -> dict[str, Any]:
+        """Profile values on top of this cluster's own Völundr API URL.
+
+        A resident's cluster-local calls (its Forge event log, activity and
+        usage reports, the Codex credential broker) belong to the Völundr that
+        runs it, exactly as a session pod's do, so it gets the same
+        ``volundr.apiUrl`` session pods get from ``session_defaults``. The
+        platform (``resident.platform``) stays the target for platform APIs and
+        the workload-token exchange. A profile that sets its own
+        ``volundr.apiUrl`` keeps it.
+        """
+        session_volundr = self._session_defaults.get("volundr")
+        cluster_api_url = ""
+        if isinstance(session_volundr, dict):
+            cluster_api_url = str(session_volundr.get("apiUrl") or "")
+        if not cluster_api_url:
+            return copy.deepcopy(configured_values)
+        values: dict[str, Any] = {"volundr": {"apiUrl": cluster_api_url}}
+        _deep_merge(values, copy.deepcopy(configured_values))
         return values
 
     async def deploy(
@@ -1115,15 +1139,40 @@ class FluxPodManager(
         )
 
 
-def _inject_workload_exchange_env(values: dict) -> None:
-    """Propagate workload token exchange URL into all session containers."""
-    volundr_cfg = values.get("volundr")
-    if not isinstance(volundr_cfg, dict):
-        return
-    api_url = str(volundr_cfg.get("apiUrl") or "").rstrip("/")
-    if not api_url:
-        return
-    exchange_url = f"{api_url}/api/v1/tokens/workload/exchange"
+def _resident_platform_exchange_url(values: dict) -> str:
+    """The platform's workload-token exchange for a resident, or "".
+
+    Mirrors charts/skuld's skuld.residentWorkloadExchangeUrl: the explicit
+    resident.platform.workloadExchangeUrl, else the platform base URL's. A
+    resident without a platform has only its cluster's Völundr.
+    """
+    resident = values.get("resident")
+    platform = resident.get("platform") if isinstance(resident, dict) else None
+    if not isinstance(platform, dict) or not platform.get("enabled"):
+        return ""
+    explicit = str(platform.get("workloadExchangeUrl") or "").strip()
+    if explicit:
+        return explicit
+    base_url = str(platform.get("baseUrl") or "").rstrip("/")
+    if not base_url:
+        return ""
+    return f"{base_url}/api/v1/tokens/workload/exchange"
+
+
+def _inject_workload_exchange_env(values: dict, *, exchange_url: str = "") -> None:
+    """Propagate workload token exchange URL into all session containers.
+
+    ``exchange_url`` names the exchange explicitly; without it the exchange is
+    the one on ``volundr.apiUrl``.
+    """
+    if not exchange_url:
+        volundr_cfg = values.get("volundr")
+        if not isinstance(volundr_cfg, dict):
+            return
+        api_url = str(volundr_cfg.get("apiUrl") or "").rstrip("/")
+        if not api_url:
+            return
+        exchange_url = f"{api_url}/api/v1/tokens/workload/exchange"
     env_entry = {
         "name": "NIUU_WORKLOAD_IDENTITY_EXCHANGE_URL",
         "value": exchange_url,

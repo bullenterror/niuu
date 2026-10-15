@@ -100,11 +100,7 @@ data:
         # Workload identity (config-first; replaces the legacy
         # NIUU_WORKLOAD_IDENTITY_* env vars on the ravn container).
         workload_token_file: "/var/run/secrets/niuu-workload/token"
-        {{- if .Values.resident.platform.workloadExchangeUrl }}
-        workload_exchange_url: {{ .Values.resident.platform.workloadExchangeUrl | quote }}
-        {{- else if .Values.volundr.apiUrl }}
-        workload_exchange_url: {{ printf "%s/api/v1/tokens/workload/exchange" (.Values.volundr.apiUrl | trimSuffix "/") | quote }}
-        {{- end }}
+        workload_exchange_url: {{ include "skuld.residentWorkloadExchangeUrl" . | quote }}
         {{- with .Values.resident.platform.workflowAliases }}
         workflow_aliases:
           {{- toYaml . | nindent 10 }}
@@ -117,9 +113,14 @@ data:
     # (skuld-configmap codex_auth), using this container's workload identity
     # (gateway.platform above). Without it the transport falls back to the
     # host login in $HOME/.codex, which a resident's own home never has.
+    # The broker is the cluster's own Volundr, the one the skuld container
+    # calls (volundr_api_url); the token is still exchanged at the platform.
     runtime_executor:
       codex_auth_adapter: {{ $codexAuthAdapter | quote }}
       codex_auth_kwargs: {{ dig "codexAuth" "kwargs" dict .Values.broker | toJson }}
+      {{- if .Values.volundr.apiUrl }}
+      volundr_api_url: {{ .Values.volundr.apiUrl | quote }}
+      {{- end }}
     {{- end }}
     {{- if .Values.resident.triggers.enabled }}
     {{- if not .Values.resident.platform.enabled }}
@@ -139,11 +140,7 @@ data:
       kwargs:
         base_url: {{ .Values.resident.platform.baseUrl | quote }}
         workload_token_file: "/var/run/secrets/niuu-workload/token"
-        {{- if .Values.resident.platform.workloadExchangeUrl }}
-        workload_exchange_url: {{ .Values.resident.platform.workloadExchangeUrl | quote }}
-        {{- else if .Values.volundr.apiUrl }}
-        workload_exchange_url: {{ printf "%s/api/v1/tokens/workload/exchange" (.Values.volundr.apiUrl | trimSuffix "/") | quote }}
-        {{- end }}
+        workload_exchange_url: {{ include "skuld.residentWorkloadExchangeUrl" . | quote }}
     {{- end }}
     initiative:
       enabled: true

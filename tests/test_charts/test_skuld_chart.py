@@ -606,9 +606,12 @@ class TestResidentWorkloadIdentityConfigFirst:
         )
         workload = broker_cfg["workload_identity"]
         assert workload["token_file"] == "/var/run/secrets/niuu-workload/token"
+        # The identity is exchanged at the platform; volundr.apiUrl is the
+        # cluster's own Völundr, which serves the resident's Forge calls.
         assert workload["exchange_url"] == (
-            "https://volundr.example/api/v1/tokens/workload/exchange"
+            "http://niuu-volundr.volundr.svc.cluster.local:80/api/v1/tokens/workload/exchange"
         )
+        assert broker_cfg["volundr_api_url"] == "https://volundr.example"
         assert broker_cfg["session"]["model"] == "gpt-5.6-sol"
         assert broker_cfg["session"]["reasoning_effort"] == "high"
 
@@ -734,7 +737,7 @@ class TestResidentWorkloadIdentityConfigFirst:
         assert platform["enabled"] is True
         assert platform["workload_token_file"] == "/var/run/secrets/niuu-workload/token"
         assert platform["workload_exchange_url"] == (
-            "https://volundr.example/api/v1/tokens/workload/exchange"
+            "http://niuu-volundr.volundr.svc.cluster.local:80/api/v1/tokens/workload/exchange"
         )
         assert platform["workflow_aliases"]["research"]["name"] == "Research Campaign"
         assert platform["workflow_aliases"]["research"]["defaults"]["gate_auto_forward_after"] == ""
@@ -779,6 +782,24 @@ class TestResidentWorkloadIdentityConfigFirst:
             ravn_cfg["gateway"]["platform"]["workload_exchange_url"]
             == "https://yggdrasil.niuu.world/api/v1/tokens/workload/exchange"
         )
+
+    def test_explicit_platform_exchange_reaches_both_containers(self, tmp_path):
+        exchange = "https://platform.example/api/v1/tokens/workload/exchange"
+        values = json.loads(json.dumps(self.RESIDENT_VALUES))
+        values["resident"]["platform"]["workloadExchangeUrl"] = exchange
+        values["resident"]["budget"] = {"enabled": True}
+        configs = [
+            yaml.safe_load(cm["data"]["config.yaml"])
+            for cm in self._configmaps(_render_skuld_chart(tmp_path, values)).values()
+            if "config.yaml" in cm.get("data", {})
+        ]
+        broker_cfg = next(config for config in configs if "transport_adapter" in config)
+        ravn_cfg = next(config for config in configs if "persona" in config)
+
+        assert broker_cfg["workload_identity"]["exchange_url"] == exchange
+        assert ravn_cfg["gateway"]["platform"]["workload_exchange_url"] == exchange
+        assert ravn_cfg["resident_budget"]["kwargs"]["workload_exchange_url"] == exchange
+        assert broker_cfg["volundr_api_url"] == "https://volundr.example"
 
     def test_resident_wakefulness_is_rendered(self, tmp_path):
         values = dict(self.RESIDENT_VALUES)
@@ -846,10 +867,17 @@ class TestResidentRavnCodexAuth:
         broker_cfg = next(config for config in configs if "transport_adapter" in config)
         ravn_cfg = next(config for config in configs if "persona" in config)
 
+        # Same broker contract, on the same (cluster) Völundr as the skuld
+        # container — not on the platform the ravn uses for platform APIs.
         assert ravn_cfg["runtime_executor"] == {
             "codex_auth_adapter": broker_cfg["codex_auth"]["adapter"],
             "codex_auth_kwargs": broker_cfg["codex_auth"]["kwargs"],
+            "volundr_api_url": broker_cfg["volundr_api_url"],
         }
+        assert ravn_cfg["runtime_executor"]["volundr_api_url"] == "https://volundr.example"
+        assert ravn_cfg["gateway"]["platform"]["base_url"] == (
+            "http://niuu-volundr.volundr.svc.cluster.local:80"
+        )
         assert ravn_cfg["runtime_executor"]["codex_auth_kwargs"] == {
             "token_path": _BROKER_TOKEN_PATH
         }
