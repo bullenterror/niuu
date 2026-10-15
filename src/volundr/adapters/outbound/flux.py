@@ -7,6 +7,7 @@ adapter pattern in config YAML.
 
 import copy
 import logging
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -18,12 +19,15 @@ from niuu.adapters.flux import (
     create_flux_api_client,
 )
 from volundr.adapters.outbound.brokered_credentials import BrokeredCredentialPodManager
+from volundr.adapters.outbound.k8s_storage_adapter import build_pvc_manifest
 from volundr.adapters.outbound.resident_container_spec import (
     resident_flock_labels,
     resident_flock_profile_configured,
     resident_mesh_pod_metadata,
 )
 from volundr.domain.models import (
+    LABEL_MANAGED_BY,
+    LABEL_PVC_TYPE,
     ResidentBackend,
     ResidentCondition,
     ResidentConditionStatus,
@@ -46,6 +50,30 @@ from volundr.domain.ports import (
 )
 
 logger = logging.getLogger(__name__)
+
+LABEL_RESIDENT_ID = "niuu.world/resident-id"
+# Deliberately not volundr/owner: the resident pod does not carry that label
+# (Valhalla's session podAffinity co-locates a user's skuld pods by it), so an
+# owner-labelled claim would fail the PVC isolation policy (charts/volundr
+# kyverno-pvc-isolation.yaml).
+LABEL_RESIDENT_OWNER_ID = "niuu.world/owner-id"
+LABEL_RESIDENT_TENANT_ID = "niuu.world/tenant-id"
+# A resident's own volumes, keyed by the profile's deployment.volumes block.
+RESIDENT_VOLUME_KINDS = ("home", "workspace")
+RESIDENT_VOLUME_SETTINGS = frozenset({"storageClass", "size", "accessMode"})
+_HTTP_NOT_FOUND = 404
+_HTTP_CONFLICT = 409
+
+
+@dataclass(frozen=True)
+class ResidentVolumeClaim:
+    """One PVC this controller creates and deletes for a single resident."""
+
+    kind: str
+    name: str
+    size: str
+    storage_class: str
+    access_mode: str
 
 
 class FluxPodManager(
@@ -85,6 +113,10 @@ class FluxPodManager(
         resident_platform_base_url: str = "",
         resident_triggers_enabled: bool = False,
         resident_budget_enabled: bool = False,
+        resident_home_size: str = "1Gi",
+        resident_workspace_size: str = "2Gi",
+        resident_storage_class: str = "",
+        resident_access_mode: str = "ReadWriteOnce",
         **_extra: object,
     ):
         self._namespace = namespace
@@ -112,6 +144,21 @@ class FluxPodManager(
         self._resident_platform_base_url = resident_platform_base_url
         self._resident_triggers_enabled = resident_triggers_enabled
         self._resident_budget_enabled = resident_budget_enabled
+        # Defaults for each resident's own home and workspace PVCs; a profile
+        # overrides them per volume in deployment.volumes.<home|workspace>.
+        # An empty storage class means the cluster's default class.
+        self._resident_volume_defaults = {
+            "home": {
+                "size": resident_home_size,
+                "storageClass": resident_storage_class,
+                "accessMode": resident_access_mode,
+            },
+            "workspace": {
+                "size": resident_workspace_size,
+                "storageClass": resident_storage_class,
+                "accessMode": resident_access_mode,
+            },
+        }
         if not resident_platform_base_url and (
             resident_triggers_enabled or resident_budget_enabled
         ):
@@ -172,6 +219,13 @@ class FluxPodManager(
         from kubernetes_asyncio import client
 
         return client.CustomObjectsApi(self._api_client)
+
+    async def _get_core_api(self):
+        """CoreV1Api on the same client, for a resident's own PVCs."""
+        await self._get_api()
+        from kubernetes_asyncio import client
+
+        return client.CoreV1Api(self._api_client)
 
     def _release_name(self, session: Session) -> str:
         return f"skuld-{session.id}"
@@ -438,6 +492,171 @@ class FluxPodManager(
             )
         ]
 
+    @staticmethod
+    def _resident_claim_name(runtime: ResidentRuntime, kind: str) -> str:
+        return f"resident-{runtime.id}-{kind}"
+
+    def _resident_claims(
+        self,
+        runtime: ResidentRuntime,
+        profile: ResidentDeploymentProfile,
+    ) -> list[ResidentVolumeClaim]:
+        """The PVCs this resident owns: its own home and its own workspace.
+
+        A profile that names its own ``existingClaim`` (or turns the volume
+        off, or uses ``persistence.emptyDir``) keeps that choice, and no PVC
+        is created for that volume.
+        """
+        values = profile.deployment.get("values") or {}
+        if not isinstance(values, dict):
+            raise ValueError(f"Resident profile {profile.id} deployment.values must be an object")
+        volumes = profile.deployment.get("volumes") or {}
+        if not isinstance(volumes, dict):
+            raise ValueError(f"Resident profile {profile.id} deployment.volumes must be an object")
+        unknown = set(volumes) - set(RESIDENT_VOLUME_KINDS)
+        if unknown:
+            raise ValueError(
+                f"Resident profile {profile.id} deployment.volumes has unknown "
+                f"volumes {sorted(unknown)}; expected {list(RESIDENT_VOLUME_KINDS)}"
+            )
+
+        claims: list[ResidentVolumeClaim] = []
+        if self._resident_owns_volume(values.get("homeVolume"), profile, "homeVolume"):
+            claims.append(self._resident_claim(runtime, profile, "home", volumes.get("home")))
+        if self._resident_owns_volume(values.get("persistence"), profile, "persistence"):
+            claims.append(
+                self._resident_claim(runtime, profile, "workspace", volumes.get("workspace"))
+            )
+        return claims
+
+    @staticmethod
+    def _resident_owns_volume(
+        configured: object,
+        profile: ResidentDeploymentProfile,
+        key: str,
+    ) -> bool:
+        if configured is None:
+            return True
+        if not isinstance(configured, dict):
+            raise ValueError(
+                f"Resident profile {profile.id} deployment.values.{key} must be an object"
+            )
+        if configured.get("enabled") is False:
+            return False
+        if configured.get("emptyDir"):
+            return False
+        return not configured.get("existingClaim")
+
+    def _resident_claim(
+        self,
+        runtime: ResidentRuntime,
+        profile: ResidentDeploymentProfile,
+        kind: str,
+        configured: object,
+    ) -> ResidentVolumeClaim:
+        configured = configured or {}
+        if not isinstance(configured, dict):
+            raise ValueError(
+                f"Resident profile {profile.id} deployment.volumes.{kind} must be an object"
+            )
+        unknown = set(configured) - RESIDENT_VOLUME_SETTINGS
+        if unknown:
+            raise ValueError(
+                f"Resident profile {profile.id} deployment.volumes.{kind} has unknown "
+                f"settings {sorted(unknown)}; expected {sorted(RESIDENT_VOLUME_SETTINGS)}"
+            )
+        settings = {**self._resident_volume_defaults[kind], **configured}
+        for setting in ("size", "accessMode"):
+            if not str(settings[setting] or ""):
+                raise ValueError(
+                    f"Resident profile {profile.id} deployment.volumes.{kind}.{setting} "
+                    "must not be empty"
+                )
+        return ResidentVolumeClaim(
+            kind=kind,
+            name=self._resident_claim_name(runtime, kind),
+            size=str(settings["size"]),
+            storage_class=str(settings["storageClass"] or ""),
+            access_mode=str(settings["accessMode"]),
+        )
+
+    @staticmethod
+    def _resident_claim_values(claims: list[ResidentVolumeClaim]) -> dict[str, Any]:
+        values: dict[str, Any] = {}
+        for claim in claims:
+            key = "homeVolume" if claim.kind == "home" else "persistence"
+            values[key] = {"enabled": True, "existingClaim": claim.name}
+        return values
+
+    async def _ensure_resident_claims(
+        self,
+        runtime: ResidentRuntime,
+        claims: list[ResidentVolumeClaim],
+    ) -> None:
+        """Create the resident's PVCs; an existing one must already be its own."""
+        if not claims:
+            return
+        api = await self._get_core_api()
+        for claim in claims:
+            manifest = build_pvc_manifest(
+                name=claim.name,
+                namespace=self._namespace,
+                storage=claim.size,
+                storage_class=claim.storage_class or None,
+                access_mode=claim.access_mode,
+                labels={
+                    LABEL_MANAGED_BY: self._managed_by,
+                    # Not "home"/"workspace": those are the user home and
+                    # session workspaces K8sStorageAdapter lists and manages.
+                    LABEL_PVC_TYPE: f"resident-{claim.kind}",
+                    LABEL_RESIDENT_ID: str(runtime.id),
+                    LABEL_RESIDENT_OWNER_ID: runtime.owner_id,
+                    LABEL_RESIDENT_TENANT_ID: runtime.tenant_id,
+                },
+            )
+            try:
+                await api.create_namespaced_persistent_volume_claim(
+                    namespace=self._namespace,
+                    body=manifest,
+                )
+                logger.info(
+                    "Created resident %s PVC %s in namespace %s",
+                    claim.kind,
+                    claim.name,
+                    self._namespace,
+                )
+                continue
+            except Exception as exc:
+                if getattr(exc, "status", None) != _HTTP_CONFLICT:
+                    raise
+            existing = await api.read_namespaced_persistent_volume_claim(
+                name=claim.name,
+                namespace=self._namespace,
+            )
+            labels = existing.metadata.labels or {}
+            managed = labels.get(LABEL_MANAGED_BY) == self._managed_by
+            owned = labels.get(LABEL_RESIDENT_ID) == str(runtime.id)
+            if not (managed and owned):
+                raise ValueError(
+                    f"PVC {self._namespace}/{claim.name} exists but is not resident "
+                    f"{runtime.id}'s own volume; delete or rename it before deploying"
+                )
+
+    async def _delete_resident_claims(self, runtime: ResidentRuntime) -> None:
+        api = await self._get_core_api()
+        for kind in RESIDENT_VOLUME_KINDS:
+            name = self._resident_claim_name(runtime, kind)
+            try:
+                await api.delete_namespaced_persistent_volume_claim(
+                    name=name,
+                    namespace=self._namespace,
+                )
+                logger.info("Deleted resident %s PVC %s", kind, name)
+            except Exception as exc:
+                if getattr(exc, "status", None) != _HTTP_NOT_FOUND:
+                    raise
+                logger.debug("Resident %s PVC %s is already absent", kind, name)
+
     def _resident_values(
         self,
         runtime: ResidentRuntime,
@@ -503,6 +722,7 @@ class FluxPodManager(
             },
             "resident": resident_values,
             **self._resident_service_account_values(runtime),
+            **self._resident_claim_values(self._resident_claims(runtime, profile)),
             "podLabels": {
                 "niuu.world/managed": "true",
                 "niuu.world/resident-id": str(runtime.id),
@@ -537,6 +757,7 @@ class FluxPodManager(
     ) -> ResidentRuntimeObservation:
         release_name = self._resident_release_name(runtime)
         realm_slug = await self._resolve_realm_slug(runtime)
+        await self._ensure_resident_claims(runtime, self._resident_claims(runtime, profile))
         await self._apply_helmrelease(
             release_name,
             self._resident_values(runtime, profile, realm_slug),
@@ -629,7 +850,10 @@ class FluxPodManager(
         return await self._observe_after_lifecycle(runtime)
 
     async def delete(self, runtime: ResidentRuntime) -> bool:
-        return await self._delete_helmrelease(self._resident_release_name(runtime))
+        """Delete the HelmRelease, then the resident's own home and workspace PVCs."""
+        existed = await self._delete_helmrelease(self._resident_release_name(runtime))
+        await self._delete_resident_claims(runtime)
+        return existed
 
     async def _set_replica_count(self, runtime: ResidentRuntime, replicas: int) -> None:
         await self._patch_helmrelease(

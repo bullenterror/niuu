@@ -1,5 +1,6 @@
 """Tests for Flux HelmRelease pod manager adapter."""
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
@@ -113,6 +114,21 @@ def pod_manager() -> FluxPodManager:
 @pytest.fixture
 def mock_api():
     api = AsyncMock()
+    return api
+
+
+_ORIGINAL_GET_CORE_API = FluxPodManager._get_core_api
+
+
+@pytest.fixture(autouse=True)
+def core_api(monkeypatch) -> AsyncMock:
+    """CoreV1Api for resident PVCs; the manifest is the builder's kwargs."""
+    api = AsyncMock()
+    monkeypatch.setattr(FluxPodManager, "_get_core_api", AsyncMock(return_value=api))
+    monkeypatch.setattr(
+        "volundr.adapters.outbound.flux.build_pvc_manifest",
+        lambda **manifest: manifest,
+    )
     return api
 
 
@@ -1262,6 +1278,349 @@ class TestFluxResidentRuntimeController:
             pod_manager._observed_state(runtime, helmrelease, scaled_down)
             is ResidentObservedState.SUSPENDED
         )
+
+
+class _ApiError(Exception):
+    def __init__(self, status: int) -> None:
+        super().__init__(f"({status})")
+        self.status = status
+
+
+def _own_volume_profile(**deployment) -> ResidentDeploymentProfile:
+    """The test profile with no claim of its own: the resident gets its own PVCs."""
+    profile = _resident_profile()
+    del profile.deployment["values"]["persistence"]["existingClaim"]
+    profile.deployment.update(deployment)
+    return profile
+
+
+def _created_claims(core_api: AsyncMock) -> dict[str, dict]:
+    return {
+        call.kwargs["body"]["name"]: call.kwargs["body"]
+        for call in core_api.create_namespaced_persistent_volume_claim.await_args_list
+    }
+
+
+class TestFluxResidentOwnVolumes:
+    """Each resident gets its own home and workspace PVCs, created and deleted here."""
+
+    async def test_deploy_creates_own_home_and_workspace_before_the_release(
+        self,
+        pod_manager: FluxPodManager,
+        mock_api,
+        core_api: AsyncMock,
+    ) -> None:
+        runtime = _resident_runtime()
+        order: list[str] = []
+        core_api.create_namespaced_persistent_volume_claim.side_effect = lambda **kwargs: (
+            order.append(kwargs["body"]["name"])
+        )
+        mock_api.create_namespaced_custom_object.side_effect = lambda **kwargs: order.append(
+            kwargs["body"]["metadata"]["name"]
+        )
+        with patch.object(pod_manager, "_get_api", return_value=mock_api):
+            await pod_manager.deploy(runtime, _own_volume_profile())
+
+        home = f"resident-{runtime.id}-home"
+        workspace = f"resident-{runtime.id}-workspace"
+        assert order == [home, workspace, f"resident-{runtime.id}"]
+        claims = _created_claims(core_api)
+        for name, kind in ((home, "home"), (workspace, "workspace")):
+            assert claims[name]["namespace"] == "test-ns"
+            assert claims[name]["storage_class"] is None
+            assert claims[name]["access_mode"] == "ReadWriteOnce"
+            assert claims[name]["labels"] == {
+                "app.kubernetes.io/managed-by": "volundr",
+                "volundr/pvc-type": f"resident-{kind}",
+                "niuu.world/resident-id": str(runtime.id),
+                "niuu.world/owner-id": "user-a",
+                "niuu.world/tenant-id": "tenant-a",
+            }
+        assert claims[home]["storage"] == "1Gi"
+        assert claims[workspace]["storage"] == "2Gi"
+
+        values = mock_api.create_namespaced_custom_object.call_args.kwargs["body"]["spec"]["values"]
+        assert values["homeVolume"] == {"enabled": True, "existingClaim": home}
+        assert values["persistence"] == {
+            "enabled": True,
+            "emptyDir": False,
+            "existingClaim": workspace,
+        }
+        # No pinning: nothing ties the resident to a node or to the owner's
+        # session pods (whose podAffinity matches on volundr/owner).
+        assert "volundr/owner" not in values["podLabels"]
+        for affinity_key in ("affinity", "nodeSelector", "nodeName"):
+            assert affinity_key not in values
+
+    async def test_profile_volumes_block_and_controller_defaults_size_the_claims(
+        self,
+        mock_api,
+        core_api: AsyncMock,
+    ) -> None:
+        pod_manager = FluxPodManager(
+            namespace="test-ns",
+            resident_home_size="5Gi",
+            resident_workspace_size="8Gi",
+            resident_storage_class="standard",
+            resident_access_mode="ReadWriteOncePod",
+        )
+        runtime = _resident_runtime()
+        profile = _own_volume_profile(
+            volumes={"home": {"storageClass": "harvester", "size": "64Gi"}},
+        )
+        profile.deployment["values"]["homeVolume"] = {
+            "mountPath": "/volundr/home",
+            "credentialFiles": {"destDir": ".codex"},
+        }
+        with patch.object(pod_manager, "_get_api", return_value=mock_api):
+            await pod_manager.deploy(runtime, profile)
+
+        claims = _created_claims(core_api)
+        home = claims[f"resident-{runtime.id}-home"]
+        workspace = claims[f"resident-{runtime.id}-workspace"]
+        assert (home["storage"], home["storage_class"], home["access_mode"]) == (
+            "64Gi",
+            "harvester",
+            "ReadWriteOncePod",
+        )
+        assert (workspace["storage"], workspace["storage_class"], workspace["access_mode"]) == (
+            "8Gi",
+            "standard",
+            "ReadWriteOncePod",
+        )
+        values = mock_api.create_namespaced_custom_object.call_args.kwargs["body"]["spec"]["values"]
+        assert values["homeVolume"] == {
+            "enabled": True,
+            "existingClaim": f"resident-{runtime.id}-home",
+            "mountPath": "/volundr/home",
+            "credentialFiles": {"destDir": ".codex"},
+        }
+
+    async def test_profile_existing_claims_are_kept_and_nothing_is_created(
+        self,
+        pod_manager: FluxPodManager,
+        mock_api,
+        core_api: AsyncMock,
+    ) -> None:
+        profile = _resident_profile()
+        profile.deployment["values"]["homeVolume"] = {
+            "enabled": True,
+            "existingClaim": "volundr-user-a-home",
+        }
+        with patch.object(pod_manager, "_get_api", return_value=mock_api):
+            await pod_manager.deploy(_resident_runtime(), profile)
+
+        core_api.create_namespaced_persistent_volume_claim.assert_not_awaited()
+        values = mock_api.create_namespaced_custom_object.call_args.kwargs["body"]["spec"]["values"]
+        assert values["homeVolume"]["existingClaim"] == "volundr-user-a-home"
+        assert values["persistence"]["existingClaim"] == "resident-workspaces"
+
+    async def test_disabled_home_and_emptydir_workspace_get_no_claim(
+        self,
+        pod_manager: FluxPodManager,
+        mock_api,
+        core_api: AsyncMock,
+    ) -> None:
+        profile = _own_volume_profile()
+        profile.deployment["values"]["homeVolume"] = {"enabled": False}
+        profile.deployment["values"]["persistence"]["emptyDir"] = True
+        with patch.object(pod_manager, "_get_api", return_value=mock_api):
+            await pod_manager.deploy(_resident_runtime(), profile)
+
+        core_api.create_namespaced_persistent_volume_claim.assert_not_awaited()
+        values = mock_api.create_namespaced_custom_object.call_args.kwargs["body"]["spec"]["values"]
+        assert values["homeVolume"] == {"enabled": False}
+        assert "existingClaim" not in values["persistence"]
+
+    async def test_redeploy_reuses_the_residents_own_claims(
+        self,
+        pod_manager: FluxPodManager,
+        mock_api,
+        core_api: AsyncMock,
+    ) -> None:
+        runtime = _resident_runtime()
+        core_api.create_namespaced_persistent_volume_claim.side_effect = _ApiError(409)
+        core_api.read_namespaced_persistent_volume_claim.return_value = SimpleNamespace(
+            metadata=SimpleNamespace(
+                labels={
+                    "app.kubernetes.io/managed-by": "volundr",
+                    "niuu.world/resident-id": str(runtime.id),
+                }
+            )
+        )
+        with patch.object(pod_manager, "_get_api", return_value=mock_api):
+            await pod_manager.deploy(runtime, _own_volume_profile())
+
+        assert core_api.read_namespaced_persistent_volume_claim.await_count == 2
+        mock_api.create_namespaced_custom_object.assert_awaited_once()
+
+    @pytest.mark.parametrize(
+        ("managed_by", "same_resident"),
+        [(None, False), ("volundr", False), (None, True)],
+        ids=["unmanaged-other-resident", "another-resident", "unmanaged-same-resident"],
+    )
+    async def test_a_foreign_claim_with_the_residents_name_fails_the_deploy(
+        self,
+        pod_manager: FluxPodManager,
+        mock_api,
+        core_api: AsyncMock,
+        managed_by: str | None,
+        same_resident: bool,
+    ) -> None:
+        runtime = _resident_runtime()
+        labels = {"niuu.world/resident-id": str(runtime.id if same_resident else uuid4())}
+        if managed_by:
+            labels["app.kubernetes.io/managed-by"] = managed_by
+        core_api.create_namespaced_persistent_volume_claim.side_effect = _ApiError(409)
+        core_api.read_namespaced_persistent_volume_claim.return_value = SimpleNamespace(
+            metadata=SimpleNamespace(labels=labels)
+        )
+        with (
+            patch.object(pod_manager, "_get_api", return_value=mock_api),
+            pytest.raises(ValueError, match="is not resident"),
+        ):
+            await pod_manager.deploy(runtime, _own_volume_profile())
+
+        mock_api.create_namespaced_custom_object.assert_not_awaited()
+
+    async def test_claim_create_errors_other_than_conflict_fail_the_deploy(
+        self,
+        pod_manager: FluxPodManager,
+        mock_api,
+        core_api: AsyncMock,
+    ) -> None:
+        core_api.create_namespaced_persistent_volume_claim.side_effect = _ApiError(403)
+        with (
+            patch.object(pod_manager, "_get_api", return_value=mock_api),
+            pytest.raises(_ApiError),
+        ):
+            await pod_manager.deploy(_resident_runtime(), _own_volume_profile())
+
+        mock_api.create_namespaced_custom_object.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        ("deployment", "message"),
+        [
+            ({"volumes": ["home"]}, "deployment.volumes must be an object"),
+            ({"volumes": {"tmp": {}}}, "unknown volumes"),
+            ({"volumes": {"home": "64Gi"}}, "deployment.volumes.home must be an object"),
+            ({"volumes": {"workspace": {"sizeGb": 2}}}, "unknown settings"),
+            ({"volumes": {"home": {"size": ""}}}, "volumes.home.size must not be empty"),
+            ({"values": ["persistence"]}, "deployment.values must be an object"),
+            (
+                {"values": {"resident": {}, "homeVolume": "volundr-home"}},
+                "deployment.values.homeVolume must be an object",
+            ),
+        ],
+    )
+    async def test_invalid_volume_configuration_is_rejected(
+        self,
+        pod_manager: FluxPodManager,
+        mock_api,
+        core_api: AsyncMock,
+        deployment: dict,
+        message: str,
+    ) -> None:
+        profile = _own_volume_profile(**deployment)
+        with (
+            patch.object(pod_manager, "_get_api", return_value=mock_api),
+            pytest.raises(ValueError, match=message),
+        ):
+            await pod_manager.deploy(_resident_runtime(), profile)
+
+        core_api.create_namespaced_persistent_volume_claim.assert_not_awaited()
+        mock_api.create_namespaced_custom_object.assert_not_awaited()
+
+    async def test_delete_removes_the_release_then_both_claims(
+        self,
+        pod_manager: FluxPodManager,
+        core_api: AsyncMock,
+    ) -> None:
+        runtime = _resident_runtime()
+        order: list[str] = []
+
+        async def _delete_release(name: str) -> bool:
+            order.append(name)
+            return True
+
+        core_api.delete_namespaced_persistent_volume_claim.side_effect = lambda **kwargs: (
+            order.append(kwargs["name"])
+        )
+        with patch.object(pod_manager, "_delete_helmrelease", _delete_release):
+            existed = await pod_manager.delete(runtime)
+
+        assert existed is True
+
+        assert order == [
+            f"resident-{runtime.id}",
+            f"resident-{runtime.id}-home",
+            f"resident-{runtime.id}-workspace",
+        ]
+        for call in core_api.delete_namespaced_persistent_volume_claim.await_args_list:
+            assert call.kwargs["namespace"] == "test-ns"
+
+    async def test_delete_tolerates_absent_claims_and_release(
+        self,
+        pod_manager: FluxPodManager,
+        core_api: AsyncMock,
+    ) -> None:
+        core_api.delete_namespaced_persistent_volume_claim.side_effect = _ApiError(404)
+        with patch.object(pod_manager, "_delete_helmrelease", AsyncMock(return_value=False)):
+            existed = await pod_manager.delete(_resident_runtime())
+
+        assert existed is False
+
+        assert core_api.delete_namespaced_persistent_volume_claim.await_count == 2
+
+    async def test_delete_raises_when_a_claim_cannot_be_deleted(
+        self,
+        pod_manager: FluxPodManager,
+        core_api: AsyncMock,
+    ) -> None:
+        core_api.delete_namespaced_persistent_volume_claim.side_effect = _ApiError(403)
+        with (
+            patch.object(pod_manager, "_delete_helmrelease", AsyncMock(return_value=True)),
+            pytest.raises(_ApiError),
+        ):
+            await pod_manager.delete(_resident_runtime())
+
+    async def test_restart_suspend_and_resume_keep_the_claims(
+        self,
+        pod_manager: FluxPodManager,
+        core_api: AsyncMock,
+    ) -> None:
+        runtime = _resident_runtime()
+        observation = ResidentRuntimeObservation(observed_state=ResidentObservedState.ACTIVE)
+        with (
+            patch.object(pod_manager, "_patch_helmrelease", AsyncMock()),
+            patch.object(
+                pod_manager,
+                "_observe_after_lifecycle",
+                AsyncMock(return_value=observation),
+            ),
+        ):
+            await pod_manager.restart(runtime, _own_volume_profile())
+            await pod_manager.suspend(runtime)
+            await pod_manager.resume(runtime)
+
+        core_api.delete_namespaced_persistent_volume_claim.assert_not_awaited()
+        core_api.create_namespaced_persistent_volume_claim.assert_not_awaited()
+
+    async def test_core_api_shares_the_flux_api_client(self, pod_manager: FluxPodManager) -> None:
+        shared_client = MagicMock()
+        pod_manager._api_client = shared_client
+        mock_client_mod = MagicMock()
+        with patch.dict(
+            "sys.modules",
+            {
+                "kubernetes_asyncio": MagicMock(client=mock_client_mod),
+                "kubernetes_asyncio.client": mock_client_mod,
+            },
+        ):
+            result = await _ORIGINAL_GET_CORE_API(pod_manager)
+
+        mock_client_mod.CoreV1Api.assert_called_once_with(shared_client)
+        assert result is mock_client_mod.CoreV1Api.return_value
 
 
 def test_inject_workload_exchange_env_updates_builtin_and_extra_containers():
