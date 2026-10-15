@@ -369,6 +369,17 @@ podManager:
     # anything — this flag alone only reaches into the rendered resident
     # config, it is not itself the adapter selection.
     resident_budget_enabled: false
+    # -- Every Flux-deployed resident gets its own home and workspace PVCs
+    # (resident-<id>-home, resident-<id>-workspace in `namespace`), created on
+    # deploy and deleted with the resident. These are the defaults; a profile
+    # overrides them per volume in deployment.volumes.<home|workspace>
+    # ({storageClass, size, accessMode}). A profile that sets its own
+    # homeVolume/persistence existingClaim keeps that claim instead.
+    resident_home_size: "1Gi"
+    resident_workspace_size: "2Gi"
+    # -- Empty means the cluster's default StorageClass
+    resident_storage_class: ""
+    resident_access_mode: "ReadWriteOnce"
   # -- Secret kwargs from K8s Secrets, merged into kwargs at runtime
   # Each entry: { kwarg: "name", secretName: "k8s-secret", secretKey: "key" }
   secretKwargs: []

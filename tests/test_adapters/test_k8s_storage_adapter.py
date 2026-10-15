@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from volundr.adapters.outbound.k8s_storage_adapter import K8sStorageAdapter
+from volundr.adapters.outbound.k8s_storage_adapter import K8sStorageAdapter, build_pvc_manifest
 from volundr.domain.models import StorageQuota
 
 
@@ -374,3 +374,34 @@ async def test_concurrent_session_home_expansion_is_idempotent(adapter, mock_cor
 class TestHomeVolumeCapability:
     def test_pvcs_count_as_home_volumes(self, adapter: K8sStorageAdapter):
         assert adapter.supports_home_volumes is True
+
+
+class TestBuildPvcManifest:
+    def test_builds_a_labelled_claim_in_the_given_namespace(self):
+        pvc = build_pvc_manifest(
+            name="resident-1-home",
+            namespace="skuld",
+            storage="64Gi",
+            storage_class="harvester",
+            access_mode="ReadWriteOnce",
+            labels={"app.kubernetes.io/managed-by": "volundr"},
+        )
+
+        assert pvc.metadata.name == "resident-1-home"
+        assert pvc.metadata.namespace == "skuld"
+        assert pvc.metadata.labels == {"app.kubernetes.io/managed-by": "volundr"}
+        assert pvc.spec.access_modes == ["ReadWriteOnce"]
+        assert pvc.spec.storage_class_name == "harvester"
+        assert pvc.spec.resources.requests == {"storage": "64Gi"}
+
+    def test_no_storage_class_leaves_the_cluster_default(self):
+        pvc = build_pvc_manifest(
+            name="resident-1-workspace",
+            namespace="skuld",
+            storage="2Gi",
+            storage_class=None,
+            access_mode="ReadWriteOnce",
+            labels={},
+        )
+
+        assert pvc.spec.storage_class_name is None
