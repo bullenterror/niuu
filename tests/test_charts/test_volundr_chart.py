@@ -584,6 +584,40 @@ class TestConfigMapTemplate:
 
         assert config["resident_runtimes"]["profiles"] == []
 
+    def test_resident_a2a_settings_render_into_config(self):
+        from volundr.config import ResidentRuntimesConfig
+
+        def render(*extra: str) -> dict:
+            result = subprocess.run(
+                ["helm", "template", "test", str(CHART_DIR), *extra],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            documents = [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+            configmap = next(
+                doc
+                for doc in documents
+                if doc.get("kind") == "ConfigMap"
+                and doc.get("metadata", {}).get("name") == "test-volundr"
+            )
+            return yaml.safe_load(configmap["data"]["config.yaml"])["resident_runtimes"]
+
+        default = ResidentRuntimesConfig.model_validate(render())
+        assert default.a2a_public_base_url == ""
+        assert default.a2a_reply_timeout_seconds == 45
+
+        configured = ResidentRuntimesConfig.model_validate(
+            render(
+                "--set",
+                "residentA2APublicBaseUrl=https://guild.example",
+                "--set",
+                "residentA2AReplyTimeoutSeconds=20",
+            )
+        )
+        assert configured.a2a_public_base_url == "https://guild.example"
+        assert configured.a2a_reply_timeout_seconds == 20
+
     def test_notifications_section_renders_into_config(self):
         from volundr.config import NotificationsConfig
 

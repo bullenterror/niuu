@@ -442,6 +442,23 @@ class ResidentRuntimesConfig(BaseModel):
         gt=0,
         description="Interval between resident backend reconciliation passes.",
     )
+    a2a_public_base_url: str = Field(
+        default="",
+        description=(
+            "Public origin under which residents are reached over A2A "
+            "(/api/v1/forge/resident-runtimes/{id}/a2a), e.g. the Guild that proxies "
+            "this target. When set, each A2A-capable resident lists its Agent Card and "
+            "A2A endpoint so the Agent Directory can discover it; empty publishes none."
+        ),
+    )
+    a2a_reply_timeout_seconds: float = Field(
+        default=45.0,
+        ge=0,
+        description=(
+            "How long an A2A SendMessage waits for a resident's reply before returning "
+            "the task WORKING for the caller to poll. Keep it under the proxy timeouts."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_unique_profile_ids(self) -> "ResidentRuntimesConfig":

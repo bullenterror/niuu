@@ -599,8 +599,15 @@ class ResidentDirectory:
         flock_member_id = str(runtime.get("flock_member_id") or runtime.get("flockMemberId") or "")
         flock_peer_id = str(runtime.get("flock_peer_id") or runtime.get("flockPeerId") or "")
         realm_id = str(runtime.get("realm_id") or runtime.get("realmId") or "")
+        endpoint_urls = {
+            str(endpoint.get("kind") or ""): str(endpoint.get("url") or "")
+            for endpoint in endpoints
+            if isinstance(endpoint, dict)
+        }
         return {
             "id": str(runtime.get("id") or ""),
+            "owner_id": runtime.get("owner_id") or runtime.get("ownerId") or "",
+            "tenant_id": runtime.get("tenant_id") or runtime.get("tenantId") or "",
             "persona_name": runtime.get("persona_name") or runtime.get("personaName") or "",
             "resident_name": runtime.get("name") or "",
             "peer_id": flock_peer_id,
@@ -610,6 +617,10 @@ class ResidentDirectory:
             "created_at": runtime.get("created_at") or runtime.get("createdAt"),
             "updated_at": runtime.get("updated_at") or runtime.get("updatedAt"),
             "chat_endpoint": chat_endpoint,
+            # Published by Volundr for residents reachable over A2A
+            # (volundr.adapters.inbound.rest_resident_a2a).
+            "a2a_card_url": endpoint_urls.get("a2a-card") or None,
+            "a2a_endpoint_url": endpoint_urls.get("a2a") or None,
             "session_id": str(runtime.get("id") or ""),
             "location": "",
             "deployment": runtime.get("backend") or "",
