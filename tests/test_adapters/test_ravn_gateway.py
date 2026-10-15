@@ -16,6 +16,7 @@ import pytest
 from niuu.adapters.memory_credential_store import MemoryCredentialStore
 from tests.test_ravn.test_openclaw_gateway import (
     StubRavnGateway,
+    _Event,
     plain_turn,
     running_shim,
 )
@@ -220,6 +221,66 @@ class TestRavnSessionsThroughTheShim:
             controller = _controller(_port(shim.url))
             with pytest.raises(Exception, match="invalid gateway token"):
                 await controller.list_sessions(_runtime())
+
+
+class TestRavnRepliesStreamOnce:
+    """A reply reaches clients exactly once, whatever Ravn executor produced it."""
+
+    async def test_cli_executor_turn_is_not_doubled(self, tmp_path) -> None:
+        """The live Valhalla turn: a CLI executor streams fragments, then re-sends the
+        whole message as one more thought, then the response. Before the fix clients
+        got the fragments and then the full text again as a last delta."""
+        fragments = ["I", "’m", " doing", " well", " and", " ready", " to", " help", "."]
+        answer = "".join(fragments)
+        script = [_Event("thought", {"text": fragment}) for fragment in fragments]
+        script += [_Event("thought", {"text": answer}), _Event("response", {"text": answer})]
+        runtime = _runtime()
+        async with _resident_shim(tmp_path, runtime, stub=StubRavnGateway(script=script)) as shim:
+            controller = _controller(_port(shim.url))
+            session = await controller.create_session(runtime, title="Hello", model="")
+            connection = await controller.connect_chat(runtime, session.id)
+            try:
+                await connection.receive()
+                await connection.receive()
+                await connection.send({"type": "user", "content": "How are you?"})
+                frames = await _frames_until_turn_ends(connection)
+            finally:
+                await connection.close()
+
+        resident = [f for f in frames if f["type"] in _RESIDENT_FRAMES]
+        assert [f["type"] for f in resident] == [
+            "assistant",
+            *["content_block_delta"] * len(fragments),
+            "result",
+        ]
+        deltas = [f["delta"]["text"] for f in resident if f["type"] == "content_block_delta"]
+        assert deltas == fragments
+        assert "".join(deltas) == answer
+
+    async def test_text_after_a_tool_does_not_repeat_the_text_before_it(self, tmp_path) -> None:
+        script = [
+            _Event("thought", {"text": "Let me look."}),
+            _Event("tool_start", {"tool_name": "read_file", "input": {}}),
+            _Event("tool_result", {"tool_name": "read_file", "result": "# niuu"}),
+            _Event("thought", {"text": "It is "}),
+            _Event("thought", {"text": "niuu."}),
+            _Event("response", {"text": "It is niuu."}),
+        ]
+        runtime = _runtime()
+        async with _resident_shim(tmp_path, runtime, stub=StubRavnGateway(script=script)) as shim:
+            controller = _controller(_port(shim.url))
+            session = await controller.create_session(runtime, title="Tools", model="")
+            connection = await controller.connect_chat(runtime, session.id)
+            try:
+                await connection.receive()
+                await connection.receive()
+                await connection.send({"type": "user", "content": "Which heading?"})
+                frames = await _frames_until_turn_ends(connection)
+            finally:
+                await connection.close()
+
+        text = "".join(f["delta"]["text"] for f in frames if f["type"] == "content_block_delta")
+        assert text == "Let me look.It is niuu."
 
 
 class TestRavnControllerWiring:

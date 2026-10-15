@@ -420,6 +420,10 @@ class OpenClawChatConnection(ResidentChatConnection):
                     previous = self._run_text.get(run_id, "")
                     delta = text[len(previous) :] if text.startswith(previous) else text
                     self._run_text[run_id] = text
+                    if not delta:
+                        # Deltas are cumulative snapshots: one that repeats what was
+                        # already streamed (or carries no text yet) adds nothing.
+                        continue
                     if run_id not in self._active_runs:
                         self._active_runs.add(run_id)
                         self._initial.put_nowait(
@@ -458,7 +462,17 @@ class OpenClawChatConnection(ResidentChatConnection):
                             "participant": self._participant,
                         }
                     self._active_runs.discard(run_id)
-                    self._run_text.pop(run_id, None)
+                    previous = self._run_text.pop(run_id, "")
+                    # The final message is the whole answer. Only text past what was
+                    # streamed is new; the rest was already sent and must not repeat.
+                    text = _message_text(payload.get("message"))
+                    tail = text[len(previous) :] if text.startswith(previous) else ""
+                    if tail:
+                        self._initial.put_nowait({"type": "result", "result": ""})
+                        return {
+                            "type": "content_block_delta",
+                            "delta": {"type": "text_delta", "text": tail},
+                        }
                     return {"type": "result", "result": ""}
                 if state in {"error", "aborted"}:
                     if state == "error" and str(payload.get("errorMessage") or "").strip() == (
