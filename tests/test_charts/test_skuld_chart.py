@@ -626,6 +626,31 @@ class TestResidentWorkloadIdentityConfigFirst:
         assert broker_cfg["volundr_api_url"] == "https://volundr.example"
         assert broker_cfg["usage_report_path"] == ("/api/v1/forge/resident-runtimes/muninn/usage")
 
+    @pytest.mark.parametrize(
+        ("broker", "enabled"),
+        [({}, True), ({"eventLogEnabled": False, "activityReportingEnabled": False}, False)],
+        ids=["forge-session", "no-forge-session"],
+    )
+    def test_forge_session_event_log_and_activity_follow_broker_values(
+        self, tmp_path, broker, enabled
+    ):
+        from skuld.config import SkuldSettings
+
+        values = json.loads(json.dumps(self.RESIDENT_VALUES))
+        values["broker"] = broker
+        broker_cfg = next(
+            yaml.safe_load(cm["data"]["config.yaml"])
+            for cm in self._configmaps(_render_skuld_chart(tmp_path, values)).values()
+            if "config.yaml" in cm.get("data", {})
+            and "transport_adapter" in cm["data"]["config.yaml"]
+        )
+
+        assert broker_cfg["event_log_enabled"] is enabled
+        assert broker_cfg["activity_reporting_enabled"] is enabled
+        settings = SkuldSettings.model_validate(broker_cfg)
+        assert settings.event_log_enabled is enabled
+        assert settings.activity_reporting_enabled is enabled
+
     def test_resident_replica_count_supports_real_suspend_and_resume(self, tmp_path):
         suspended = dict(self.RESIDENT_VALUES)
         suspended["replicaCount"] = 0

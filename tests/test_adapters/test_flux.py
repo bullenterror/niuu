@@ -1730,6 +1730,39 @@ class TestFluxResidentClusterVolundr:
         )
 
 
+class TestFluxResidentHasNoForgeSession:
+    """A resident is a resident runtime, not a Forge session: its skuld must not
+    call the Forge session event log or activity endpoints."""
+
+    async def test_resident_disables_forge_session_log_and_activity(
+        self, pod_manager: FluxPodManager, mock_api
+    ) -> None:
+        profile = _resident_profile()
+        profile.deployment["values"]["broker"] = {
+            "cliType": "codex-ws",
+            "eventLogEnabled": True,
+        }
+        with patch.object(pod_manager, "_get_api", return_value=mock_api):
+            await pod_manager.deploy(_resident_runtime(), profile)
+
+        values = mock_api.create_namespaced_custom_object.call_args.kwargs["body"]["spec"]["values"]
+        assert values["broker"]["eventLogEnabled"] is False
+        assert values["broker"]["activityReportingEnabled"] is False
+        # The profile's own broker settings and the brokered credentials stay.
+        assert values["broker"]["cliType"] == "codex-ws"
+        assert "codexAuth" in values["broker"]
+
+    async def test_forge_sessions_keep_their_event_log_and_activity(
+        self, pod_manager: FluxPodManager, sample_session: Session, mock_api
+    ) -> None:
+        with patch.object(pod_manager, "_get_api", return_value=mock_api):
+            await pod_manager.start(sample_session, make_spec())
+
+        values = mock_api.create_namespaced_custom_object.call_args.kwargs["body"]["spec"]["values"]
+        assert "eventLogEnabled" not in values.get("broker", {})
+        assert "activityReportingEnabled" not in values.get("broker", {})
+
+
 class TestFluxPodManagerRejectsExecutionFlagsWithoutBaseUrl:
     """resident_triggers_enabled/resident_budget_enabled without
     resident_platform_base_url used to be silently ignored — _resident_values

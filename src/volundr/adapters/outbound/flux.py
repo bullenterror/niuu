@@ -825,6 +825,11 @@ class FluxPodManager(
                 "ownerId": runtime.owner_id,
             },
             "resident": resident_values,
+            # A resident is a resident runtime, not a Forge session: no
+            # Forge session event log or activity exists for its id. Its
+            # main-room history is skuld's own conversation file on its
+            # workspace; usage goes to /resident-runtimes/<id>/usage.
+            "broker": {"eventLogEnabled": False, "activityReportingEnabled": False},
             **self._resident_service_account_values(runtime),
             **self._resident_claim_values(self._resident_claims(runtime, profile)),
             "podLabels": {
