@@ -409,6 +409,63 @@ def test_resident_control_dispatches_through_embedded_target() -> None:
     assert created_session.json()["instance_id"] == "local"
 
 
+def test_resident_a2a_card_and_jsonrpc_relay_to_the_owning_target() -> None:
+    embedded = FastAPI()
+    runtime = {"id": "resident-1", "name": "Muninn", "backend": "helmrelease", "engine": "ravn"}
+    seen: dict[str, Any] = {}
+
+    @embedded.get("/api/v1/forge/resident-runtimes/{runtime_id}")
+    async def get_runtime(runtime_id: str) -> dict[str, Any]:
+        return runtime
+
+    @embedded.get("/api/v1/forge/resident-runtimes/{runtime_id}/a2a/.well-known/agent-card.json")
+    async def card(runtime_id: str) -> StarletteResponse:
+        return StarletteResponse(
+            content=b'{"name":"Muninn"}',
+            media_type="application/json",
+            headers={"Cache-Control": "private, max-age=60"},
+        )
+
+    @embedded.post("/api/v1/forge/resident-runtimes/{runtime_id}/a2a")
+    async def jsonrpc(runtime_id: str, request: Request) -> StarletteResponse:
+        seen["body"] = await request.body()
+        seen["version"] = request.headers.get("a2a-version")
+        return StarletteResponse(
+            content=b'{"jsonrpc":"2.0","id":1,"result":{"task":{"id":"t"}}}',
+            media_type="application/json",
+        )
+
+    client = _client(
+        [
+            _instance(
+                "local",
+                base_url="embedded://local-forge",
+                is_default=True,
+                config={"transport": "embedded"},
+            )
+        ],
+        embedded_forge_app=embedded,
+    )
+
+    card_response = client.get(
+        "/api/v1/forge/resident-runtimes/resident-1/a2a/.well-known/agent-card.json",
+        headers=_headers(),
+    )
+    rpc_body = b'{"jsonrpc":"2.0","id":1,"method":"GetTask","params":{"id":"t"}}'
+    rpc_response = client.post(
+        "/api/v1/forge/resident-runtimes/resident-1/a2a",
+        headers={**_headers(), "A2A-Version": "1.0", "Content-Type": "application/json"},
+        content=rpc_body,
+    )
+
+    assert card_response.status_code == 200
+    assert card_response.json() == {"name": "Muninn"}
+    assert card_response.headers["cache-control"] == "private, max-age=60"
+    assert rpc_response.status_code == 200
+    assert rpc_response.json()["result"] == {"task": {"id": "t"}}
+    assert seen == {"body": rpc_body, "version": "1.0"}
+
+
 def test_upstream_error_detail_is_forwarded_without_a_second_wrapper() -> None:
     """A Forge 409 arrives as its own message, not as a JSON body inside detail."""
     from fastapi import HTTPException

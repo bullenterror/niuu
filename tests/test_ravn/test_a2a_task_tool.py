@@ -715,3 +715,45 @@ async def test_start_reuses_durable_request_identity_after_tool_restart(tmp_path
     await runtime.record_a2a_activity({"task_id": "task-1", "state": "TASK_STATE_FAILED"})
     assert not (await tool().execute(request)).is_error
     assert len(client.posts) == 2
+
+
+@pytest.mark.asyncio
+async def test_start_with_context_id_continues_the_peer_conversation() -> None:
+    client = _Client(
+        [
+            {
+                "task": {
+                    "id": "channel-1:4:abc",
+                    "contextId": "channel-1",
+                    "status": {"state": "TASK_STATE_COMPLETED"},
+                    "artifacts": [{"artifactId": "reply", "parts": [{"text": "Agreed."}]}],
+                }
+            },
+            {"task": {"id": "channel-2:0:def", "status": {"state": "TASK_STATE_WORKING"}}},
+        ]
+    )
+    tool = A2ATaskTool(agent_directory=_Directory(_agent()), client=client)
+
+    continued = await tool.execute(
+        {
+            "operation": "start",
+            "agent_id": _agent().id,
+            "skill_id": "review",
+            "prompt": "And the tests?",
+            "context_id": "channel-1",
+        }
+    )
+    await tool.execute(
+        {
+            "operation": "start",
+            "agent_id": _agent().id,
+            "skill_id": "review",
+            "prompt": "New topic.",
+        }
+    )
+
+    payload = json.loads(continued.content)
+    assert payload["context_id"] == "channel-1"
+    assert payload["artifacts"][0]["parts"][0]["text"] == "Agreed."
+    assert client.posts[0][1]["params"]["message"]["contextId"] == "channel-1"
+    assert "contextId" not in client.posts[1][1]["params"]["message"]

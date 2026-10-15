@@ -461,6 +461,14 @@ residentRuntimeSessionControllers: []
 # -- Seconds between resident HelmRelease/Deployment reconciliation passes
 residentRuntimeReconciliationIntervalSeconds: 10.0
 
+# -- Public origin under which residents answer A2A
+# (/api/v1/forge/resident-runtimes/{id}/a2a, Agent Card at .../a2a/.well-known/agent-card.json),
+# usually the Guild that proxies this target. Empty publishes no resident Agent Cards.
+residentA2APublicBaseUrl: ""
+
+# -- Seconds an A2A SendMessage waits for a resident's reply before returning the task WORKING
+residentA2AReplyTimeoutSeconds: 45
+
 # Sleipnir is the transport for cross-runtime flock RPC and platform events.
 sleipnir:
   enabled: false

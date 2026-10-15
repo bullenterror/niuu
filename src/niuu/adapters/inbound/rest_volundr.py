@@ -1253,6 +1253,57 @@ def create_volundr_router(
         )
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
+    @router.get("/resident-runtimes/{runtime_id}/a2a/.well-known/agent-card.json")
+    async def get_resident_agent_card(
+        request: Request,
+        runtime_id: str,
+        principal: Principal = Depends(extract_principal),
+    ) -> Response:
+        """The resident's A2A Agent Card, from the target that runs it."""
+        _, response = await _resident_owner_request(
+            request,
+            principal,
+            runtime_id,
+            method="GET",
+            path_suffix="/a2a/.well-known/agent-card.json",
+        )
+        return Response(
+            content=response.content,
+            media_type="application/json",
+            headers={"Cache-Control": response.headers.get("cache-control", "no-store")},
+        )
+
+    @router.post("/resident-runtimes/{runtime_id}/a2a")
+    async def resident_a2a(
+        request: Request,
+        runtime_id: str,
+        principal: Principal = Depends(extract_principal),
+    ) -> Response:
+        """Relay one A2A JSON-RPC call to the target that runs the resident."""
+        instance, _ = await _find_resident_owner(
+            service,
+            principal,
+            request,
+            runtime_id,
+            embedded_app=embedded_forge_app,
+        )
+        version = request.headers.get("a2a-version", "")
+        response = await _request_remote(
+            instance,
+            request,
+            method="POST",
+            path=f"/resident-runtimes/{runtime_id}/a2a",
+            content_body=await request.body(),
+            extra_headers={
+                "Content-Type": "application/json",
+                **({"A2A-Version": version} if version else {}),
+            },
+            embedded_app=embedded_forge_app,
+            timeout=300.0,
+        )
+        _ensure_remote_success(response)
+        return Response(content=response.content, media_type="application/json")
+
     @router.delete(
         "/resident-runtimes/{runtime_id}",
         status_code=status.HTTP_204_NO_CONTENT,

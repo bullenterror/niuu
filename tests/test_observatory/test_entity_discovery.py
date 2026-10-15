@@ -2435,6 +2435,45 @@ async def test_a_resident_in_a_flock_gets_a_membership_edge() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_resident_publishing_an_agent_card_is_an_owner_visible_a2a_agent() -> None:
+    card = "https://guild.test/api/v1/forge/resident-runtimes/r1/a2a/.well-known/agent-card.json"
+    adapter = RavnResidentsDiscoveryAdapter(
+        base_url="http://ravn.test",
+        cluster="valhalla",
+        transport=_routed(
+            {
+                "/api/v1/ravn/ravens": [
+                    {
+                        "id": "r1",
+                        "resident_name": "Muninn",
+                        "owner_id": "user-a",
+                        "tenant_id": "tenant-a",
+                        "chat_endpoint": "/s/r1/session",
+                        "a2a_card_url": card,
+                        "a2a_endpoint_url": "https://guild.test/api/v1/forge/resident-runtimes/r1/a2a",
+                    },
+                    {"id": "r2", "resident_name": "Hugin", "owner_id": "user-a"},
+                ]
+            }
+        ),
+    )
+
+    agent, plain = (await adapter.discover()).entities
+
+    assert agent.endpoints == {
+        "chat": "/s/r1/session",
+        "a2a": "https://guild.test/api/v1/forge/resident-runtimes/r1/a2a",
+        "a2aCard": card,
+    }
+    assert agent.metadata["agentKind"] == "resident"
+    assert agent.metadata["visibility"] == "user"
+    assert agent.metadata["ownerId"] == "user-a"
+    assert agent.metadata["tenantId"] == "tenant-a"
+    assert "a2aCard" not in plain.endpoints
+    assert "agentKind" not in plain.metadata
+
+
+@pytest.mark.asyncio
 async def test_a_resident_without_a_flock_gets_no_membership_edge() -> None:
     adapter = RavnResidentsDiscoveryAdapter(
         base_url="http://ravn.test",

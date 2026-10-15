@@ -1425,6 +1425,27 @@ class RavnResidentsDiscoveryAdapter(_HttpServiceDiscoveryAdapter):
             name = str(raven.get("resident_name") or raven.get("persona_name") or raven_id)
             node_id = f"ravn:{_slug(self._cluster or 'unknown')}:{_slug(raven_id)}"
             flock_id = str(raven.get("flock_id") or "")
+            endpoints = {
+                key: str(raven[field])
+                for key, field in (
+                    ("chat", "chat_endpoint"),
+                    ("a2a", "a2a_endpoint_url"),
+                    ("a2aCard", "a2a_card_url"),
+                )
+                if raven.get(field)
+            }
+            # A resident publishing an Agent Card is an A2A agent: the directory
+            # lists it to its owner, like a workflow session.
+            a2a_metadata = (
+                {
+                    "agentKind": "resident",
+                    "visibility": str(raven.get("a2a_visibility") or "user"),
+                    "ownerId": str(raven.get("owner_id") or ""),
+                    "tenantId": str(raven.get("tenant_id") or ""),
+                }
+                if "a2aCard" in endpoints
+                else {}
+            )
             entities.append(
                 self._entity(
                     "ravn_long",
@@ -1434,10 +1455,9 @@ class RavnResidentsDiscoveryAdapter(_HttpServiceDiscoveryAdapter):
                     # deployment has no cluster placement to inherit.
                     host=str(raven.get("location") or ""),
                     status=_status_from_valkyrie(str(raven.get("status") or "")),
-                    endpoints=(
-                        {"chat": str(raven["chat_endpoint"])} if raven.get("chat_endpoint") else {}
-                    ),
+                    endpoints=endpoints,
                     metadata={
+                        **a2a_metadata,
                         "persona": str(raven.get("persona_name") or ""),
                         "model": str(raven.get("model") or ""),
                         "deployment": str(raven.get("deployment") or raven.get("backend") or ""),

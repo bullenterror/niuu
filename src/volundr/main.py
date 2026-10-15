@@ -65,6 +65,7 @@ from volundr.adapters.inbound.rest_openshell_credentials import (
     create_openshell_credentials_router,
 )
 from volundr.adapters.inbound.rest_prompts import create_prompts_router
+from volundr.adapters.inbound.rest_resident_a2a import create_resident_a2a_router
 from volundr.adapters.inbound.rest_resident_runtimes import create_resident_runtimes_router
 from volundr.adapters.inbound.rest_resources import create_resources_router
 from volundr.adapters.inbound.rest_secrets import create_canonical_secrets_router
@@ -1455,7 +1456,20 @@ def create_app(
                 session_participant_service=session_participant_service,
             )
             app.include_router(forge_router)
-            app.include_router(create_resident_runtimes_router(resident_runtime_service))
+            app.include_router(
+                create_resident_runtimes_router(
+                    resident_runtime_service,
+                    a2a_public_base_url=settings.resident_runtimes.a2a_public_base_url,
+                )
+            )
+            app.include_router(
+                create_resident_a2a_router(
+                    resident_runtime_service,
+                    persona_provider=session_persona_provider,
+                    public_base_url=settings.resident_runtimes.a2a_public_base_url,
+                    reply_timeout_seconds=settings.resident_runtimes.a2a_reply_timeout_seconds,
+                )
+            )
             app.state.resident_runtime_service = resident_runtime_service
             app.include_router(create_codex_credentials_router(codex_credential_broker))
             credential_grant_brokers = {

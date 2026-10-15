@@ -101,6 +101,13 @@ class A2ATaskTool(ToolPort):
                     "type": "string",
                     "description": "A2A task id; required for get, reply, and cancel.",
                 },
+                "context_id": {
+                    "type": "string",
+                    "description": (
+                        "For start: the context_id of an earlier task with the same peer, "
+                        "to continue that conversation instead of opening a new one."
+                    ),
+                },
                 "answer": {
                     "type": "string",
                     "description": "Answer or requested revision; required for reply.",
@@ -322,6 +329,7 @@ class A2ATaskTool(ToolPort):
                 **(supplied if isinstance(supplied, dict) else {}),
             }
             input = {**input, "metadata": metadata}
+            context_id = str(input.get("context_id") or "").strip()
             request_fingerprint = hashlib.sha256(
                 json.dumps(
                     [
@@ -330,6 +338,8 @@ class A2ATaskTool(ToolPort):
                         input.get("prompt"),
                         metadata,
                         self._default_connection_id,
+                        # Only when given, so fingerprints of earlier starts still match.
+                        *([context_id] if context_id else []),
                     ],
                     sort_keys=True,
                 ).encode()
@@ -472,12 +482,15 @@ class A2ATaskTool(ToolPort):
             trace_context = get_observability().inject()
             if trace_context:
                 metadata["traceContext"] = trace_context
+            context_id = str(input.get("context_id") or "").strip()
+            self._validate_message(context_id, "context_id")
             return await self._rpc(
                 endpoint,
                 "SendMessage",
                 {
                     "message": {
                         "messageId": str(input.get(_PERSISTED_MESSAGE_ID) or uuid4()),
+                        **({"contextId": context_id} if context_id else {}),
                         "role": "ROLE_USER",
                         "parts": [{"text": prompt}],
                         "metadata": metadata,

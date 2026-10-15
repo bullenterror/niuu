@@ -21,6 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
 from volundr.adapters.inbound.auth import extract_principal
+from volundr.adapters.inbound.rest_resident_a2a import with_a2a_endpoints
 from volundr.domain.models import (
     Principal,
     ResidentBackend,
@@ -115,8 +116,16 @@ def _resident_error(exc: Exception) -> HTTPException:
     raise exc
 
 
-def create_resident_runtimes_router(service: ResidentRuntimeService) -> APIRouter:
-    """Create target-local resident runtime routes for Ravn and Guild."""
+def create_resident_runtimes_router(
+    service: ResidentRuntimeService,
+    *,
+    a2a_public_base_url: str = "",
+) -> APIRouter:
+    """Create target-local resident runtime routes for Ravn and Guild.
+
+    With ``a2a_public_base_url`` set, every A2A-capable resident also lists its
+    Agent Card and A2A endpoint (``rest_resident_a2a``) among its endpoints.
+    """
     router = APIRouter(prefix="/api/v1/forge", tags=["Resident Runtimes"])
 
     @router.get("/resident-profiles", response_model=list[ResidentProfileResponse])
@@ -131,7 +140,10 @@ def create_resident_runtimes_router(service: ResidentRuntimeService) -> APIRoute
     async def list_resident_runtimes(
         principal: Principal = Depends(extract_principal),
     ) -> list[ResidentRuntime]:
-        return await service.list(principal)
+        return [
+            with_a2a_endpoints(runtime, a2a_public_base_url)
+            for runtime in await service.list(principal)
+        ]
 
     @router.post(
         "/resident-runtimes",
@@ -168,9 +180,10 @@ def create_resident_runtimes_router(service: ResidentRuntimeService) -> APIRoute
         principal: Principal = Depends(extract_principal),
     ) -> ResidentRuntime:
         try:
-            return await service.get(principal, runtime_id)
+            runtime = await service.get(principal, runtime_id)
         except Exception as exc:
             raise _resident_error(exc) from exc
+        return with_a2a_endpoints(runtime, a2a_public_base_url)
 
     @router.post("/resident-runtimes/{runtime_id}/restart", response_model=ResidentRuntime)
     async def restart_resident_runtime(

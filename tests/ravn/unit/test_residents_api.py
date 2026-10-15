@@ -210,6 +210,36 @@ class TestListRavens:
         assert ravens[0]["realm_id"] == ""
 
     @respx.mock
+    async def test_managed_resident_carries_owner_and_a2a_card(self):
+        card = "https://guild.test/api/v1/forge/resident-runtimes/r/a2a/.well-known/agent-card.json"
+        managed = _managed_runtime(
+            ownerId="user-a",
+            tenantId="tenant-a",
+            endpoints=[
+                {"kind": "chat", "protocol": "skuld-v1", "url": "/s/muninn"},
+                {"kind": "a2a-card", "protocol": "https", "url": card},
+                {"kind": "a2a", "protocol": "jsonrpc", "url": "https://guild.test/a2a"},
+            ],
+        )
+        directory = _directory(managed=[managed])
+
+        raven = (await directory.list_ravens(_PRINCIPAL, {}, {}))[0]
+
+        assert raven["owner_id"] == "user-a"
+        assert raven["tenant_id"] == "tenant-a"
+        assert raven["a2a_card_url"] == card
+        assert raven["a2a_endpoint_url"] == "https://guild.test/a2a"
+
+    @respx.mock
+    async def test_managed_resident_without_a2a_publishes_no_card(self):
+        directory = _directory(managed=[_managed_runtime()])
+
+        raven = (await directory.list_ravens(_PRINCIPAL, {}, {}))[0]
+
+        assert raven["a2a_card_url"] is None
+        assert raven["a2a_endpoint_url"] is None
+
+    @respx.mock
     async def test_discovery_visibility_is_owner_and_tenant_scoped(self):
         directory = _directory(
             discovery=_StaticDiscovery(
