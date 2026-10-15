@@ -15,12 +15,14 @@ import pytest
 
 from niuu.adapters.memory_credential_store import MemoryCredentialStore
 from tests.test_ravn.test_openclaw_gateway import (
-    TOKEN,
     StubRavnGateway,
     plain_turn,
     running_shim,
 )
-from volundr.adapters.outbound.ravn_gateway import RavnResidentSessionController
+from volundr.adapters.outbound.ravn_gateway import (
+    RavnResidentSessionController,
+    resident_openclaw_token,
+)
 from volundr.composition_builders import _create_resident_session_controllers
 from volundr.config import Settings
 from volundr.domain.models import (
@@ -31,13 +33,21 @@ from volundr.domain.models import (
 )
 from volundr.domain.ports import ResidentSessionController
 
+#: Volundr's master secret. A resident's shim only ever holds its derived token.
+MASTER = "master-9f8e7d6c5b4a39281706f5e4d3c2b1a0"
 _RESIDENT_FRAMES = {"assistant", "content_block_delta", "result", "error"}
 
 
 class _FluxRoutes:
-    """The helm-release runtime controller: Ravn needs nothing from it to route."""
+    """The helm-release runtime controller: it provisions each resident's shim token."""
 
     backend = ResidentBackend.HELMRELEASE
+
+    def __init__(self) -> None:
+        self.resident_token: Any = None
+
+    def set_resident_openclaw_tokens(self, resident_token: Any) -> None:
+        self.resident_token = resident_token
 
     async def approve_resident_device(self, *_args: Any, **_kwargs: Any) -> None:
         raise AssertionError("the Ravn shim trusts devices on first use; no pairing")
@@ -62,9 +72,19 @@ def _controller(port: int, **kwargs: Any) -> RavnResidentSessionController:
     return RavnResidentSessionController(
         _FluxRoutes(),
         MemoryCredentialStore(),
-        gateway_token=TOKEN,
+        gateway_token=MASTER,
         service_host="127.0.0.1",
         service_port=port,
+        **kwargs,
+    )
+
+
+def _resident_shim(tmp_path: Any, runtime: ResidentRuntime, **kwargs: Any) -> Any:
+    """The shim as the resident's pod runs it: agent id main, its own derived token."""
+    return running_shim(
+        tmp_path,
+        agent_id="main",
+        token=resident_openclaw_token(MASTER, runtime),
         **kwargs,
     )
 
@@ -84,9 +104,9 @@ async def _frames_until_turn_ends(connection: Any) -> list[dict[str, Any]]:
 
 class TestRavnSessionsThroughTheShim:
     async def test_create_list_chat_and_delete(self, tmp_path) -> None:
-        async with running_shim(tmp_path, agent_id="main") as shim:
+        runtime = _runtime()
+        async with _resident_shim(tmp_path, runtime) as shim:
             controller = _controller(_port(shim.url))
-            runtime = _runtime()
 
             session = await controller.create_session(runtime, title="Research", model="")
             assert session.chat_endpoint == f"/s/{runtime.id}/sessions/{session.id}/session"
@@ -129,9 +149,9 @@ class TestRavnSessionsThroughTheShim:
     async def test_sessions_are_separate_conversations_with_their_own_history(
         self, tmp_path
     ) -> None:
-        async with running_shim(tmp_path, agent_id="main") as shim:
+        runtime = _runtime()
+        async with _resident_shim(tmp_path, runtime) as shim:
             controller = _controller(_port(shim.url))
-            runtime = _runtime()
             first = await controller.create_session(runtime, title="One", model="")
             second = await controller.create_session(runtime, title="Two", model="")
 
@@ -163,9 +183,9 @@ class TestRavnSessionsThroughTheShim:
 
     async def test_interrupt_aborts_the_turn(self, tmp_path) -> None:
         stub = StubRavnGateway(script=plain_turn(), delay=0.3)
-        async with running_shim(tmp_path, stub=stub, agent_id="main") as shim:
+        runtime = _runtime()
+        async with _resident_shim(tmp_path, runtime, stub=stub) as shim:
             controller = _controller(_port(shim.url))
-            runtime = _runtime()
             session = await controller.create_session(runtime, title="Slow", model="")
             connection = await controller.connect_chat(runtime, session.id)
             try:
@@ -182,15 +202,22 @@ class TestRavnSessionsThroughTheShim:
                 await connection.close()
             assert frames[-1] == {"type": "error", "error": "aborted"}
 
-    async def test_a_wrong_gateway_token_is_refused(self, tmp_path) -> None:
-        async with running_shim(tmp_path, agent_id="main") as shim:
+    async def test_a_wrong_master_is_refused(self, tmp_path) -> None:
+        runtime = _runtime()
+        async with _resident_shim(tmp_path, runtime) as shim:
             controller = RavnResidentSessionController(
                 _FluxRoutes(),
                 MemoryCredentialStore(),
-                gateway_token="not-the-token",
+                gateway_token="not-the-master",
                 service_host="127.0.0.1",
                 service_port=_port(shim.url),
             )
+            with pytest.raises(Exception, match="invalid gateway token"):
+                await controller.list_sessions(runtime)
+
+    async def test_one_residents_token_does_not_open_another_residents_shim(self, tmp_path) -> None:
+        async with _resident_shim(tmp_path, _runtime()) as shim:
+            controller = _controller(_port(shim.url))
             with pytest.raises(Exception, match="invalid gateway token"):
                 await controller.list_sessions(_runtime())
 
@@ -199,13 +226,22 @@ class TestRavnControllerWiring:
     def test_engine_is_ravn(self) -> None:
         assert _controller(1).engine is ResidentEngine.RAVN
 
+    def test_hands_the_per_resident_token_to_the_runtime_controller(self) -> None:
+        routes = _FluxRoutes()
+        RavnResidentSessionController(routes, MemoryCredentialStore(), gateway_token=MASTER)
+        runtime = _runtime()
+        token = routes.resident_token(runtime)
+        assert token == resident_openclaw_token(MASTER, runtime)
+        assert len(token) == 64 and int(token, 16) >= 0
+        assert MASTER not in token
+
     def test_gateway_token_is_required(self) -> None:
         with pytest.raises(ValueError, match="gateway_token"):
             RavnResidentSessionController(_FluxRoutes(), MemoryCredentialStore())
 
     def test_route_is_the_resident_service_shim_port(self) -> None:
         controller = RavnResidentSessionController(
-            _FluxRoutes(), MemoryCredentialStore(), gateway_token=TOKEN
+            _FluxRoutes(), MemoryCredentialStore(), gateway_token=MASTER
         )
         runtime = _runtime()
         target = controller._proxy_target(runtime)
@@ -219,20 +255,22 @@ class TestRavnControllerWiring:
 
     async def test_device_identity_is_stable_per_resident_and_never_stored(self) -> None:
         store = MemoryCredentialStore()
-        controller = RavnResidentSessionController(_FluxRoutes(), store, gateway_token=TOKEN)
+        controller = RavnResidentSessionController(_FluxRoutes(), store, gateway_token=MASTER)
         runtime = _runtime()
         first = await controller._machine_credentials(runtime)
         again = await controller._machine_credentials(runtime)
         other = await controller._machine_credentials(_runtime())
         assert first == again
         assert first["device_id"] != other["device_id"]
-        assert first["gateway_token"] == TOKEN
+        assert first["gateway_token"] == resident_openclaw_token(MASTER, runtime)
+        assert first["gateway_token"] != MASTER
+        assert other["gateway_token"] != first["gateway_token"]
         assert first["device_token"] == ""
         await controller._remember_device_token(runtime, {**first, "device_token": "d"})
         assert await store.get_value("resident", str(runtime.id), "openclaw-gateway") is None
 
     def test_composition_builds_it_against_the_helmrelease_backend(self, monkeypatch) -> None:
-        monkeypatch.setenv("RESIDENT_SESSION_CONTROLLER_0_SK_GATEWAY_TOKEN", TOKEN)
+        monkeypatch.setenv("RESIDENT_SESSION_CONTROLLER_0_SK_GATEWAY_TOKEN", MASTER)
         settings = Settings.model_validate(
             {
                 "resident_runtimes": {

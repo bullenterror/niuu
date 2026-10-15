@@ -87,6 +87,7 @@ async def running_shim(
     tick_seconds: float | None = None,
     agent_id: str = "travis",
     max_live_sessions: int = 8,
+    token: str = TOKEN,
 ):
     """Boot the shim on an ephemeral port and yield its URL."""
     from ravn.adapters.channels import gateway_openclaw as mod
@@ -106,7 +107,7 @@ async def running_shim(
 
     import os
 
-    os.environ["RAVN_OPENCLAW_TEST_TOKEN_ENV"] = TOKEN
+    os.environ["RAVN_OPENCLAW_TEST_TOKEN_ENV"] = token
 
     original_tick = mod.TICK_EMIT_SECONDS
     if tick_seconds is not None:

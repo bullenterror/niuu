@@ -1010,6 +1010,64 @@ class TestConfigMapTemplate:
             "key": "token",
         }
 
+    @staticmethod
+    def _rbac(*overrides: str) -> list[dict]:
+        result = subprocess.run(
+            ["helm", "template", "test", str(CHART_DIR), *overrides],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+
+    def test_ravn_sessions_grant_secret_writes_only_in_the_residents_namespace(self):
+        documents = self._rbac(
+            "--set",
+            "podManager.adapter=volundr.adapters.outbound.flux.FluxPodManager",
+            "--set",
+            "podManager.kwargs.namespace=skuld",
+            "--set",
+            "rbac.clusterWide=true",
+            "--set",
+            (
+                "residentRuntimeSessionControllers[0].adapter="
+                "volundr.adapters.outbound.ravn_gateway.RavnResidentSessionController"
+            ),
+            "--set",
+            "residentRuntimeSessionControllers[0].runtimeBackend=helmrelease",
+        )
+        role = next(
+            doc
+            for doc in documents
+            if doc["kind"] == "Role" and doc["metadata"]["name"] == "test-volundr-resident-openclaw"
+        )
+        assert role["metadata"]["namespace"] == "skuld"
+        assert role["rules"] == [
+            {
+                "apiGroups": [""],
+                "resources": ["secrets"],
+                "verbs": ["get", "create", "patch", "delete"],
+            }
+        ]
+        binding = next(
+            doc
+            for doc in documents
+            if doc["kind"] == "RoleBinding"
+            and doc["metadata"]["name"] == "test-volundr-resident-openclaw"
+        )
+        assert binding["metadata"]["namespace"] == "skuld"
+        assert binding["roleRef"]["name"] == "test-volundr-resident-openclaw"
+        cluster_role = next(doc for doc in documents if doc["kind"] == "ClusterRole")
+        assert all("secrets" not in rule["resources"] for rule in cluster_role["rules"])
+
+    def test_no_resident_secret_role_without_a_ravn_session_controller(self):
+        documents = self._rbac(
+            "--set",
+            "podManager.adapter=volundr.adapters.outbound.flux.FluxPodManager",
+        )
+        names = {doc["metadata"]["name"] for doc in documents}
+        assert "test-volundr-resident-openclaw" not in names
+
 
 class TestPreviewCacheStorage:
     """Tests for the tool-result image preview cache mount.

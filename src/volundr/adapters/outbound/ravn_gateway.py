@@ -7,9 +7,13 @@ the OpenClaw controller itself; this adapter supplies only what differs:
 
 * the route: the shim's port on the resident's in-cluster Service, not a backend
   proxy target;
-* the machine identity: the shim trusts a device on first use behind one shared
-  gateway token, so the device key is derived from that token and the resident id
-  instead of being minted and stored per resident;
+* the token: each resident's shim checks its own token, HMAC-SHA256(master, resident
+  id). Volundr holds only the master (``gateway_token``) and hands the derivation to
+  the runtime controller, which writes that one resident's token into a Secret for
+  its pod; a pod never sees the master or another resident's token;
+* the machine identity: the shim trusts a device on first use behind that token, so
+  the device key is derived from the master and the resident id instead of being
+  minted and stored per resident;
 * the participant: the resident itself, not NemoClaw.
 
 The resident's default room (its ``skuld-v1`` chat endpoint, session id = resident
@@ -40,6 +44,15 @@ DEFAULT_SERVICE_PORT = 18790
 _DEVICE_SEED_CONTEXT = b"niuu-ravn-resident-openclaw-device:"
 
 
+def resident_openclaw_token(master: str, runtime: ResidentRuntime) -> str:
+    """The shim token of one resident: HMAC-SHA256(master, resident id), hex."""
+    return hmac.new(
+        master.encode("utf-8"),
+        str(runtime.id).encode("ascii"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
 class RavnResidentSessionController(OpenClawResidentSessionController):
     """Ravn implementation of resident sessions, over the Ravn OpenClaw shim."""
 
@@ -56,8 +69,8 @@ class RavnResidentSessionController(OpenClawResidentSessionController):
     ) -> None:
         if not gateway_token:
             raise ValueError(
-                "RavnResidentSessionController requires gateway_token: the token every "
-                "Ravn resident's OpenClaw shim reads from RAVN_OPENCLAW_TOKEN"
+                "RavnResidentSessionController requires gateway_token: the master secret "
+                "each Ravn resident's own OpenClaw shim token is derived from"
             )
         super().__init__(
             runtime_controller,
@@ -68,6 +81,14 @@ class RavnResidentSessionController(OpenClawResidentSessionController):
         self._gateway_token = gateway_token
         self._service_host = service_host
         self._service_port = int(service_port)
+        # The backend that deploys the resident provisions the same per-resident token.
+        provision = getattr(runtime_controller, "set_resident_openclaw_tokens", None)
+        if callable(provision):
+            provision(self.resident_token)
+
+    def resident_token(self, runtime: ResidentRuntime) -> str:
+        """The token *runtime*'s shim checks (``RAVN_OPENCLAW_TOKEN`` in its pod)."""
+        return resident_openclaw_token(self._gateway_token, runtime)
 
     @property
     def engine(self) -> ResidentEngine:
@@ -96,7 +117,7 @@ class RavnResidentSessionController(OpenClawResidentSessionController):
             hashlib.sha256,
         ).digest()
         credentials = _new_machine_credential(Ed25519PrivateKey.from_private_bytes(seed))
-        return {**credentials, "gateway_token": self._gateway_token, "device_token": ""}
+        return {**credentials, "gateway_token": self.resident_token(runtime), "device_token": ""}
 
     async def _remember_device_token(
         self,
