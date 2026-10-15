@@ -1547,7 +1547,9 @@ class TestFluxResidentOwnVolumes:
             order.append(kwargs["name"])
         )
         with patch.object(pod_manager, "_delete_helmrelease", _delete_release):
-            assert await pod_manager.delete(runtime) is True
+            existed = await pod_manager.delete(runtime)
+
+        assert existed is True
 
         assert order == [
             f"resident-{runtime.id}",
@@ -1564,7 +1566,9 @@ class TestFluxResidentOwnVolumes:
     ) -> None:
         core_api.delete_namespaced_persistent_volume_claim.side_effect = _ApiError(404)
         with patch.object(pod_manager, "_delete_helmrelease", AsyncMock(return_value=False)):
-            assert await pod_manager.delete(_resident_runtime()) is False
+            existed = await pod_manager.delete(_resident_runtime())
+
+        assert existed is False
 
         assert core_api.delete_namespaced_persistent_volume_claim.await_count == 2
 
