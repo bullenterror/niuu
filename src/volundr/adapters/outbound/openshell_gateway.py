@@ -84,6 +84,7 @@ from volundr.domain.models import (
     ResidentCondition,
     ResidentConditionStatus,
     ResidentDeploymentProfile,
+    ResidentDesiredState,
     ResidentEndpoint,
     ResidentEngine,
     ResidentLogEntry,
@@ -1718,6 +1719,21 @@ class OpenShellGatewayPodManager(
             self._resident_sandbox_name(runtime),
         )
         if sandbox is None:
+            if runtime.desired_state is ResidentDesiredState.RUNNING:
+                # The gateway no longer knows this sandbox (for example after a
+                # gateway upgrade orphaned it). Report the resident as owning no
+                # backend so the service redeploys it in the background.
+                return ResidentRuntimeObservation(
+                    observed_state=ResidentObservedState.PENDING,
+                    conditions=[
+                        ResidentCondition(
+                            type="SandboxReady",
+                            status=ResidentConditionStatus.FALSE,
+                            reason="NotFound",
+                            message="OpenShell sandbox does not exist; redeploying",
+                        )
+                    ],
+                )
             return ResidentRuntimeObservation(
                 observed_state=ResidentObservedState.FAILED,
                 backend_ref=dict(runtime.backend_ref),
