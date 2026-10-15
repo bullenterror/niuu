@@ -1041,6 +1041,14 @@ class SkuldSettings(BaseSettings):
     # Volundr session_event_log so any client can replay the full transcript
     # (including the in-flight turn) regardless of whether a socket is attached.
     event_log_enabled: bool = Field(default=True)
+    activity_reporting_enabled: bool = Field(
+        default=True,
+        description=(
+            "Report activity state to the Forge session "
+            "(/api/v1/forge/sessions/<id>/activity). Off for a runtime that has "
+            "no Forge session, such as a resident."
+        ),
+    )
     event_log_batch_size: int = Field(default=100)
     event_log_flush_interval_ms: int = Field(default=500)
     event_log_max_buffer: int = Field(default=50_000)

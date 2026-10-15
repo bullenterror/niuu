@@ -137,7 +137,7 @@ class ActivityReportingMixin:
             pending = {"kind": terminal_kind, "payload": payload}
             self._pending_terminal_activity = pending
 
-        if not self.volundr_api_url:
+        if not self.volundr_api_url or not self._settings.activity_reporting_enabled:
             return False
 
         # Stays set until Forge acknowledges a report for the state the broker is

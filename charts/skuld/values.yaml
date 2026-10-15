@@ -246,6 +246,13 @@ broker:
   conversationSnapshotMaxBytes: 921600
   liveFrameMaxBytes: 921600
   codexReceiveMaxBytes: 16777216
+  # -- Append every frame to the Forge session's durable event log
+  # (/api/v1/forge/sessions/<id>/log). Off for a runtime with no Forge session
+  # (a resident, whose history lives in its own conversation file).
+  eventLogEnabled: true
+  # -- Report activity state to the Forge session
+  # (/api/v1/forge/sessions/<id>/activity). Off for a runtime with no Forge session.
+  activityReportingEnabled: true
   historyHydrationEnabled: true
   historyHydrationTimeoutSeconds: 30
   historyHydrationPageSize: 1000
