@@ -518,6 +518,13 @@ spec:
                   name: {{ .secretName }}
                   key: {{ .secretKey }}
             {{- end }}
+            {{- if .Values.resident.openclaw.enabled }}
+            - name: RAVN_OPENCLAW_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "resident.openclaw.tokenSecret.name is required when resident.openclaw.enabled=true" .Values.resident.openclaw.tokenSecret.name }}
+                  key: {{ .Values.resident.openclaw.tokenSecret.key }}
+            {{- end }}
           ports:
             - name: ravn-pub
               containerPort: 7482
@@ -531,6 +538,11 @@ spec:
             - name: ravn-gw
               containerPort: 7781
               protocol: TCP
+            {{- if .Values.resident.openclaw.enabled }}
+            - name: ravn-openclaw
+              containerPort: {{ .Values.resident.openclaw.port }}
+              protocol: TCP
+            {{- end }}
           volumeMounts:
             {{- include "skuld.scratchMounts" (dict "root" . "container" "ravn") | nindent 12 }}
             {{- if .Values.persistence.enabled }}

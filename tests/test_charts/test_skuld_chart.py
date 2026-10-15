@@ -1524,3 +1524,83 @@ class TestResidentServiceAccount:
         docs = self._render("--set", "resident.serviceAccount.create=true")
         sa = self._service_account(docs)
         assert sa["metadata"]["name"] == "resident-abc123"
+
+
+class TestResidentOpenClawSessions:
+    """resident.openclaw: the Ravn shim behind Volundr's resident sessions API."""
+
+    _VALUES = {
+        "resident": {
+            "enabled": True,
+            "persona": "product-steward",
+            "openclaw": {"enabled": True, "tokenSecret": {"name": "volundr-ravn-openclaw"}},
+        },
+        "networkPolicy": {"enabled": True},
+    }
+
+    def test_absent_by_default(self, tmp_path: Path) -> None:
+        rendered = _render_skuld_chart(
+            tmp_path, {"resident": {"enabled": True, "persona": "product-steward"}}
+        )
+        assert "openclaw" not in _ravn_config_from_rendered(rendered)["gateway"]["channels"]
+        assert "ravn-openclaw" not in rendered
+
+    def test_shim_config_token_port_and_service(self, tmp_path: Path) -> None:
+        rendered = _render_skuld_chart(tmp_path, self._VALUES)
+        shim = _ravn_config_from_rendered(rendered)["gateway"]["channels"]["openclaw"]
+        assert shim == {
+            "enabled": True,
+            "host": "0.0.0.0",
+            "port": 18790,
+            "token_env": "RAVN_OPENCLAW_TOKEN",
+            "agent_id": "main",
+            "max_live_sessions": 64,
+            "store_path": "/workspace/.ravn/openclaw/state.db",
+        }
+
+        deployment = _deployment_from_rendered(rendered)
+        ravn = next(
+            c for c in deployment["spec"]["template"]["spec"]["containers"] if c["name"] == "ravn"
+        )
+        token = next(e for e in ravn["env"] if e["name"] == "RAVN_OPENCLAW_TOKEN")
+        assert token["valueFrom"]["secretKeyRef"] == {
+            "name": "volundr-ravn-openclaw",
+            "key": "token",
+        }
+        assert {"name": "ravn-openclaw", "containerPort": 18790, "protocol": "TCP"} in ravn["ports"]
+
+        documents = [d for d in yaml.safe_load_all(rendered) if isinstance(d, dict)]
+        service = next(d for d in documents if d["kind"] == "Service")
+        assert {
+            "port": 18790,
+            "targetPort": "ravn-openclaw",
+            "protocol": "TCP",
+            "name": "openclaw",
+        } in service["spec"]["ports"]
+        policy = next(d for d in documents if d["kind"] == "NetworkPolicy")
+        assert {"ports": [{"protocol": "TCP", "port": 18790}]} in policy["spec"]["ingress"]
+
+    def test_requires_a_token_secret(self, tmp_path: Path) -> None:
+        helm = shutil.which("helm")
+        if not helm:
+            pytest.skip("helm is not installed")
+        values_file = tmp_path / "values.yaml"
+        values_file.write_text(
+            yaml.safe_dump(
+                {
+                    "resident": {
+                        "enabled": True,
+                        "persona": "product-steward",
+                        "openclaw": {"enabled": True},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [helm, "template", "skuld-test", str(CHART_DIR), "-f", str(values_file)],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode != 0
+        assert "resident.openclaw.tokenSecret.name is required" in result.stderr

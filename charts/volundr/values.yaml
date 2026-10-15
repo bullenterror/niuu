@@ -447,6 +447,14 @@ residentRuntimeSessionControllers: []
 #   optional: false
 #   kwargs: {}
 #   secretKwargs: []
+# Ravn residents on Flux: their sessions through each pod's OpenClaw shim
+# (skuld chart resident.openclaw, enabled with the same token Secret).
+# - adapter: volundr.adapters.outbound.ravn_gateway.RavnResidentSessionController
+#   runtimeBackend: helmrelease
+#   secretKwargs:
+#     - kwarg: gateway_token
+#       secretName: volundr-ravn-openclaw
+#       secretKey: token
 
 # -- Seconds between resident HelmRelease/Deployment reconciliation passes
 residentRuntimeReconciliationIntervalSeconds: 10.0
