@@ -439,3 +439,52 @@ def test_resident_chat_websocket_rejects_missing_identity_or_session(
         service.connect_chat.assert_awaited_once()
     else:
         service.connect_chat.assert_not_awaited()
+
+
+class _GatewayStub:
+    """The Gateway half of a real OpenClawChatConnection: accepts every RPC."""
+
+    def __init__(self) -> None:
+        self.events: asyncio.Queue[dict] = asyncio.Queue()
+        self.requests: list[str] = []
+
+    async def request(self, method: str, params: dict) -> dict:
+        self.requests.append(method)
+        return {"messages": []} if method == "chat.history" else {"ok": True}
+
+    async def close(self) -> None:
+        pass
+
+
+def test_resident_chat_websocket_survives_an_unsupported_command() -> None:
+    """An optional control frame (Lexi's set_internal_visibility) gets an error frame;
+    the chat stays open and the next message still reaches the engine."""
+    from volundr.adapters.outbound.openclaw_gateway import OpenClawChatConnection
+
+    gateway = _GatewayStub()
+    connection = OpenClawChatConnection(
+        gateway,  # type: ignore[arg-type]
+        f"agent:main:niuu-{uuid4()}",
+        {},
+        "openai/gpt-5.6",
+    )
+    service = Mock()
+    service.connect_chat = AsyncMock(return_value=connection)
+
+    with _client(service).websocket_connect(
+        f"/api/v1/forge/resident-runtimes/{uuid4()}/sessions/{uuid4()}/chat",
+        headers={"x-auth-user-id": "user-a", "x-auth-tenant": "tenant-a"},
+    ) as websocket:
+        assert websocket.receive_json()["type"] == "capabilities"
+        assert websocket.receive_json()["type"] == "conversation_history"
+        websocket.send_json({"type": "set_internal_visibility", "visible": False})
+        assert websocket.receive_json() == {
+            "type": "error",
+            "error": "Unsupported shared chat command: set_internal_visibility",
+            "command": "set_internal_visibility",
+        }
+        websocket.send_json({"type": "user", "content": "hello", "request_id": "r-1"})
+        confirmed = websocket.receive_json()
+        assert (confirmed["type"], confirmed["request_id"]) == ("user_confirmed", "r-1")
+
+    assert gateway.requests == ["chat.history", "chat.send"]

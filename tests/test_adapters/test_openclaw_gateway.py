@@ -421,8 +421,12 @@ async def test_openclaw_chat_supports_attachments_and_final_only_responses() -> 
     await chat.receive()
     await chat.receive()
 
-    with pytest.raises(OpenClawGatewayError, match="Unsupported"):
-        await chat.send({"type": "control"})
+    await chat.send({"type": "control"})
+    assert await chat.receive() == {
+        "type": "error",
+        "error": "Unsupported shared chat command: control",
+        "command": "control",
+    }
     await chat.send(
         {
             "type": "user",
@@ -507,3 +511,31 @@ async def test_openclaw_chat_reports_closed_connection_and_retry_timeout() -> No
     await gateway.events.put({"type": "event", "event": "connection.closed", "payload": {}})
     with pytest.raises(OpenClawGatewayError, match="connection closed"):
         await chat.receive()
+
+
+@pytest.mark.asyncio
+async def test_openclaw_chat_answers_unsupported_commands_and_stays_open() -> None:
+    """Lexi sends optional control frames on connect; one must not end the chat."""
+    gateway = _QueueGateway()
+    chat = OpenClawChatConnection(
+        gateway,  # type: ignore[arg-type]
+        f"agent:main:niuu-{uuid4()}",
+        {},
+        "openai/gpt-5.6",
+    )
+    await chat.receive()
+    await chat.receive()
+
+    await chat.send({"type": "set_internal_visibility", "visible": False})
+
+    assert await chat.receive() == {
+        "type": "error",
+        "error": "Unsupported shared chat command: set_internal_visibility",
+        "command": "set_internal_visibility",
+    }
+    assert gateway.requests == []
+    assert not gateway.closed
+    await chat.send({"type": "user", "content": "still here", "request_id": "r-1"})
+    assert [method for method, _ in gateway.requests] == ["chat.history", "chat.send"]
+    confirmed = await chat.receive()
+    assert (confirmed["type"], confirmed["request_id"]) == ("user_confirmed", "r-1")
