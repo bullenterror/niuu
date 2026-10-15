@@ -154,9 +154,25 @@ class TurnTranslator:
             self.thinking_buf += text
             self.blocks[self._ensure_thinking_block()]["text"] = self.thinking_buf
         else:
+            if text == self._last_text():
+                # A CLI executor re-sends the message it just streamed (its
+                # ``assistant`` event) as one more thought. That repeat is not new
+                # text: appending it would double the cumulative snapshot, and a
+                # client diffing snapshots would show the whole answer twice.
+                return []
             self.text_buf += text
-            self.blocks[self._ensure_text_block()]["text"] = self.text_buf
+            block = self.blocks[self._ensure_text_block()]
+            # Per block: text after a tool is a new paragraph, so it must not
+            # carry the text streamed before the tool again.
+            block["text"] = str(block.get("text") or "") + text
         return [self._event("delta")]
+
+    def _last_text(self) -> str:
+        """The text of the most recent answer block, or "" when there is none."""
+        for block in reversed(self.blocks):
+            if block.get("type") == "text":
+                return str(block.get("text") or "")
+        return ""
 
     def _on_tool_start(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
         self._tool_n += 1
@@ -213,7 +229,17 @@ class TurnTranslator:
         text = str(payload.get("text") or "")
         if text:
             self.text_buf = text
-            self.blocks[self._ensure_text_block()]["text"] = text
+            index = self._ensure_text_block()
+            # The response may be the whole turn's answer or only its last message;
+            # either way the snapshot must not repeat the text of earlier blocks.
+            before = "".join(
+                str(block.get("text") or "")
+                for block in self.blocks[:index]
+                if block.get("type") == "text"
+            )
+            if before and text.startswith(before):
+                text = text[len(before) :]
+            self.blocks[index]["text"] = text
         self.finished = True
         return [self._event("final")]
 
