@@ -9,11 +9,12 @@ import json
 import socket
 import sys
 import tarfile
+import threading
 import time
 import types
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
 import jwt
@@ -1460,6 +1461,8 @@ async def test_resident_controller_deploys_real_sandbox_and_processes(
     assert "token_env: NIUU_VOLUNDR_ACCESS_TOKEN" in ravn_config
     assert "Saga Planning" in ravn_config
     assert "skip_permissions: true" in skuld_config
+    assert "event_log_enabled: false" in skuld_config
+    assert "activity_reporting_enabled: false" in skuld_config
     assert [process["pid_path"] for process in client.execs] == [
         "/sandbox/.volundr/skuld.pid",
         "/sandbox/.volundr/ravn.pid",
@@ -1509,6 +1512,163 @@ async def test_resident_deploy_resumes_owned_sandbox_and_launches_missing_proces
     assert observation.observed_state is ResidentObservedState.ACTIVE
     assert client.created is None
     assert [process["pid_path"] for process in client.execs] == ["/sandbox/.volundr/ravn.pid"]
+
+
+def _store_locked_error(adapter):
+    class StoreLocked(adapter.grpc.RpcError):
+        def details(self) -> str:
+            return (
+                "workspace lookup failed: database error: error returned from "
+                "database: (code: 5) database is locked"
+            )
+
+    return StoreLocked()
+
+
+def _raw_sandbox(adapter, name: str):
+    return types.SimpleNamespace(
+        metadata=types.SimpleNamespace(id=f"id-{name}", name=name, labels={}),
+        status=types.SimpleNamespace(
+            phase=adapter.openshell_pb2.SANDBOX_PHASE_READY, conditions=[]
+        ),
+        spec=types.SimpleNamespace(providers=[]),
+    )
+
+
+def test_concurrent_gateway_calls_retry_while_the_gateway_store_is_locked(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    adapter = _import_adapter(monkeypatch)
+    callers = 4
+    start = threading.Barrier(callers)
+    rejected: list[str] = []
+
+    class SingleWriterGateway:
+        """Rejects a call while another holds the store, as SQLite reports SQLITE_BUSY."""
+
+        def __init__(self) -> None:
+            self.store = threading.Lock()
+
+        def GetSandbox(self, request, **_kwargs):  # noqa: N802 - gRPC stub method.
+            if not self.store.acquire(blocking=False):
+                rejected.append(request.name)
+                raise _store_locked_error(adapter)
+            try:
+                time.sleep(0.02)
+                return types.SimpleNamespace(sandbox=_raw_sandbox(adapter, request.name))
+            finally:
+                self.store.release()
+
+    client = adapter.OpenShellGatewayClient(token_provider=Mock(token=Mock(return_value="t")))
+    client._stub = adapter._BusyRetryingStub(SingleWriterGateway(), delays=(0.02,) * 20)
+
+    def deploy_poll(index: int):
+        start.wait()
+        return client.get_sandbox(f"r-{index}")
+
+    with ThreadPoolExecutor(max_workers=callers) as pool:
+        sandboxes = list(pool.map(deploy_poll, range(callers)))
+
+    assert [sandbox.name for sandbox in sandboxes] == [f"r-{i}" for i in range(callers)]
+    assert rejected
+
+
+def test_gateway_retry_stops_at_errors_other_than_a_locked_store(monkeypatch):
+    adapter = _import_adapter(monkeypatch)
+    calls: list[str] = []
+
+    def get_sandbox(request, **_kwargs):
+        calls.append(request.name)
+        raise adapter.grpc.RpcError()
+
+    stub = adapter._BusyRetryingStub(
+        types.SimpleNamespace(GetSandbox=get_sandbox), delays=(0.0, 0.0)
+    )
+
+    with pytest.raises(adapter.grpc.RpcError):
+        stub.GetSandbox(types.SimpleNamespace(name="r-1"))
+
+    assert calls == ["r-1"]
+
+
+def test_gateway_retries_an_exec_stream_whose_first_event_hit_a_locked_store(monkeypatch):
+    adapter = _import_adapter(monkeypatch)
+    attempts: list[int] = []
+
+    def exec_sandbox(_request, **_kwargs):
+        attempts.append(len(attempts))
+        if len(attempts) == 1:
+            raise _store_locked_error(adapter)
+        yield types.SimpleNamespace(HasField=lambda field: field == "exit")
+
+    stub = adapter._BusyRetryingStub(
+        types.SimpleNamespace(ExecSandbox=lambda *a, **k: exec_sandbox(*a, **k)),
+        delays=(0.0, 0.0),
+    )
+
+    events = list(stub.ExecSandbox(types.SimpleNamespace()))
+
+    assert len(attempts) == 2
+    assert len(events) == 1
+
+
+@pytest.mark.asyncio
+async def test_resident_deploy_replaces_a_leftover_sandbox_still_being_deleted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _import_adapter(monkeypatch)
+    runtime = _resident_runtime()
+    client = _FakeOpenShellGatewayClient(adapter)
+    leftover = iter(
+        (
+            adapter.OpenShellSandbox(
+                id="rolled-back",
+                name="leftover",
+                phase=adapter.openshell_pb2.SANDBOX_PHASE_DELETING,
+                labels={"volundr.niuu.io/resident": str(runtime.id)},
+            ),
+            None,
+        )
+    )
+    live_sandbox = client.get_sandbox
+
+    def get_sandbox(name: str):
+        # The rolled-back sandbox is seen deleting, then gone, before a new one exists.
+        return live_sandbox(name) if client.created is not None else next(leftover)
+
+    client.get_sandbox = get_sandbox
+    manager = adapter.OpenShellGatewayPodManager(client=client, ready_timeout=0.1)
+    manager.set_credential_store(
+        _FakeCredentialStore({"codex-credentials": {"auth.json": _codex_auth_document()}})
+    )
+    manager.set_workload_token_issuer(_FakeWorkloadTokenIssuer())
+
+    observation = await manager.deploy(runtime, _resident_profile())
+
+    assert observation.observed_state is ResidentObservedState.ACTIVE
+    assert client.created is not None
+    assert client.created["name"] == f"r-{runtime.id.hex[:17]}"
+
+
+@pytest.mark.asyncio
+async def test_resident_reconcile_adopts_sandbox_left_by_a_failed_rollback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _import_adapter(monkeypatch)
+    runtime = _resident_runtime().model_copy(
+        update={"observed_state": ResidentObservedState.FAILED, "backend_ref": {}}
+    )
+    client = _FakeOpenShellGatewayClient(adapter)
+    client.sandbox_labels = {"volundr.niuu.io/resident": str(runtime.id)}
+    manager = adapter.OpenShellGatewayPodManager(client=client)
+
+    observation = await manager.reconcile(runtime, _resident_profile())
+
+    assert observation.observed_state is ResidentObservedState.PENDING
+    assert observation.backend_ref == {}
+    assert observation.conditions[0].reason == "Unadopted"
+    assert client.created is None
+    assert client.execs == []
 
 
 @pytest.mark.asyncio
