@@ -110,6 +110,17 @@ data:
           {{- toYaml . | nindent 10 }}
         {{- end }}
       {{- end }}
+    {{- $codexAuthAdapter := dig "codexAuth" "adapter" "" .Values.broker }}
+    {{- if and .Values.resident.platform.enabled $codexAuthAdapter (ne $codexAuthAdapter "skuld.codex_auth.HostCodexAuthProvider") }}
+    # The resident's own Codex transport (a persona on CliTransportExecutor)
+    # authenticates through the same broker contract as the skuld container
+    # (skuld-configmap codex_auth), using this container's workload identity
+    # (gateway.platform above). Without it the transport falls back to the
+    # host login in $HOME/.codex, which a resident's own home never has.
+    runtime_executor:
+      codex_auth_adapter: {{ $codexAuthAdapter | quote }}
+      codex_auth_kwargs: {{ dig "codexAuth" "kwargs" dict .Values.broker | toJson }}
+    {{- end }}
     {{- if .Values.resident.triggers.enabled }}
     {{- if not .Values.resident.platform.enabled }}
     {{- fail "resident.triggers.enabled requires resident.platform.enabled — a resident with no platform gateway has nothing to poll its triggers from" }}
