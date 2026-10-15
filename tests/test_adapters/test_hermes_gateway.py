@@ -501,8 +501,12 @@ async def test_interrupt_uses_run_stop_api_and_steer_is_not_advertised() -> None
         await chat.send({"type": "interrupt"})
         result = await chat.receive()
         assert result == {"type": "result", "result": "", "interrupted": True}
-        with pytest.raises(HermesGatewayError, match="does not support steering"):
-            await chat.send({"type": "steer", "content": "Change direction"})
+        await chat.send({"type": "steer", "content": "Change direction"})
+        assert await chat.receive() == {
+            "type": "error",
+            "error": "Hermes API server does not support steering active runs",
+            "command": "steer",
+        }
         await chat.close()
 
 
@@ -522,3 +526,22 @@ async def test_chat_surfaces_event_stream_transport_failure() -> None:
     assert await chat.receive() == {"type": "error", "error": "event stream lost"}
     api.request.assert_not_awaited()
     assert chat._active_run_id is None
+
+
+@pytest.mark.asyncio
+async def test_chat_answers_unsupported_commands_and_stays_open() -> None:
+    """Lexi sends optional control frames on connect; one must not end the chat."""
+    api = AsyncMock()
+    chat = HermesChatConnection(api, "session", [], "model")
+    await chat.receive()  # capabilities
+    await chat.receive()  # history
+
+    await chat.send({"type": "set_internal_visibility", "visible": False})
+
+    assert await chat.receive() == {
+        "type": "error",
+        "error": "Unsupported shared chat command: set_internal_visibility",
+        "command": "set_internal_visibility",
+    }
+    api.request.assert_not_awaited()
+    await chat.close()

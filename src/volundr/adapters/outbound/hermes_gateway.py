@@ -22,7 +22,11 @@ from volundr.domain.models import (
     ResidentSession,
     ResidentSessionStatus,
 )
-from volundr.domain.ports import ResidentChatConnection, ResidentSessionController
+from volundr.domain.ports import (
+    ResidentChatConnection,
+    ResidentSessionController,
+    unsupported_chat_command_frame,
+)
 
 HERMES_CREDENTIAL_NAME = "hermes-api-server"
 HERMES_LEGACY_CREDENTIAL_NAME = "hermes-dashboard"
@@ -407,13 +411,21 @@ class HermesChatConnection(ResidentChatConnection):
                     "POST", f"/v1/runs/{quote(self._active_run_id, safe='')}/stop"
                 )
             return
+        # Unsupported commands are answered, not raised: an optional control frame
+        # (or a steer the capabilities frame already ruled out) must not end the chat.
         if frame_type in {"steer", "steer_active_turn"}:
-            raise HermesGatewayError("Hermes API server does not support steering active runs")
+            self._events.put_nowait(
+                unsupported_chat_command_frame(
+                    frame_type, "Hermes API server does not support steering active runs"
+                )
+            )
+            return
         if frame_type == "permission_response":
             await self._send_permission_response(frame)
             return
         if frame_type != "user":
-            raise HermesGatewayError(f"Unsupported shared chat command: {frame_type}")
+            self._events.put_nowait(unsupported_chat_command_frame(frame_type))
+            return
         if self._active_run_id:
             raise HermesGatewayError("Hermes already has an active run for this chat")
 

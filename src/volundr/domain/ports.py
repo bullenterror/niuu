@@ -924,11 +924,27 @@ class ResidentChatConnection(ABC):
 
     @abstractmethod
     async def send(self, frame: dict[str, Any]) -> None:
-        """Send one shared-chat command."""
+        """Send one shared-chat command.
+
+        A command the engine does not support is answered with
+        :func:`unsupported_chat_command_frame` through :meth:`receive`, never by
+        raising: clients send optional control frames, and one of them must not
+        end the chat.
+        """
 
     @abstractmethod
     async def close(self) -> None:
         """Close the engine connection."""
+
+
+def unsupported_chat_command_frame(command: object, message: str = "") -> dict[str, Any]:
+    """The error frame answering a shared-chat command an engine does not support."""
+    command_type = str(command or "")
+    return {
+        "type": "error",
+        "error": message or f"Unsupported shared chat command: {command_type}",
+        "command": command_type,
+    }
 
 
 class ResidentSessionController(ABC):

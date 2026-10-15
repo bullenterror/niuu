@@ -31,6 +31,7 @@ from volundr.domain.models import (
 from volundr.domain.ports import (
     ResidentChatConnection,
     ResidentSessionController,
+    unsupported_chat_command_frame,
 )
 
 _CREDENTIAL_NAME = "openclaw-gateway"
@@ -491,7 +492,9 @@ class OpenClawChatConnection(ResidentChatConnection):
             await self._gateway.request("chat.abort", {"sessionKey": self._session_key})
             return
         if frame_type != "user":
-            raise OpenClawGatewayError(f"Unsupported shared chat command: {frame_type}")
+            # Answered, not raised: an optional control frame must not end the chat.
+            self._initial.put_nowait(unsupported_chat_command_frame(frame_type))
+            return
         content = frame.get("content")
         attachments: list[dict[str, str]] = []
         if isinstance(content, list):
