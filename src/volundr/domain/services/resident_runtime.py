@@ -353,14 +353,7 @@ class ResidentRuntimeService:
         try:
             profile = self._require_profile(runtime.profile_id)
             controller = self._require_controller(profile)
-            if (
-                runtime.observed_state
-                in {
-                    ResidentObservedState.PENDING,
-                    ResidentObservedState.DEPLOYING,
-                }
-                and not runtime.backend_ref
-            ):
+            if self._awaits_deployment(runtime):
                 self._schedule_deployment(runtime, profile)
                 return runtime
             runtime = runtime.model_copy(update={"capabilities": profile.capabilities})
@@ -370,7 +363,23 @@ class ResidentRuntimeService:
             raise ResidentRuntimeDeploymentError(
                 f"Failed to reconcile resident {runtime.name}: {exc}"
             ) from exc
-        return await self._apply_observation(runtime, observation)
+        reconciled = await self._apply_observation(runtime, observation)
+        # A controller that found the backend gone reports it as owning nothing;
+        # provision it again off the reconcile loop, as for a new resident.
+        if self._awaits_deployment(reconciled):
+            self._schedule_deployment(reconciled, profile)
+        return reconciled
+
+    @staticmethod
+    def _awaits_deployment(runtime: ResidentRuntime) -> bool:
+        return (
+            runtime.observed_state
+            in {
+                ResidentObservedState.PENDING,
+                ResidentObservedState.DEPLOYING,
+            }
+            and not runtime.backend_ref
+        )
 
     async def reconcile_all(self) -> None:
         """Refresh every durable resident without letting one failure stop the pass."""

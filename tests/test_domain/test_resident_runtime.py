@@ -575,6 +575,32 @@ async def test_reconcile_resumes_unfinished_background_deployment(runtime_servic
     assert repository.items[runtime.id].observed_state is ResidentObservedState.ACTIVE
 
 
+async def test_reconcile_redeploys_backend_the_controller_found_missing() -> None:
+    repository = MemoryResidentRuntimeRepository()
+    controller = MemoryResidentRuntimeController()
+    controller.reconcile = AsyncMock(
+        return_value=ResidentRuntimeObservation(observed_state=ResidentObservedState.PENDING)
+    )
+    service = ResidentRuntimeService(repository, _profiles(), [controller])
+    runtime = await service.create_record(_principal(), name="Muninn", profile_id="ravn-openshell")
+    repository.items[runtime.id] = runtime.model_copy(
+        update={
+            "observed_state": ResidentObservedState.FAILED,
+            "backend_ref": {"kind": "Sandbox", "name": str(runtime.id)},
+        }
+    )
+
+    reconciled = await service.reconcile(runtime.id)
+
+    assert reconciled.observed_state is ResidentObservedState.PENDING
+    assert reconciled.backend_ref == {}
+    await asyncio.gather(*tuple(service._deployment_tasks.values()))
+    assert controller.actions == ["deploy"]
+    redeployed = repository.items[runtime.id]
+    assert redeployed.observed_state is ResidentObservedState.ACTIVE
+    assert redeployed.backend_ref == {"kind": "Sandbox", "name": str(runtime.id)}
+
+
 async def test_reconcile_all_records_unavailable_controller_and_continues() -> None:
     repository = MemoryResidentRuntimeRepository()
     service = ResidentRuntimeService(repository, _profiles())

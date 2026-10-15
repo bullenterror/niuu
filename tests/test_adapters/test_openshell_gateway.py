@@ -32,6 +32,7 @@ from volundr.domain.models import (
     ResidentBackend,
     ResidentCapability,
     ResidentDeploymentProfile,
+    ResidentDesiredState,
     ResidentEngine,
     ResidentObservedState,
     ResidentRuntime,
@@ -1554,6 +1555,49 @@ async def test_resident_reconcile_recovers_missing_service_endpoint(
     }
     assert observation.backend_ref["service_url"] == client.service_url
     assert observation.endpoints[0].url == f"/s/{runtime.id}/session"
+
+
+@pytest.mark.asyncio
+async def test_resident_reconcile_requests_redeploy_of_missing_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _import_adapter(monkeypatch)
+    runtime = _resident_runtime().model_copy(
+        update={
+            "observed_state": ResidentObservedState.FAILED,
+            "backend_ref": {"kind": "OpenShellSandbox", "name": "resident-orphaned"},
+        }
+    )
+    client = _FakeOpenShellGatewayClient(adapter)
+    client.sandbox_exists = False
+    manager = adapter.OpenShellGatewayPodManager(client=client)
+
+    observation = await manager.reconcile(runtime, _resident_profile())
+
+    assert observation.observed_state is ResidentObservedState.PENDING
+    assert observation.backend_ref == {}
+    assert observation.conditions[0].reason == "NotFound"
+    assert client.created is None
+
+
+@pytest.mark.asyncio
+async def test_resident_reconcile_reports_missing_sandbox_of_stopped_resident(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _import_adapter(monkeypatch)
+    backend_ref = {"kind": "OpenShellSandbox", "name": "resident-orphaned"}
+    runtime = _resident_runtime().model_copy(
+        update={"desired_state": ResidentDesiredState.SUSPENDED, "backend_ref": backend_ref}
+    )
+    client = _FakeOpenShellGatewayClient(adapter)
+    client.sandbox_exists = False
+    manager = adapter.OpenShellGatewayPodManager(client=client)
+
+    observation = await manager.reconcile(runtime, _resident_profile())
+
+    assert observation.observed_state is ResidentObservedState.FAILED
+    assert observation.backend_ref == backend_ref
+    assert observation.conditions[0].reason == "NotFound"
 
 
 @pytest.mark.asyncio
