@@ -31,6 +31,7 @@ from volundr.domain.services.resident_runtime import (
     ResidentRuntimeConflictError,
     ResidentRuntimeDeploymentError,
     ResidentRuntimeNotFoundError,
+    ResidentRuntimeStateError,
     ResidentRuntimeValidationError,
 )
 
@@ -317,6 +318,28 @@ def test_create_maps_domain_failures(error, expected_status) -> None:
     )
 
     assert response.status_code == expected_status
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_status"),
+    [
+        (ResidentRuntimeStateError("No logs to read: resident 'Muninn' has no pod"), 409),
+        (
+            ResidentRuntimeDeploymentError(
+                "Failed to read resident Muninn logs: Kubernetes forbids ... pods/log"
+            ),
+            502,
+        ),
+    ],
+)
+def test_logs_failures_carry_their_reason(error, expected_status) -> None:
+    service = Mock()
+    service.logs = AsyncMock(side_effect=error)
+
+    response = _client(service).get(f"/api/v1/forge/resident-runtimes/{uuid4()}/logs")
+
+    assert response.status_code == expected_status
+    assert response.json()["detail"] == str(error)
 
 
 @pytest.mark.parametrize(

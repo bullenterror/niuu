@@ -878,8 +878,16 @@ class ResidentRuntimeController(ABC):
         """Delete backend resources, returning whether a resource existed."""
 
 
+class ResidentLogsUnavailableError(RuntimeError):
+    """The resident has nothing to read logs from right now, e.g. no running pod.
+
+    A state of the resident, not a backend fault: the API answers 409 with this
+    message, so the caller learns why instead of seeing a gateway error.
+    """
+
+
 class ResidentRuntimeLogReader(ABC):
-    """Optional backend port for normalized resident logs."""
+    """Backend port for normalized resident logs; every resident backend implements it."""
 
     @abstractmethod
     async def logs(

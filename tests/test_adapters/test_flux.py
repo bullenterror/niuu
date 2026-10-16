@@ -13,6 +13,7 @@ from volundr.adapters.outbound.flux import (
     HELMRELEASE_VERSION,
     FluxPodManager,
     _inject_workload_exchange_env,
+    parse_pod_logs,
 )
 from volundr.domain.models import (
     GitSource,
@@ -28,7 +29,7 @@ from volundr.domain.models import (
     SessionSpec,
     SessionStatus,
 )
-from volundr.domain.ports import ResidentRuntimeObservation
+from volundr.domain.ports import ResidentLogsUnavailableError, ResidentRuntimeObservation
 
 
 def _resident_runtime(**overrides) -> ResidentRuntime:
@@ -2108,3 +2109,212 @@ class TestFluxResidentOpenClawToken:
             await pod_manager.delete(_resident_runtime())
 
         core_api.delete_namespaced_secret.assert_not_awaited()
+
+
+def _container_status(name: str, *, running: bool = True, restarts: int = 0, last_run=False):
+    state = SimpleNamespace(
+        running=SimpleNamespace() if running else None,
+        terminated=None,
+        waiting=None if running else SimpleNamespace(reason="ContainerCreating"),
+    )
+    last_state = SimpleNamespace(terminated=SimpleNamespace() if last_run else None)
+    return SimpleNamespace(name=name, state=state, last_state=last_state, restart_count=restarts)
+
+
+def _pod(name: str, containers: dict[str, dict], init_containers: dict[str, dict] | None = None):
+    init_containers = init_containers or {}
+    return SimpleNamespace(
+        metadata=SimpleNamespace(name=name),
+        spec=SimpleNamespace(
+            containers=[SimpleNamespace(name=container) for container in containers],
+            init_containers=[SimpleNamespace(name=container) for container in init_containers],
+        ),
+        status=SimpleNamespace(
+            container_statuses=[
+                _container_status(container, **state) for container, state in containers.items()
+            ],
+            init_container_statuses=[
+                _container_status(container, **state)
+                for container, state in init_containers.items()
+            ],
+        ),
+    )
+
+
+def _with_logs(core_api: AsyncMock, pods: list, logs: dict[tuple[str, str], str]) -> None:
+    core_api.list_namespaced_pod.return_value = SimpleNamespace(items=pods)
+
+    async def read_log(*, name, namespace, container, tail_lines, timestamps):
+        return logs[(name, container)]
+
+    core_api.read_namespaced_pod_log.side_effect = read_log
+
+
+class TestFluxResidentLogs:
+    """The resident Logs action on Flux: each container's pod log, by container name."""
+
+    async def test_reads_each_container_of_the_resident_pod_as_a_source(
+        self, pod_manager: FluxPodManager, core_api: AsyncMock
+    ) -> None:
+        runtime = _resident_runtime()
+        pod = f"resident-{runtime.id}-skuld-7c9d-abcde"
+        _with_logs(
+            core_api,
+            [_pod(pod, {"skuld": {}, "ravn": {}})],
+            {
+                (pod, "skuld"): (
+                    "2026-10-15T10:00:02.000000000Z 2026-10-15 10:00:02,000 - skuld.broker - "
+                    "WARNING - slow turn\n"
+                    '2026-10-15T10:00:00.123456789Z {"time":"t","level":"INFO",'
+                    '"logger":"skuld","message":"broker ready"}\n'
+                ),
+                (pod, "ravn"): "2026-10-15T10:00:01Z 2026-10-15 ravn.agent ERROR tool failed\n",
+            },
+        )
+
+        page = await pod_manager.logs(runtime, lines=50, sources=(), min_level="")
+
+        assert [(e.source, e.level, e.message) for e in page.entries] == [
+            ("skuld", "info", "broker ready"),
+            ("ravn", "error", "2026-10-15 ravn.agent ERROR tool failed"),
+            ("skuld", "warning", "2026-10-15 10:00:02,000 - skuld.broker - WARNING - slow turn"),
+        ]
+        # The kubelet's nanoseconds, kept to the millisecond.
+        assert page.entries[0].timestamp_ms == 1_792_058_400_123
+        assert page.entries[0].fields == {"pod": pod}
+        assert page.buffer_total == 3
+        core_api.list_namespaced_pod.assert_awaited_once_with(
+            namespace="test-ns",
+            label_selector=f"app.kubernetes.io/instance=resident-{runtime.id}",
+        )
+        core_api.read_namespaced_pod_log.assert_any_await(
+            name=pod,
+            namespace="test-ns",
+            container="ravn",
+            tail_lines=50,
+            timestamps=True,
+        )
+
+    async def test_honours_sources_min_level_and_lines(
+        self, pod_manager: FluxPodManager, core_api: AsyncMock
+    ) -> None:
+        runtime = _resident_runtime()
+        _with_logs(
+            core_api,
+            [_pod("p", {"skuld": {}, "ravn": {}})],
+            {
+                ("p", "ravn"): (
+                    "2026-10-15T10:00:00Z ravn DEBUG noise\n"
+                    "2026-10-15T10:00:01Z ravn WARN first\n"
+                    "2026-10-15T10:00:02Z ravn CRITICAL second\n"
+                    "2026-10-15T10:00:03Z ravn ERROR third\n"
+                ),
+            },
+        )
+
+        page = await pod_manager.logs(runtime, lines=2, sources=("ravn",), min_level="WARNING")
+
+        assert [(e.level, e.message) for e in page.entries] == [
+            ("critical", "ravn CRITICAL second"),
+            ("error", "ravn ERROR third"),
+        ]
+        assert page.buffer_total == 3
+        assert [
+            call.kwargs["container"] for call in core_api.read_namespaced_pod_log.await_args_list
+        ] == ["ravn"]
+
+    async def test_skips_containers_that_have_not_started_and_reads_every_pod(
+        self, pod_manager: FluxPodManager, core_api: AsyncMock
+    ) -> None:
+        runtime = _resident_runtime()
+        _with_logs(
+            core_api,
+            [
+                _pod("old", {"skuld": {"running": False, "restarts": 3, "last_run": True}}),
+                _pod(
+                    "new",
+                    {"skuld": {"running": False}},
+                    init_containers={"setup": {"running": False, "last_run": True}},
+                ),
+            ],
+            {
+                ("old", "skuld"): "2026-10-15T10:00:00Z Traceback: crashed\n",
+                ("new", "setup"): "2026-10-15T10:00:01Z copying workspace\n",
+            },
+        )
+
+        page = await pod_manager.logs(runtime, lines=10, sources=(), min_level="")
+
+        assert [(e.fields["pod"], e.source, e.level) for e in page.entries] == [
+            ("old", "skuld", "info"),
+            ("new", "setup", "info"),
+        ]
+
+    async def test_a_resident_without_a_pod_has_no_logs_to_read(
+        self, pod_manager: FluxPodManager, core_api: AsyncMock
+    ) -> None:
+        core_api.list_namespaced_pod.return_value = SimpleNamespace(items=[])
+
+        with pytest.raises(ResidentLogsUnavailableError, match="suspended or not scheduled"):
+            await pod_manager.logs(_resident_runtime(), lines=10, sources=(), min_level="")
+
+    async def test_a_pod_whose_containers_never_started_has_no_logs_to_read(
+        self, pod_manager: FluxPodManager, core_api: AsyncMock
+    ) -> None:
+        _with_logs(core_api, [_pod("p", {"skuld": {"running": False}})], {})
+
+        with pytest.raises(ResidentLogsUnavailableError, match="still starting"):
+            await pod_manager.logs(_resident_runtime(), lines=10, sources=(), min_level="")
+        core_api.read_namespaced_pod_log.assert_not_awaited()
+
+    @pytest.mark.parametrize("failing_call", ["list_namespaced_pod", "read_namespaced_pod_log"])
+    async def test_forbidden_names_the_missing_rbac(
+        self, pod_manager: FluxPodManager, core_api: AsyncMock, failing_call: str
+    ) -> None:
+        _with_logs(core_api, [_pod("p", {"skuld": {}})], {("p", "skuld"): ""})
+        getattr(core_api, failing_call).side_effect = _ApiError(403)
+
+        with pytest.raises(PermissionError, match="pods/log there") as raised:
+            await pod_manager.logs(_resident_runtime(), lines=10, sources=(), min_level="")
+        assert "namespace test-ns" in str(raised.value)
+        assert "resident-logs Role" in str(raised.value)
+
+    async def test_other_api_errors_propagate(
+        self, pod_manager: FluxPodManager, core_api: AsyncMock
+    ) -> None:
+        core_api.list_namespaced_pod.side_effect = _ApiError(500)
+
+        with pytest.raises(_ApiError):
+            await pod_manager.logs(_resident_runtime(), lines=10, sources=(), min_level="")
+
+
+class TestParsePodLogs:
+    def test_json_lines_without_a_known_level_infer_one(self) -> None:
+        entries = parse_pod_logs(
+            '2026-10-15T10:00:00Z {"event": "tool exception raised"}\n'
+            "2026-10-15T10:00:01Z plain debug output\n"
+            "not-a-timestamp skipped\n"
+            "2026-10-15T10:00:02Z \n",
+            pod="p",
+            container="ravn",
+            min_level="",
+        )
+
+        assert [(e.level, e.message) for e in entries] == [
+            ("error", "tool exception raised"),
+            ("debug", "plain debug output"),
+        ]
+
+    def test_fatal_and_warn_map_to_the_shared_levels(self) -> None:
+        entries = parse_pod_logs(
+            '2026-10-15T10:00:00Z {"level": "warn", "msg": "low disk"}\n'
+            "2026-10-15T10:00:01Z FATAL out of memory\n",
+            pod="p",
+            container="ravn",
+            min_level="warn",
+        )
+
+        assert [(e.level, e.message) for e in entries] == [
+            ("warning", "low disk"),
+            ("critical", "FATAL out of memory"),
+        ]

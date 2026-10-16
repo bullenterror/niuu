@@ -207,3 +207,42 @@ subjects:
     name: {{ include "volundr.serviceAccountName" . }}
     namespace: {{ .Release.Namespace }}
 {{- end }}
+{{- /*
+Flux residents' logs: the resident Logs action reads each resident pod's
+container logs in the residents' namespace (FluxPodManager.logs). Always on
+wherever a Flux resident controller runs, so no cluster needs its own grant;
+namespaced, so Völundr reads pod logs only where its residents run.
+*/}}
+{{- if and .Values.rbac.create $residentNamespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "volundr.fullname" . }}-resident-logs
+  namespace: {{ $residentNamespace }}
+  labels:
+    {{- include "volundr.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "volundr.fullname" . }}-resident-logs
+  namespace: {{ $residentNamespace }}
+  labels:
+    {{- include "volundr.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "volundr.fullname" . }}-resident-logs
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "volundr.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

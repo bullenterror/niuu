@@ -1096,6 +1096,31 @@ def test_get_raven_logs_searches_visible_targets_without_instance_hint() -> None
     assert beta.called
 
 
+@respx.mock
+@pytest.mark.parametrize(
+    ("upstream_status", "detail"),
+    [
+        (409, "No logs to read: resident 'Muninn' has no pod in namespace skuld"),
+        (502, "Failed to read resident Muninn logs: Kubernetes forbids pods/log"),
+    ],
+)
+def test_get_raven_logs_forwards_the_owning_targets_status_and_reason(
+    upstream_status: int, detail: str
+) -> None:
+    client = _client([_instance("beta", base_url="http://beta")])
+    respx.get("http://beta/api/v1/ravn/ravens/resident-id/logs").mock(
+        return_value=Response(upstream_status, json={"detail": detail})
+    )
+
+    response = client.get(
+        "/api/v1/ravn/ravens/resident-id/logs?instance_id=beta",
+        headers=_headers(),
+    )
+
+    assert response.status_code == upstream_status
+    assert response.json()["detail"] == detail
+
+
 class TestWsConnectKwargs:
     """Direct tests of the resident/session WS bridge's TLS-pinning gate."""
 
