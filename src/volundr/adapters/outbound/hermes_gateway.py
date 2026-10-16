@@ -17,6 +17,7 @@ from niuu.domain.models import SecretType
 from niuu.ports.credentials import CredentialStorePort
 from niuu.ports.session_proxy import SessionProxyTarget
 from volundr.domain.models import (
+    ResidentBackend,
     ResidentEngine,
     ResidentRuntime,
     ResidentSession,
@@ -547,6 +548,10 @@ class HermesResidentSessionController(ResidentSessionController):
     @property
     def engine(self) -> ResidentEngine:
         return ResidentEngine.HERMES
+
+    @property
+    def runtime_backend(self) -> ResidentBackend | None:
+        return getattr(self._routes, "backend", None)
 
     async def _connect(self, runtime: ResidentRuntime) -> _HermesAPI:
         target = self._routes.resident_proxy_target(runtime)

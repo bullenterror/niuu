@@ -7,7 +7,7 @@ Adapters implement these interfaces.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -901,6 +901,32 @@ class ResidentRuntimeProxyTargetResolver(ABC):
         """Resolve the backend service reached by the shared session proxy."""
 
 
+class ResidentOpenClawShimHost(ABC):
+    """Optional backend port: the backend runs a Ravn resident's OpenClaw shim.
+
+    A Ravn resident's sessions ("channels") are served by Ravn's OpenClaw-protocol
+    shim inside the resident's own workload. A backend that implements this port
+    starts the shim with the resident's own token and routes Völundr to its port,
+    so Völundr wires Ravn sessions on it by default
+    (``RavnResidentSessionController``).
+    """
+
+    @abstractmethod
+    def set_resident_openclaw_tokens(
+        self,
+        resident_token: Callable[[ResidentRuntime], str],
+    ) -> None:
+        """Provision each Ravn resident's own shim token, derived by Völundr."""
+
+    @abstractmethod
+    def resident_openclaw_target(
+        self,
+        runtime: ResidentRuntime,
+        port: int,
+    ) -> SessionProxyTarget | None:
+        """Route to the resident's shim on ``port``; None before the backend reports it."""
+
+
 class ResidentDeviceApprover(ABC):
     """Optional runtime capability for approving resident engine devices."""
 
@@ -954,6 +980,24 @@ class ResidentSessionController(ABC):
     @abstractmethod
     def engine(self) -> ResidentEngine:
         """Return the resident engine implemented by this controller."""
+
+    @property
+    def runtime_backend(self) -> ResidentBackend | None:
+        """The backend whose residents this controller drives; None drives any backend.
+
+        A controller bound to one runtime controller names its backend, so one
+        engine can have a controller per backend (Ravn on Flux and on OpenShell).
+        """
+        return None
+
+    def provides_sessions(self, profile: ResidentDeploymentProfile) -> bool:
+        """Whether residents of ``profile`` get sessions from this controller.
+
+        The resident session capabilities (session.list/create/delete) follow from
+        this; a controller whose engine can switch its session API off per profile
+        says so here.
+        """
+        return True
 
     @abstractmethod
     async def list_sessions(self, runtime: ResidentRuntime) -> list[ResidentSession]:

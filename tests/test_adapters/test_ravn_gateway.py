@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 
 from niuu.adapters.memory_credential_store import MemoryCredentialStore
+from niuu.ports.session_proxy import SessionProxyTarget
 from tests.test_ravn.test_openclaw_gateway import (
     StubRavnGateway,
     _Event,
@@ -28,19 +29,21 @@ from volundr.composition_builders import _create_resident_session_controllers
 from volundr.config import Settings
 from volundr.domain.models import (
     ResidentBackend,
+    ResidentDeploymentProfile,
     ResidentEngine,
     ResidentRuntime,
     ResidentSessionStatus,
 )
-from volundr.domain.ports import ResidentSessionController
+from volundr.domain.ports import ResidentOpenClawShimHost, ResidentSessionController
 
 #: Volundr's master secret. A resident's shim only ever holds its derived token.
 MASTER = "master-9f8e7d6c5b4a39281706f5e4d3c2b1a0"
 _RESIDENT_FRAMES = {"assistant", "content_block_delta", "result", "error"}
 
 
-class _FluxRoutes:
-    """The helm-release runtime controller: it provisions each resident's shim token."""
+class _FluxRoutes(ResidentOpenClawShimHost):
+    """The helm-release runtime controller: it provisions each resident's shim token
+    and routes to the shim on the resident's Service, as FluxPodManager does."""
 
     backend = ResidentBackend.HELMRELEASE
 
@@ -49,6 +52,16 @@ class _FluxRoutes:
 
     def set_resident_openclaw_tokens(self, resident_token: Any) -> None:
         self.resident_token = resident_token
+
+    def resident_openclaw_target(self, runtime: ResidentRuntime, port: int):
+        namespace = str(runtime.backend_ref.get("namespace") or "")
+        release = str(runtime.backend_ref.get("name") or "")
+        if not namespace or not release:
+            return None
+        host = f"{release}-skuld.{namespace}.svc.cluster.local"
+        return SessionProxyTarget(
+            service_url=f"http://{host}:{port}/", connect_host=host, connect_port=port
+        )
 
     async def approve_resident_device(self, *_args: Any, **_kwargs: Any) -> None:
         raise AssertionError("the Ravn shim trusts devices on first use; no pairing")
@@ -310,6 +323,40 @@ class TestRavnControllerWiring:
         assert target is not None
         assert target.service_url == f"http://{host}:18790/"
         assert (target.connect_host, target.connect_port) == (host, 18790)
+
+    def test_a_backend_without_the_shim_needs_an_explicit_host(self) -> None:
+        class _NoShim:
+            backend = ResidentBackend.LOCAL
+
+        with pytest.raises(ValueError, match="ResidentOpenClawShimHost"):
+            RavnResidentSessionController(_NoShim(), MemoryCredentialStore(), gateway_token=MASTER)
+        explicit = RavnResidentSessionController(
+            _NoShim(), MemoryCredentialStore(), gateway_token=MASTER, service_host="10.0.0.9"
+        )
+        target = explicit._proxy_target(_runtime())
+        assert target is not None and target.connect_host == "10.0.0.9"
+
+    @pytest.mark.parametrize(
+        ("values", "expected"),
+        [
+            ({}, True),
+            ({"resident": {"openclaw": {"enabled": True}}}, True),
+            ({"resident": {"openclaw": {"port": 18800}}}, True),
+            ({"resident": {"openclaw": {"enabled": False}}}, False),
+        ],
+    )
+    def test_sessions_unless_the_profile_switches_the_shim_off(self, values, expected) -> None:
+        profile = ResidentDeploymentProfile(
+            id="ravn-helm",
+            display_name="Ravn",
+            backend=ResidentBackend.HELMRELEASE,
+            engine=ResidentEngine.RAVN,
+            deployment={"values": values},
+        )
+        assert _controller(1).provides_sessions(profile) is expected
+
+    def test_bound_to_its_runtime_backend(self) -> None:
+        assert _controller(1).runtime_backend is ResidentBackend.HELMRELEASE
 
     def test_no_route_before_the_backend_reports_the_release(self) -> None:
         assert _controller(1)._proxy_target(_runtime(backend_ref={})) is None

@@ -522,7 +522,7 @@ spec:
             - name: RAVN_OPENCLAW_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: {{ required "resident.openclaw.tokenSecret.name is required when resident.openclaw.enabled=true" .Values.resident.openclaw.tokenSecret.name }}
+                  name: {{ .Values.resident.openclaw.tokenSecret.name | default (printf "%s-openclaw" .Release.Name) }}
                   key: {{ .Values.resident.openclaw.tokenSecret.key }}
             {{- end }}
           ports:

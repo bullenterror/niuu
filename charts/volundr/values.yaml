@@ -447,16 +447,37 @@ residentRuntimeSessionControllers: []
 #   optional: false
 #   kwargs: {}
 #   secretKwargs: []
-# Ravn residents on Flux: their sessions through each pod's OpenClaw shim (skuld
-# chart resident.openclaw). gateway_token is the master secret: the Flux resident
-# controller writes each resident's derived token into resident-<id>-openclaw in
-# the residents' namespace (namespaced Role in rbac.yaml); pods never see it.
+# Ravn residents' sessions need no entry here: ravnResidentSessions below wires them
+# on every backend that hosts the shim. An explicit entry like this one replaces
+# that default on its backend, e.g. to keep an existing master secret.
+# gateway_token is the master secret: the Flux resident controller writes each
+# resident's derived token into resident-<id>-openclaw in the residents' namespace
+# (namespaced Role in rbac.yaml); pods never see it.
 # - adapter: volundr.adapters.outbound.ravn_gateway.RavnResidentSessionController
 #   runtimeBackend: helmrelease
 #   secretKwargs:
 #     - kwarg: gateway_token
 #       secretName: volundr-ravn-openclaw
 #       secretKey: token
+
+# Ravn residents' sessions ("channels"), on by default: Volundr drives them through
+# each Ravn resident's OpenClaw shim on every resident backend that hosts it (Flux,
+# OpenShell), and each Ravn resident it deploys runs the shim with its own token,
+# HMAC-SHA256(master, resident id). A residentRuntimeSessionControllers entry for a
+# backend replaces the default there. Profiles get session.list/create/delete
+# wherever this is wired; a profile's deployment.values.resident.openclaw.enabled:
+# false switches one off.
+ravnResidentSessions:
+  # -- Wire Ravn residents' sessions by default
+  enabled: true
+  gatewayToken:
+    # -- Secret holding the master token, e.g. synced from Doppler by an
+    # ExternalSecret; it wins. Empty: Volundr generates a master once and keeps it
+    # in its credential store (system/resident-ravn-sessions/gateway-token), like
+    # the Hermes residents' API keys. Only Volundr ever reads it.
+    existingSecret: ""
+    # -- Key of the master token in that Secret
+    key: token
 
 # -- Seconds between resident HelmRelease/Deployment reconciliation passes
 residentRuntimeReconciliationIntervalSeconds: 10.0

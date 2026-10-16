@@ -20,7 +20,7 @@ import socket
 import tarfile
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -48,9 +48,8 @@ from niuu.ports.workload_identity import WorkloadTokenIssuer
 from volundr.adapters.outbound.brokered_credentials import BrokeredCredentialPodManager
 from volundr.adapters.outbound.local_process import LocalProcessPodManager
 from volundr.adapters.outbound.resident_container_spec import (
-    image_from_values as _shared_image_from_values,
-)
-from volundr.adapters.outbound.resident_container_spec import (
+    RAVN_OPENCLAW_TOKEN_ENV,
+    enable_resident_openclaw_shim,
     realm_charter_page_for,
     realm_mount_name_for,
     realm_routing_prefix_for,
@@ -60,6 +59,10 @@ from volundr.adapters.outbound.resident_container_spec import (
     resident_flock_runtime_config,
     resident_flock_skuld_config,
     resident_mesh_pod_metadata,
+    resident_openclaw_shim_enabled,
+)
+from volundr.adapters.outbound.resident_container_spec import (
+    image_from_values as _shared_image_from_values,
 )
 from volundr.adapters.outbound.resident_container_spec import (
     resident_attribution_headers as _shared_resident_attribution_headers,
@@ -103,6 +106,7 @@ from volundr.domain.ports import (
     PodManager,
     PodStartResult,
     ResidentDeviceApprover,
+    ResidentOpenClawShimHost,
     ResidentRuntimeController,
     ResidentRuntimeLogReader,
     ResidentRuntimeObservation,
@@ -851,6 +855,7 @@ class OpenShellGatewayPodManager(
     ResidentRuntimeLogReader,
     ResidentRuntimeProxyTargetResolver,
     ResidentDeviceApprover,
+    ResidentOpenClawShimHost,
 ):
     """Kubernetes OpenShell PodManager using OIDC and native gRPC."""
 
@@ -964,6 +969,61 @@ class OpenShellGatewayPodManager(
         self._resident_runtime_repository: ResidentRuntimeRepository | None = None
         self._workload_token_issuer: WorkloadTokenIssuer | None = None
         self._realm_repository: RealmRepository | None = None
+        # Each Ravn resident's own OpenClaw shim token, derived from Volundr's master by
+        # the Ravn session controller (set_resident_openclaw_tokens). None: not configured.
+        self._resident_openclaw_token: Callable[[ResidentRuntime], str] | None = None
+
+    def set_resident_openclaw_tokens(
+        self,
+        resident_token: Callable[[ResidentRuntime], str],
+    ) -> None:
+        """Provision each Ravn resident's own shim token (RavnResidentSessionController)."""
+        self._resident_openclaw_token = resident_token
+
+    def _resident_openclaw_enabled(
+        self,
+        runtime: ResidentRuntime,
+        values: dict[str, Any],
+    ) -> bool:
+        return resident_openclaw_shim_enabled(
+            runtime,
+            values,
+            tokens_provisioned=self._resident_openclaw_token is not None,
+        )
+
+    def _resident_openclaw_environment(
+        self,
+        runtime: ResidentRuntime,
+        values: dict[str, Any],
+    ) -> dict[str, str]:
+        """The shim's token for the Ravn process; never in the sandbox's own env."""
+        resident_token = self._resident_openclaw_token
+        if not self._resident_openclaw_enabled(runtime, values) or resident_token is None:
+            return {}
+        return {RAVN_OPENCLAW_TOKEN_ENV: resident_token(runtime)}
+
+    def resident_openclaw_target(
+        self,
+        runtime: ResidentRuntime,
+        port: int,
+    ) -> SessionProxyTarget | None:
+        """The shim's sandbox port over the same native TCP tunnel Hermes residents use."""
+        sandbox_id = str(runtime.backend_ref.get("id") or "")
+        if not sandbox_id:
+            return None
+        key = _openclaw_forwarder_key(runtime, sandbox_id)
+        forwarder = self._resident_forwarders.get(key)
+        if forwarder is None:
+            # A redeployed resident has a new sandbox: retire the old one's tunnel.
+            for stale in [k for k in self._resident_forwarders if _is_openclaw_key(k, runtime)]:
+                self._resident_forwarders.pop(stale).close()
+            forwarder = self._client.start_tcp_forward(sandbox_id=sandbox_id, target_port=port)
+            self._resident_forwarders[key] = forwarder
+        return SessionProxyTarget(
+            service_url=f"http://ravn-openclaw.internal:{port}/",
+            connect_host=forwarder.host,
+            connect_port=forwarder.port,
+        )
 
     def set_credential_store(self, store: CredentialStorePort) -> None:
         """Inject credential store for resolving OpenShell launch credentials."""
@@ -1731,6 +1791,7 @@ class OpenShellGatewayPodManager(
                 process_env["OPENCLAW_GATEWAY_TOKEN"] = machine_credential["gateway_token"]
             if runtime.engine is ResidentEngine.HERMES and machine_credential is not None:
                 process_env[HERMES_API_SERVER_KEY_ENV] = machine_credential["api_key"]
+            process_env.update(self._resident_openclaw_environment(runtime, values))
             if resumed_deployment:
                 await self._launch_missing_resident_processes(ready.id, process_env, processes)
             else:
@@ -1935,6 +1996,7 @@ class OpenShellGatewayPodManager(
         env.update(resident_flock_environment(runtime))
         env.update(credential_context.environment)
         env.update(credential_context.process_environment)
+        env.update(self._resident_openclaw_environment(runtime, values))
         if runtime.engine is ResidentEngine.OPENCLAW:
             if self._credential_store is None:
                 raise RuntimeError("OpenClaw residents require the configured credential store")
@@ -2021,9 +2083,12 @@ class OpenShellGatewayPodManager(
         runtime_id = str(runtime.id)
         self._service_urls.pop(runtime_id, None)
         self._resident_process_locks.pop(runtime_id, None)
-        forwarder = self._resident_forwarders.pop(runtime_id, None)
-        if forwarder is not None:
-            await asyncio.to_thread(forwarder.close)
+        for key in [
+            key
+            for key in self._resident_forwarders
+            if key == runtime_id or _is_openclaw_key(key, runtime)
+        ]:
+            await asyncio.to_thread(self._resident_forwarders.pop(key).close)
         sandbox_name = self._resident_sandbox_name(runtime)
         grants = self._provider_grants.pop(runtime_id, ())
         if not grants:
@@ -2234,6 +2299,11 @@ class OpenShellGatewayPodManager(
         if runtime.engine is not ResidentEngine.RAVN:
             return {}
         realm_slug = await self._resolve_realm_slug(runtime)
+        ravn_config = _resident_ravn_config(
+            runtime, values, self._service_port, realm_slug, self._volundr_api_url
+        )
+        if self._resident_openclaw_enabled(runtime, values):
+            enable_resident_openclaw_shim(ravn_config, values)
         return {
             "/sandbox/.volundr/skuld.yaml": yaml.safe_dump(
                 _resident_skuld_config(
@@ -2244,12 +2314,7 @@ class OpenShellGatewayPodManager(
                 ),
                 sort_keys=False,
             ).encode(),
-            "/sandbox/.volundr/ravn.yaml": yaml.safe_dump(
-                _resident_ravn_config(
-                    runtime, values, self._service_port, realm_slug, self._volundr_api_url
-                ),
-                sort_keys=False,
-            ).encode(),
+            "/sandbox/.volundr/ravn.yaml": yaml.safe_dump(ravn_config, sort_keys=False).encode(),
         }
 
     async def _resolve_realm_slug(self, runtime: ResidentRuntime) -> str:
@@ -3654,6 +3719,15 @@ for name in {quoted}; do
   rm -f "$pid_file"
 done
 """
+
+
+def _openclaw_forwarder_key(runtime: ResidentRuntime, sandbox_id: str) -> str:
+    """A Ravn resident's shim tunnel to one sandbox, beside its skuld tunnel (its id)."""
+    return f"{runtime.id}:openclaw:{sandbox_id}"
+
+
+def _is_openclaw_key(key: str, runtime: ResidentRuntime) -> bool:
+    return key.startswith(f"{runtime.id}:openclaw:")
 
 
 def _resident_process_log_script(lines: int, sources: Sequence[str]) -> str:

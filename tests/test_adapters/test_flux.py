@@ -1953,19 +1953,67 @@ class TestFluxResidentOpenClawToken:
         assert _OPENCLAW_MASTER not in rendered
         assert expected not in rendered
 
-    async def test_no_secret_without_resident_openclaw(
+    async def test_shim_is_on_by_default_wherever_ravn_sessions_are_wired(
+        self,
+        pod_manager: FluxPodManager,
+        mock_api,
+        core_api: AsyncMock,
+    ) -> None:
+        """A profile need not mention resident.openclaw: channels follow from the wiring."""
+        _bind_ravn_sessions(pod_manager)
+        runtime = _resident_runtime()
+        with patch.object(pod_manager, "_get_api", return_value=mock_api):
+            await pod_manager.deploy(runtime, _resident_profile())
+
+        core_api.create_namespaced_secret.assert_awaited_once()
+        values = mock_api.create_namespaced_custom_object.call_args.kwargs["body"]["spec"]["values"]
+        assert values["resident"]["openclaw"] == {
+            "enabled": True,
+            "tokenSecret": {"name": f"resident-{runtime.id}-openclaw", "key": "token"},
+        }
+
+    async def test_a_profile_can_switch_the_shim_off(
         self,
         pod_manager: FluxPodManager,
         mock_api,
         core_api: AsyncMock,
     ) -> None:
         _bind_ravn_sessions(pod_manager)
+        profile = _resident_profile()
+        profile.deployment["values"]["resident"]["openclaw"] = {"enabled": False}
+        with patch.object(pod_manager, "_get_api", return_value=mock_api):
+            await pod_manager.deploy(_resident_runtime(), profile)
+
+        core_api.create_namespaced_secret.assert_not_awaited()
+        values = mock_api.create_namespaced_custom_object.call_args.kwargs["body"]["spec"]["values"]
+        assert values["resident"]["openclaw"] == {"enabled": False}
+
+    async def test_shim_is_explicitly_off_without_ravn_sessions(
+        self,
+        pod_manager: FluxPodManager,
+        mock_api,
+        core_api: AsyncMock,
+    ) -> None:
+        """The skuld chart turns the shim on by default; Volundr decides per resident."""
         with patch.object(pod_manager, "_get_api", return_value=mock_api):
             await pod_manager.deploy(_resident_runtime(), _resident_profile())
 
         core_api.create_namespaced_secret.assert_not_awaited()
         values = mock_api.create_namespaced_custom_object.call_args.kwargs["body"]["spec"]["values"]
-        assert "openclaw" not in values["resident"]
+        assert values["resident"]["openclaw"] == {"enabled": False}
+
+    def test_routes_to_the_shim_port_on_the_residents_service(
+        self, pod_manager: FluxPodManager
+    ) -> None:
+        runtime = _resident_runtime(
+            backend_ref={"namespace": "skuld", "name": "resident-abc"},
+        )
+        target = pod_manager.resident_openclaw_target(runtime, 18790)
+        host = "resident-abc-skuld.skuld.svc.cluster.local"
+        assert target is not None
+        assert target.service_url == f"http://{host}:18790/"
+        assert (target.connect_host, target.connect_port) == (host, 18790)
+        assert pod_manager.resident_openclaw_target(_resident_runtime(), 18790) is None
 
     async def test_openclaw_without_a_ravn_session_controller_fails_the_deploy(
         self,

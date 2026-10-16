@@ -143,6 +143,7 @@ from volundr.composition_builders import (  # noqa: F401
     _create_resource_provider,
     _create_secret_injection_adapter,
     _create_workflow_execution_credential_service,
+    _resolve_ravn_sessions_master,
     _runtime_backend,
     _validate_remote_room_role_config,
     create_oauth_client_registry,
@@ -957,6 +958,9 @@ def create_app(
                 settings,
                 resident_controllers,
                 credential_store,
+                ravn_sessions_master=await _resolve_ravn_sessions_master(
+                    settings, resident_controllers, credential_store
+                ),
             )
             # Built early (not just at realm-router mount time below) so
             # ResidentRuntimeService can validate a create() call's realm_id

@@ -631,16 +631,16 @@ resident:
   hudEnabled: false
   # -- Ravn's OpenClaw-protocol shim (ravn gateway.channels.openclaw): the resident's
   # sessions ("channels"), each its own conversation, served to Volundr's
-  # RavnResidentSessionController on its own Service port. The resident's default
-  # room on the broker is unaffected.
+  # RavnResidentSessionController on its own Service port. On by default for every
+  # resident; the resident's default room on the broker is unaffected.
   openclaw:
-    enabled: false
+    enabled: true
     # -- Port of the shim on the ravn container and on the Service.
     port: 18790
     # -- Secret holding this resident's own shim token (RAVN_OPENCLAW_TOKEN).
-    # Required when enabled. Volundr's Flux resident controller creates
-    # resident-<id>-openclaw (HMAC of Volundr's master secret and the resident id)
-    # and sets this for each resident it deploys.
+    # Empty means <release>-openclaw: the Secret Volundr's Flux resident controller
+    # creates for each resident it deploys (resident-<id>-openclaw, HMAC of
+    # Volundr's master secret and the resident id).
     tokenSecret:
       name: ""
       key: token

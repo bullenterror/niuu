@@ -19,12 +19,14 @@ from niuu.adapters.flux import (
     FluxHelmReleases,
     create_flux_api_client,
 )
+from niuu.ports.session_proxy import SessionProxyTarget
 from volundr.adapters.outbound.brokered_credentials import BrokeredCredentialPodManager
 from volundr.adapters.outbound.k8s_storage_adapter import build_pvc_manifest
 from volundr.adapters.outbound.resident_container_spec import (
     resident_flock_labels,
     resident_flock_profile_configured,
     resident_mesh_pod_metadata,
+    resident_openclaw_shim_enabled,
 )
 from volundr.domain.models import (
     LABEL_MANAGED_BY,
@@ -46,6 +48,7 @@ from volundr.domain.models import (
 from volundr.domain.ports import (
     PodManager,
     PodStartResult,
+    ResidentOpenClawShimHost,
     ResidentRuntimeController,
     ResidentRuntimeObservation,
 )
@@ -84,6 +87,7 @@ class FluxPodManager(
     BrokeredCredentialPodManager,
     PodManager,
     ResidentRuntimeController,
+    ResidentOpenClawShimHost,
 ):
     """Flux-native implementation of PodManager.
 
@@ -674,12 +678,34 @@ class FluxPodManager(
     def _resident_openclaw_secret_name(runtime: ResidentRuntime) -> str:
         return f"resident-{runtime.id}-openclaw"
 
-    @staticmethod
-    def _resident_openclaw_enabled(profile: ResidentDeploymentProfile) -> bool:
+    def _resident_openclaw_enabled(
+        self,
+        runtime: ResidentRuntime,
+        profile: ResidentDeploymentProfile,
+    ) -> bool:
         values = profile.deployment.get("values") or {}
-        resident = values.get("resident") if isinstance(values, dict) else None
-        shim = resident.get("openclaw") if isinstance(resident, dict) else None
-        return isinstance(shim, dict) and bool(shim.get("enabled"))
+        return resident_openclaw_shim_enabled(
+            runtime,
+            values if isinstance(values, dict) else {},
+            tokens_provisioned=self._resident_openclaw_token is not None,
+        )
+
+    def resident_openclaw_target(
+        self,
+        runtime: ResidentRuntime,
+        port: int,
+    ) -> SessionProxyTarget | None:
+        """The shim's port on the resident's own Service (charts/skuld service.yaml)."""
+        namespace = str(runtime.backend_ref.get("namespace") or "")
+        release = str(runtime.backend_ref.get("name") or "")
+        if not namespace or not release:
+            return None
+        host = f"{release}-skuld.{namespace}.svc.cluster.local"
+        return SessionProxyTarget(
+            service_url=f"http://{host}:{port}/",
+            connect_host=host,
+            connect_port=port,
+        )
 
     async def _ensure_resident_openclaw_secret(
         self,
@@ -687,16 +713,12 @@ class FluxPodManager(
         profile: ResidentDeploymentProfile,
     ) -> None:
         """Write the resident's own shim token; the pod never sees Volundr's master."""
-        if not self._resident_openclaw_enabled(profile):
+        enabled = self._resident_openclaw_enabled(runtime, profile)
+        resident_token = self._resident_openclaw_token
+        if not enabled or resident_token is None:
             return
-        if self._resident_openclaw_token is None:
-            raise ValueError(
-                f"Resident profile {profile.id} enables resident.openclaw, but no "
-                "RavnResidentSessionController is configured to provide its token; add one "
-                "to resident_runtimes.session_controllers or disable resident.openclaw"
-            )
         name = self._resident_openclaw_secret_name(runtime)
-        token = {RESIDENT_OPENCLAW_TOKEN_KEY: self._resident_openclaw_token(runtime)}
+        token = {RESIDENT_OPENCLAW_TOKEN_KEY: resident_token(runtime)}
         api = await self._get_core_api()
         try:
             await api.create_namespaced_secret(
@@ -806,13 +828,17 @@ class FluxPodManager(
             }
         if realm_slug:
             resident_values["realm"] = {"slug": realm_slug}
-        if self._resident_openclaw_enabled(profile):
+        if self._resident_openclaw_enabled(runtime, profile):
             resident_values["openclaw"] = {
+                "enabled": True,
                 "tokenSecret": {
                     "name": self._resident_openclaw_secret_name(runtime),
                     "key": RESIDENT_OPENCLAW_TOKEN_KEY,
-                }
+                },
             }
+        else:
+            # Explicit either way: the chart's own default must not decide.
+            resident_values["openclaw"] = {"enabled": False}
 
         flock_labels = resident_flock_labels(runtime, prefix="niuu.world")
         mesh_labels, mesh_annotations = resident_mesh_pod_metadata(runtime)

@@ -437,6 +437,26 @@ class ResidentRuntimesConfig(BaseModel):
         description="Dynamically configured resident engine protocol adapters.",
     )
     profiles: list[ResidentProfileConfig] = Field(default_factory=list)
+    ravn_sessions_enabled: bool = Field(
+        default=True,
+        description=(
+            'Ravn residents\' sessions ("channels") by default: Volundr drives them '
+            "(RavnResidentSessionController) on every resident backend that hosts the Ravn "
+            "OpenClaw shim, except a backend session_controllers already names a Ravn "
+            "controller for. charts/volundr sets it from ravnResidentSessions.enabled."
+        ),
+    )
+    ravn_gateway_token: str = Field(
+        default="",
+        repr=False,
+        description=(
+            "Master secret of the default Ravn residents' sessions; each resident's shim "
+            "token is derived from it. Empty: Volundr generates one once and keeps it in "
+            "its credential store. charts/volundr sets it (env "
+            "RESIDENT_RUNTIMES__RAVN_GATEWAY_TOKEN) from "
+            "ravnResidentSessions.gatewayToken.existingSecret."
+        ),
+    )
     reconciliation_interval_seconds: float = Field(
         default=10.0,
         gt=0,

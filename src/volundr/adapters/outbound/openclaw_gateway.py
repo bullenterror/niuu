@@ -23,6 +23,7 @@ from niuu.domain.models import SecretType
 from niuu.ports.credentials import CredentialStorePort
 from niuu.ports.session_proxy import SessionProxyTarget
 from volundr.domain.models import (
+    ResidentBackend,
     ResidentEngine,
     ResidentRuntime,
     ResidentSession,
@@ -580,6 +581,10 @@ class OpenClawResidentSessionController(ResidentSessionController):
     @property
     def engine(self) -> ResidentEngine:
         return ResidentEngine.OPENCLAW
+
+    @property
+    def runtime_backend(self) -> ResidentBackend | None:
+        return getattr(self._runtime, "backend", None)
 
     # Engine hooks. Another engine that speaks this Gateway protocol (Ravn's OpenClaw
     # shim) reuses the whole lifecycle and chat bridge by overriding only these.

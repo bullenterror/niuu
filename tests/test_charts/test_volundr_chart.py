@@ -1094,13 +1094,87 @@ class TestConfigMapTemplate:
         cluster_role = next(doc for doc in documents if doc["kind"] == "ClusterRole")
         assert all("secrets" not in rule["resources"] for rule in cluster_role["rules"])
 
-    def test_no_resident_secret_role_without_a_ravn_session_controller(self):
+    def test_no_resident_secret_role_without_ravn_sessions(self):
         documents = self._rbac(
             "--set",
             "podManager.adapter=volundr.adapters.outbound.flux.FluxPodManager",
+            "--set",
+            "ravnResidentSessions.enabled=false",
         )
         names = {doc["metadata"]["name"] for doc in documents}
         assert "test-volundr-resident-openclaw" not in names
+
+    def test_default_ravn_sessions_grant_secret_writes_in_the_residents_namespace(self):
+        documents = self._rbac(
+            "--set",
+            "podManager.adapter=volundr.adapters.outbound.flux.FluxPodManager",
+            "--set",
+            "podManager.kwargs.namespace=skuld",
+        )
+        role = next(
+            doc
+            for doc in documents
+            if doc["kind"] == "Role" and doc["metadata"]["name"] == "test-volundr-resident-openclaw"
+        )
+        assert role["metadata"]["namespace"] == "skuld"
+
+
+class TestRavnResidentSessions:
+    """Ravn residents' sessions are on by default; the master token needs no cluster setup."""
+
+    @staticmethod
+    def _render(*overrides: str) -> list[dict]:
+        result = subprocess.run(
+            ["helm", "template", "test", str(CHART_DIR), "--namespace", "volundr", *overrides],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+
+    @staticmethod
+    def _env(documents: list[dict]) -> dict[str, dict]:
+        deployment = next(
+            doc
+            for doc in documents
+            if doc["kind"] == "Deployment" and doc["metadata"]["name"] == "test-volundr"
+        )
+        container = deployment["spec"]["template"]["spec"]["containers"][0]
+        return {item["name"]: item for item in container.get("env", [])}
+
+    def test_on_by_default_with_no_secret_to_provision(self):
+        """Volundr keeps its own master in its credential store: the chart adds none."""
+        documents = self._render()
+        env = self._env(documents)
+        assert env["RESIDENT_RUNTIMES__RAVN_SESSIONS_ENABLED"]["value"] == "true"
+        assert "RESIDENT_RUNTIMES__RAVN_GATEWAY_TOKEN" not in env
+        assert not [
+            doc
+            for doc in documents
+            if doc["kind"] == "Secret" and "ravn" in doc["metadata"]["name"]
+        ]
+
+    def test_an_existing_secret_wins(self):
+        documents = self._render(
+            "--set",
+            "ravnResidentSessions.gatewayToken.existingSecret=volundr-ravn-openclaw",
+        )
+        token = self._env(documents)["RESIDENT_RUNTIMES__RAVN_GATEWAY_TOKEN"]
+        assert token["valueFrom"]["secretKeyRef"] == {
+            "name": "volundr-ravn-openclaw",
+            "key": "token",
+        }
+
+    def test_switched_off(self):
+        documents = self._render(
+            "--set",
+            "ravnResidentSessions.enabled=false",
+            "--set",
+            "ravnResidentSessions.gatewayToken.existingSecret=volundr-ravn-openclaw",
+        )
+        env = self._env(documents)
+        assert env["RESIDENT_RUNTIMES__RAVN_SESSIONS_ENABLED"]["value"] == "false"
+        assert "RESIDENT_RUNTIMES__RAVN_GATEWAY_TOKEN" not in env
 
 
 class TestPreviewCacheStorage:

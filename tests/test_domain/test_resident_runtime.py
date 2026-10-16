@@ -1084,6 +1084,153 @@ def test_duplicate_session_controllers_fail_at_composition_boundary() -> None:
         )
 
 
+class _BackendSessionController(MemoryResidentSessionController):
+    """An engine controller bound to one backend, as composition builds them."""
+
+    def __init__(self, backend: ResidentBackend) -> None:
+        super().__init__()
+        self._backend = backend
+
+    @property
+    def runtime_backend(self) -> ResidentBackend | None:
+        return self._backend
+
+
+def _plain_ravn_profiles() -> ConfigResidentDeploymentProfileProvider:
+    """A Ravn profile that lists no session capability: the wiring provides them."""
+    return ConfigResidentDeploymentProfileProvider(
+        [
+            ResidentProfileConfig(
+                id="ravn-plain",
+                display_name="Plain Ravn",
+                backend=ResidentBackend.OPENSHELL,
+                engine=ResidentEngine.RAVN,
+                capabilities=[ResidentCapability.CHAT, ResidentCapability.LOGS],
+                default_model="gpt-5.6",
+                allowed_models=["gpt-5.6"],
+                deployment={"image": "ghcr.io/niuulabs/niuu@sha256:real"},
+            )
+        ]
+    )
+
+
+_SESSION_API = [
+    ResidentCapability.SESSION_LIST,
+    ResidentCapability.SESSION_CREATE,
+    ResidentCapability.SESSION_DELETE,
+]
+
+
+async def test_session_capabilities_follow_from_the_wired_controller() -> None:
+    repository = MemoryResidentRuntimeRepository()
+    wired = ResidentRuntimeService(
+        repository,
+        _plain_ravn_profiles(),
+        [MemoryResidentRuntimeController()],
+        [_BackendSessionController(ResidentBackend.OPENSHELL)],
+    )
+    unwired = ResidentRuntimeService(
+        repository,
+        _plain_ravn_profiles(),
+        [MemoryResidentRuntimeController()],
+        [_BackendSessionController(ResidentBackend.HELMRELEASE)],
+    )
+
+    [profile] = wired.list_profiles()
+    assert profile.capabilities == [
+        ResidentCapability.CHAT,
+        ResidentCapability.LOGS,
+        *_SESSION_API,
+    ]
+    [plain] = unwired.list_profiles()
+    assert plain.capabilities == [ResidentCapability.CHAT, ResidentCapability.LOGS]
+
+    runtime = await wired.create_record(_principal(), name="Heimdall", profile_id="ravn-plain")
+    assert set(_SESSION_API) <= set(runtime.capabilities)
+    assert await wired.list_sessions(_principal(), runtime.id) == []
+
+
+def test_a_controller_can_decline_a_profiles_sessions() -> None:
+    """Ravn: a profile that switches its shim off advertises no session API."""
+
+    class _Declines(_BackendSessionController):
+        def provides_sessions(self, profile) -> bool:
+            return False
+
+    service = ResidentRuntimeService(
+        MemoryResidentRuntimeRepository(),
+        _plain_ravn_profiles(),
+        [MemoryResidentRuntimeController()],
+        [_Declines(ResidentBackend.OPENSHELL)],
+    )
+    [profile] = service.list_profiles()
+    assert profile.capabilities == [ResidentCapability.CHAT, ResidentCapability.LOGS]
+
+
+async def test_reconcile_gives_existing_residents_the_wired_session_api() -> None:
+    repository = MemoryResidentRuntimeRepository()
+    before = ResidentRuntimeService(
+        repository, _plain_ravn_profiles(), [MemoryResidentRuntimeController()]
+    )
+    runtime = await before.create_record(_principal(), name="Bragi", profile_id="ravn-plain")
+    assert not set(_SESSION_API) & set(runtime.capabilities)
+    await repository.update(
+        runtime.model_copy(
+            update={
+                "observed_state": ResidentObservedState.ACTIVE,
+                "backend_ref": {"kind": "Sandbox", "name": str(runtime.id)},
+            }
+        )
+    )
+
+    after = ResidentRuntimeService(
+        repository,
+        _plain_ravn_profiles(),
+        [MemoryResidentRuntimeController()],
+        [_BackendSessionController(ResidentBackend.OPENSHELL)],
+    )
+    reconciled = await after.reconcile(runtime.id)
+
+    assert set(_SESSION_API) <= set(reconciled.capabilities)
+
+
+def test_one_engine_has_a_session_controller_per_backend() -> None:
+    service = ResidentRuntimeService(
+        MemoryResidentRuntimeRepository(),
+        _plain_ravn_profiles(),
+        [MemoryResidentRuntimeController()],
+        [
+            _BackendSessionController(ResidentBackend.OPENSHELL),
+            _BackendSessionController(ResidentBackend.HELMRELEASE),
+        ],
+    )
+    assert [profile.id for profile in service.list_profiles()] == ["ravn-plain"]
+    with pytest.raises(ValueError, match="unique per backend"):
+        ResidentRuntimeService(
+            MemoryResidentRuntimeRepository(),
+            _plain_ravn_profiles(),
+            [MemoryResidentRuntimeController()],
+            [
+                _BackendSessionController(ResidentBackend.OPENSHELL),
+                _BackendSessionController(ResidentBackend.OPENSHELL),
+            ],
+        )
+
+
+async def test_session_api_names_engine_and_backend_when_unwired() -> None:
+    repository = MemoryResidentRuntimeRepository()
+    service = ResidentRuntimeService(
+        repository, _plain_ravn_profiles(), [MemoryResidentRuntimeController()]
+    )
+    runtime = await service.create_record(_principal(), name="Kvasir", profile_id="ravn-plain")
+    await repository.update(
+        runtime.model_copy(update={"capabilities": [*runtime.capabilities, *_SESSION_API]})
+    )
+
+    with pytest.raises(ResidentRuntimeDeploymentError, match="ravn on openshell"):
+        await service.list_sessions(_principal(), runtime.id)
+
+
 async def test_optional_resident_ports_fail_closed() -> None:
     repository = MemoryResidentRuntimeRepository()
     service = ResidentRuntimeService(
