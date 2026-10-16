@@ -11,6 +11,7 @@ import asyncio
 import base64
 import hashlib
 import io
+import itertools
 import json
 import logging
 import re
@@ -121,6 +122,9 @@ DEFAULT_SERVICE_PORT = 9200
 READY_POLL_INTERVAL = 1.0
 DEFAULT_RESOURCE_DELETE_TIMEOUT_SECONDS = 30.0
 TCP_FORWARD_BUFFER_BYTES = 64 * 1024
+# Backoff for calls the gateway rejected because its SQLite store was locked by
+# a concurrent write (SQLITE_BUSY); several resident deployments at once hit it.
+GATEWAY_BUSY_RETRY_DELAYS = (0.25, 0.5, 1.0, 2.0, 4.0)
 BOOTSTRAP_TIMEOUT_SECONDS = 600
 BOOTSTRAP_GIT_ATTEMPTS = 20
 MAX_SANDBOX_ROUTING_NAME_LENGTH = 19
@@ -269,6 +273,58 @@ class ClientCredentialsTokenProvider:
             self._client.close()
 
 
+def _gateway_store_busy(exc: grpc.RpcError) -> bool:
+    details = getattr(exc, "details", None)
+    message = details() if callable(details) else str(exc)
+    return "database is locked" in str(message or "")
+
+
+class _BusyRetryingStub:
+    """Retry gateway calls rejected only because the gateway's store was busy.
+
+    The rejected call's database transaction did not commit, so it is safe to
+    send again. Exec streams fail on their first event, so that event is read
+    inside the retry; the bidirectional TCP forward is passed through untouched.
+    """
+
+    _SERVER_STREAMS = frozenset({"ExecSandbox"})
+    _PASSTHROUGH = frozenset({"ForwardTcp"})
+
+    def __init__(self, stub: Any, delays: Sequence[float] = GATEWAY_BUSY_RETRY_DELAYS) -> None:
+        self._stub = stub
+        self._delays = tuple(delays)
+
+    def __getattr__(self, name: str) -> Any:
+        method = getattr(self._stub, name)
+        if name in self._PASSTHROUGH or not callable(method):
+            return method
+        if name in self._SERVER_STREAMS:
+            return lambda *args, **kwargs: self._retry(
+                lambda: _started_stream(method(*args, **kwargs))
+            )
+        return lambda *args, **kwargs: self._retry(lambda: method(*args, **kwargs))
+
+    def _retry(self, call: Any) -> Any:
+        for delay in self._delays:
+            try:
+                return call()
+            except grpc.RpcError as exc:
+                if not _gateway_store_busy(exc):
+                    raise
+                logger.info("OpenShell gateway store busy; retrying in %.2fs", delay)
+            time.sleep(delay)
+        return call()
+
+
+def _started_stream(stream: Any) -> Any:
+    iterator = iter(stream)
+    try:
+        first = next(iterator)
+    except StopIteration:
+        return iter(())
+    return itertools.chain((first,), iterator)
+
+
 class OpenShellGatewayClient:
     """Native gRPC client for the OpenShell gateway calls Volundr needs."""
 
@@ -291,7 +347,7 @@ class OpenShellGatewayClient:
             else grpc.secure_channel(self._endpoint, grpc.ssl_channel_credentials())
         )
         self._channel = channel
-        self._stub = openshell_pb2_grpc.OpenShellStub(channel)
+        self._stub = _BusyRetryingStub(openshell_pb2_grpc.OpenShellStub(channel))
         self._workspace_scope = datamodel_pb2.WorkspaceSelector(workspace="default")
 
     def close(self) -> None:
@@ -1588,6 +1644,11 @@ class OpenShellGatewayPodManager(
                 raise RuntimeError(
                     f"OpenShell sandbox {sandbox_name!r} is not owned by resident {runtime.id}"
                 )
+            if sandbox.phase == openshell_pb2.SANDBOX_PHASE_DELETING:
+                # A rolled-back attempt is still being deleted: let it go, then
+                # provision a fresh sandbox under the same name.
+                await self._wait_for_sandbox_deleted(sandbox_name)
+                sandbox = None
         resumed_deployment = sandbox is not None
         try:
             if runtime.engine is ResidentEngine.OPENCLAW:
@@ -1743,6 +1804,25 @@ class OpenShellGatewayPodManager(
                         status=ResidentConditionStatus.FALSE,
                         reason="NotFound",
                         message="OpenShell sandbox does not exist",
+                    )
+                ],
+            )
+        if (
+            runtime.observed_state is ResidentObservedState.FAILED
+            and not runtime.backend_ref
+            and runtime.desired_state is ResidentDesiredState.RUNNING
+        ):
+            # A failed deployment never recorded owning this sandbox: its rollback
+            # did not finish. Deploying again adopts it and starts whatever
+            # resident processes are missing.
+            return ResidentRuntimeObservation(
+                observed_state=ResidentObservedState.PENDING,
+                conditions=[
+                    ResidentCondition(
+                        type="SandboxReady",
+                        status=ResidentConditionStatus.FALSE,
+                        reason="Unadopted",
+                        message="OpenShell sandbox is left from an unfinished deployment; adopting",
                     )
                 ],
             )
@@ -2962,6 +3042,10 @@ def _resident_skuld_config(
         "persistence_mount_path": "/sandbox/workspace",
         "volundr_api_url": volundr_api_url,
         "usage_report_path": f"/api/v1/forge/resident-runtimes/{runtime.id}/usage",
+        # A resident is a resident runtime, not a Forge session: Volundr has no
+        # Forge session event log or activity for its id (as in FluxPodManager).
+        "event_log_enabled": False,
+        "activity_reporting_enabled": False,
         "room": {
             "enabled": True,
             "presence_sweep_interval_s": 0,
