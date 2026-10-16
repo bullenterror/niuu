@@ -144,7 +144,7 @@ def test_load_system_workflows_only_keeps_supported_catalog() -> None:
     assert research_resources["Research Memory"]["url"] == (
         "https://mimir.yggdrasil.niuu.world/api/v1"
     )
-    assert research_resources["Research Memory"]["authRef"] == "integration:volundr"
+    assert research_resources["Research Memory"]["authRef"] == "workload:mimir"
 
     planning_flow = next(workflow for workflow in workflows if workflow.name == "Saga Planning")
     assert {"planning", "saga"}.issubset(set(planning_flow.graph["tags"]))
@@ -188,7 +188,7 @@ def test_load_system_workflows_only_keeps_supported_catalog() -> None:
     assert planning_resources["Planning Memory"]["url"] == (
         "https://mimir.yggdrasil.niuu.world/api/v1"
     )
-    assert planning_resources["Planning Memory"]["authRef"] == "integration:volundr"
+    assert planning_resources["Planning Memory"]["authRef"] == "workload:mimir"
 
     specification_flow = next(
         workflow for workflow in workflows if workflow.name == "Specification Stack"
@@ -249,7 +249,7 @@ def test_load_system_workflows_only_keeps_supported_catalog() -> None:
     assert specification_resources["Specification Memory"]["url"] == (
         "https://mimir.yggdrasil.niuu.world/api/v1"
     )
-    assert specification_resources["Specification Memory"]["authRef"] == "integration:volundr"
+    assert specification_resources["Specification Memory"]["authRef"] == "workload:mimir"
 
     delivery_flow = next(
         workflow for workflow in workflows if workflow.name == "Tracker Delivery Flow"
@@ -332,7 +332,7 @@ def test_load_system_workflows_only_keeps_supported_catalog() -> None:
     assert code_review_resources["Delivery Memory"]["url"] == (
         "https://mimir.yggdrasil.niuu.world/api/v1"
     )
-    assert code_review_resources["Delivery Memory"]["authRef"] == "integration:volundr"
+    assert code_review_resources["Delivery Memory"]["authRef"] == "workload:mimir"
 
     builder_flow = next(
         workflow for workflow in workflows if workflow.name == "Tool & Skill Builder"
@@ -392,7 +392,7 @@ def test_load_system_workflows_only_keeps_supported_catalog() -> None:
     assert builder_resources["Capability Memory"]["url"] == (
         "https://mimir.yggdrasil.niuu.world/api/v1"
     )
-    assert builder_resources["Capability Memory"]["authRef"] == "integration:volundr"
+    assert builder_resources["Capability Memory"]["authRef"] == "workload:mimir"
     builder_binding = next(
         binding
         for binding in builder_flow.graph["resourceBindings"]
@@ -598,7 +598,7 @@ async def test_seed_reclassified_legacy_row_matching_package_is_replaced_not_com
 async def test_seed_reclassified_legacy_research_campaign_reseeds_current_version(
     monkeypatch,
 ) -> None:
-    """The real Research Campaign case: a legacy 1.0.0 row, package now 2.0.0.
+    """The real Research Campaign case: a legacy 1.0.0 row, package now 2.0.1.
 
     A version mismatch already took the reseed branch before this fix (it
     never reached the strict content-hash comparison), so this locks in that
@@ -608,7 +608,7 @@ async def test_seed_reclassified_legacy_research_campaign_reseeds_current_versio
     seed = next(
         workflow for workflow in load_system_workflows() if workflow.name == "Research Campaign"
     )
-    assert seed.version == "2.0.0"
+    assert seed.version == "2.0.1"
     legacy = replace(
         seed,
         version="1.0.0",
@@ -630,7 +630,7 @@ async def test_seed_reclassified_legacy_research_campaign_reseeds_current_versio
 
     assert repo.save_calls == saved
     assert saved[0].id == seed.id
-    assert saved[0].version == "2.0.0"
+    assert saved[0].version == "2.0.1"
     assert saved[0].graph == seed.graph
     assert saved[0].origin == "bundled"
 
@@ -639,7 +639,7 @@ async def test_seed_reclassified_legacy_research_campaign_reseeds_current_versio
     rerun = await seed_system_workflows(repo)
 
     assert repo.save_calls == []
-    assert rerun[0].version == "2.0.0"
+    assert rerun[0].version == "2.0.1"
 
 
 @pytest.mark.asyncio
@@ -681,3 +681,36 @@ async def test_seed_reclassifies_orphaned_never_versioned_row_as_authored(
     repo.save_calls.clear()
     await seed_system_workflows(repo)
     assert repo.save_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "workflow",
+    [workflow for workflow in load_system_workflows() if "mimir" in str(workflow.graph)],
+    ids=lambda workflow: workflow.name,
+)
+async def test_bundled_memory_wells_provision_without_a_stored_integration(workflow) -> None:
+    """Every launch path (UI, Ting, A2A) provisions a bundled workflow's memory well.
+
+    The wells authenticate with the session's own workload identity. A well that
+    names ``integration:<slug>`` instead fails provisioning for every owner who has
+    no integration with that slug — which is how an A2A-launched Research Thread
+    failed with "Memory well requires attached integration(s)".
+    """
+    from unittest.mock import AsyncMock
+
+    from ting.domain.workflow_snapshot import build_workflow_snapshot, workflow_mimir_from_snapshot
+    from volundr.adapters.outbound.contributors.secrets import SecretInjectionContributor
+    from volundr.domain.ports import SessionContext
+
+    mimir = workflow_mimir_from_snapshot(build_workflow_snapshot(workflow))
+    refs = mimir.get("registry_refs") or []
+    assert refs, f"{workflow.name} declares a memory well but projects none"
+    assert not [ref for ref in refs if str(ref.get("auth_ref") or "").startswith("integration:")]
+
+    store = AsyncMock()
+    contributor = SecretInjectionContributor(credential_store=store)
+    context = SessionContext(workload_type="ravn_flock", workload_config={"mimir": mimir})
+
+    assert await contributor._build_mappings(context, "owner-without-a-volundr-integration") == []
+    store.get.assert_not_called()

@@ -3,7 +3,7 @@ id: 96ecf5df-18a0-542b-9df6-aef6aef6a5db
 name: Specification Stack
 description: End-to-end specification workflow that produces a PRD, SRD, SDD, and delivery breakdown with
   explicit review and approval gates between each artifact.
-version: 1.0.0
+version: 1.0.1
 persona_dependencies:
   specification-breakdown-critic:
     id: specification-breakdown-critic
@@ -72,7 +72,7 @@ graph:
     bindingMode: registry
     registryEntryId: mimir-yggdrasil
     url: https://mimir.yggdrasil.niuu.world/api/v1
-    authRef: integration:volundr
+    authRef: workload:mimir
     role: shared
     categories:
     - specifications
