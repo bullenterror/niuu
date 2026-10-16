@@ -753,6 +753,31 @@ class TestResidentWorkloadIdentityConfigFirst:
             "key": "password",
         }
 
+    def test_ravn_config_carries_platform_a2a_peers_only_when_set(self, tmp_path):
+        def platform(values: dict) -> dict:
+            configmaps = self._configmaps(_render_skuld_chart(tmp_path, values))
+            ravn_cm = next(cm for name, cm in configmaps.items() if name.endswith("-ravn-config"))
+            return yaml.safe_load(ravn_cm["data"]["config.yaml"])["gateway"]["platform"]
+
+        default = platform(dict(self.RESIDENT_VALUES))
+        assert "a2a_agent_card_urls" not in default
+        assert "a2a_default_connection_id" not in default
+
+        values = dict(self.RESIDENT_VALUES)
+        values["resident"] = {
+            **values["resident"],
+            "platform": {
+                **values["resident"]["platform"],
+                "a2aAgentCardUrls": ["https://platform.test/.well-known/agent-card.json"],
+                "a2aDefaultConnectionId": "Valhalla",
+            },
+        }
+        configured = platform(values)
+        assert configured["a2a_agent_card_urls"] == [
+            "https://platform.test/.well-known/agent-card.json"
+        ]
+        assert configured["a2a_default_connection_id"] == "Valhalla"
+
     def test_ravn_config_carries_platform_workload_fields(self, rendered):
         configmaps = self._configmaps(rendered)
         ravn_cm = next(cm for name, cm in configmaps.items() if name.endswith("-ravn-config"))

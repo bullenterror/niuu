@@ -105,6 +105,13 @@ data:
         workflow_aliases:
           {{- toYaml . | nindent 10 }}
         {{- end }}
+        {{- with .Values.resident.platform.a2aAgentCardUrls }}
+        a2a_agent_card_urls:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        {{- with .Values.resident.platform.a2aDefaultConnectionId }}
+        a2a_default_connection_id: {{ . | quote }}
+        {{- end }}
       {{- end }}
     {{- $codexAuthAdapter := dig "codexAuth" "adapter" "" .Values.broker }}
     {{- if and .Values.resident.platform.enabled $codexAuthAdapter (ne $codexAuthAdapter "skuld.codex_auth.HostCodexAuthProvider") }}

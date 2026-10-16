@@ -255,6 +255,27 @@ def test_ting_scope_is_bound_to_launch_route(path, allowed):
     assert app["readinessProbe"]["httpGet"]["port"] == 8443
 
 
+@pytest.mark.parametrize(
+    "method,path,admitted",
+    [
+        ("GET", "/.well-known/agent-card.json", True),
+        ("HEAD", "/.well-known/agent-card.json", True),
+        ("POST", "/.well-known/agent-card.json", False),
+        ("POST", "/api/v1/ting/a2a", True),
+    ],
+)
+def test_ting_gateway_admits_its_a2a_card_and_endpoint(method, path, admitted):
+    """The gateway denies every unlisted route; A2A clients must reach Ting's card."""
+    docs = render_cedar(chart=CHART.parent / "ting")
+    config = next(
+        yaml.safe_load(d["data"]["authz.yaml"])
+        for d in docs
+        if d["kind"] == "ConfigMap" and "authz.yaml" in d["data"]
+    )
+    routes = AuthorizationGatewayConfig.model_validate(config).routes
+    assert any(method in route.methods and route.matches(path) for route in routes) is admitted
+
+
 @pytest.mark.parametrize("path,prefix", [("/api/{id}/launch", True), ("/api/item-{id}", False)])
 def test_ambiguous_route_templates_rejected(path, prefix):
     from identity.authz_config import GatewayRoute

@@ -693,6 +693,12 @@ resident:
     #     defaults:
     #       gate_auto_forward_after: ""
     workflowAliases: {}
+    # -- Agent Card URLs the resident's a2a_task reaches beside the Guild Agent
+    # Directory, e.g. the platform's Ting card
+    # (https://<platform>/.well-known/agent-card.json), whose skills launch workflows.
+    a2aAgentCardUrls: []
+    # -- Volundr connection injected into A2A workflow launches that name none.
+    a2aDefaultConnectionId: ""
   triggers:
     # -- Have this resident load and run its own durable triggers
     # (POST /api/v1/ravn/triggers) over the platform gateway above. Requires
