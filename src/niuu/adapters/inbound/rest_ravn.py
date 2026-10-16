@@ -516,13 +516,9 @@ def create_ravn_router(
                 continue
             if response.status_code == status.HTTP_403_FORBIDDEN:
                 continue
-            try:
-                response.raise_for_status()
-            except httpx.HTTPStatusError as exc:  # pragma: no cover - defensive transport mapping
-                raise HTTPException(
-                    status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail=str(exc),
-                ) from exc
+            # The owning target's own status and message (e.g. a resident with no
+            # pod, or missing RBAC), not a generic gateway error.
+            _ensure_remote_success(response)
             payload = response.json()
             if isinstance(payload, dict):
                 return _with_instance(payload, instance, rebase_chat_endpoint=False)

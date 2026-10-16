@@ -1094,6 +1094,57 @@ class TestConfigMapTemplate:
         cluster_role = next(doc for doc in documents if doc["kind"] == "ClusterRole")
         assert all("secrets" not in rule["resources"] for rule in cluster_role["rules"])
 
+    @pytest.mark.parametrize(
+        "controller",
+        [
+            (
+                "podManager.adapter=volundr.adapters.outbound.flux.FluxPodManager",
+                "podManager.kwargs.namespace=skuld",
+            ),
+            (
+                "podManager.adapter=volundr.adapters.outbound.direct_k8s_pod_manager.DirectK8sPodManager",
+                "residentRuntimeControllers[0].adapter="
+                "volundr.adapters.outbound.flux.FluxPodManager",
+                "residentRuntimeControllers[0].kwargs.namespace=skuld",
+            ),
+        ],
+    )
+    def test_flux_residents_can_always_read_their_pod_logs(self, controller):
+        """No per-cluster grant: the role follows from the Flux controller alone."""
+        overrides = [arg for value in controller for arg in ("--set", value)]
+        documents = self._rbac(
+            "--namespace", "volundr", "--set", "rbac.clusterWide=true", *overrides
+        )
+        role = next(
+            doc
+            for doc in documents
+            if doc["kind"] == "Role" and doc["metadata"]["name"] == "test-volundr-resident-logs"
+        )
+        assert role["metadata"]["namespace"] == "skuld"
+        assert role["rules"] == [
+            {"apiGroups": [""], "resources": ["pods"], "verbs": ["get", "list"]},
+            {"apiGroups": [""], "resources": ["pods/log"], "verbs": ["get"]},
+        ]
+        binding = next(
+            doc
+            for doc in documents
+            if doc["kind"] == "RoleBinding"
+            and doc["metadata"]["name"] == "test-volundr-resident-logs"
+        )
+        assert binding["metadata"]["namespace"] == "skuld"
+        assert binding["roleRef"]["name"] == "test-volundr-resident-logs"
+        assert binding["subjects"] == [
+            {"kind": "ServiceAccount", "name": "test-volundr", "namespace": "volundr"}
+        ]
+
+    def test_no_resident_logs_role_without_a_flux_controller(self):
+        documents = self._rbac(
+            "--set",
+            "podManager.adapter=volundr.adapters.outbound.direct_k8s_pod_manager.DirectK8sPodManager",
+        )
+        names = {doc["metadata"]["name"] for doc in documents}
+        assert "test-volundr-resident-logs" not in names
+
     def test_no_resident_secret_role_without_a_ravn_session_controller(self):
         documents = self._rbac(
             "--set",

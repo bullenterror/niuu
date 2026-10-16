@@ -6,7 +6,9 @@ adapter pattern in config YAML.
 """
 
 import copy
+import json
 import logging
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -21,6 +23,7 @@ from niuu.adapters.flux import (
 )
 from volundr.adapters.outbound.brokered_credentials import BrokeredCredentialPodManager
 from volundr.adapters.outbound.k8s_storage_adapter import build_pvc_manifest
+from volundr.adapters.outbound.local_resident_storage import LOG_LEVELS, resident_log_level
 from volundr.adapters.outbound.resident_container_spec import (
     resident_flock_labels,
     resident_flock_profile_configured,
@@ -36,6 +39,8 @@ from volundr.domain.models import (
     ResidentDesiredState,
     ResidentEndpoint,
     ResidentEngine,
+    ResidentLogEntry,
+    ResidentLogPage,
     ResidentObservedState,
     ResidentRuntime,
     Session,
@@ -46,7 +51,9 @@ from volundr.domain.models import (
 from volundr.domain.ports import (
     PodManager,
     PodStartResult,
+    ResidentLogsUnavailableError,
     ResidentRuntimeController,
+    ResidentRuntimeLogReader,
     ResidentRuntimeObservation,
 )
 
@@ -62,6 +69,7 @@ LABEL_RESIDENT_TENANT_ID = "niuu.world/tenant-id"
 # A resident's own volumes, keyed by the profile's deployment.volumes block.
 RESIDENT_VOLUME_KINDS = ("home", "workspace")
 RESIDENT_VOLUME_SETTINGS = frozenset({"storageClass", "size", "accessMode"})
+_HTTP_FORBIDDEN = 403
 _HTTP_NOT_FOUND = 404
 _HTTP_CONFLICT = 409
 #: Key of a Ravn resident's own OpenClaw shim token Secret (resident.openclaw.tokenSecret).
@@ -84,6 +92,7 @@ class FluxPodManager(
     BrokeredCredentialPodManager,
     PodManager,
     ResidentRuntimeController,
+    ResidentRuntimeLogReader,
 ):
     """Flux-native implementation of PodManager.
 
@@ -990,6 +999,83 @@ class FluxPodManager(
         await self._delete_resident_openclaw_secret(runtime)
         return existed
 
+    async def logs(
+        self,
+        runtime: ResidentRuntime,
+        *,
+        lines: int,
+        sources: tuple[str, ...],
+        min_level: str,
+    ) -> ResidentLogPage:
+        """Tail each started container of the resident's pods; a source is a container name.
+
+        Every pod of the release is read, so a rollout shows the old and the new
+        pod side by side (``fields["pod"]`` tells them apart).
+        """
+        release_name = self._resident_release_name(runtime)
+        selector = f"app.kubernetes.io/instance={release_name}"
+        api = await self._get_core_api()
+        try:
+            pod_list = await api.list_namespaced_pod(
+                namespace=self._namespace,
+                label_selector=selector,
+            )
+        except Exception as exc:
+            if getattr(exc, "status", None) == _HTTP_FORBIDDEN:
+                raise self._pod_logs_forbidden("list pods") from exc
+            raise
+        pods = list(getattr(pod_list, "items", None) or [])
+        if not pods:
+            raise ResidentLogsUnavailableError(
+                f"resident {runtime.name!r} has no pod in namespace {self._namespace} "
+                f"({selector}); it is suspended or not scheduled yet"
+            )
+
+        entries: list[ResidentLogEntry] = []
+        read_any = False
+        for pod in pods:
+            pod_name = str(pod.metadata.name)
+            for container in _started_containers(pod):
+                if sources and container not in sources:
+                    continue
+                read_any = True
+                try:
+                    payload = await api.read_namespaced_pod_log(
+                        name=pod_name,
+                        namespace=self._namespace,
+                        container=container,
+                        tail_lines=lines,
+                        timestamps=True,
+                    )
+                except Exception as exc:
+                    if getattr(exc, "status", None) == _HTTP_FORBIDDEN:
+                        raise self._pod_logs_forbidden(f"read pod {pod_name} logs") from exc
+                    raise
+                entries.extend(
+                    parse_pod_logs(
+                        str(payload or ""),
+                        pod=pod_name,
+                        container=container,
+                        min_level=min_level,
+                    )
+                )
+        if not read_any:
+            wanted = f" named {', '.join(sources)}" if sources else ""
+            raise ResidentLogsUnavailableError(
+                f"resident {runtime.name!r} has no started container{wanted} in its pods "
+                f"({', '.join(str(pod.metadata.name) for pod in pods)}); it is still starting"
+            )
+        entries.sort(key=lambda entry: entry.timestamp_ms)
+        return ResidentLogPage(entries=entries[-lines:], buffer_total=len(entries))
+
+    def _pod_logs_forbidden(self, action: str) -> PermissionError:
+        """Name the missing grant when Kubernetes refuses Völundr's service account."""
+        return PermissionError(
+            f"Kubernetes forbids Völundr's service account to {action} in namespace "
+            f"{self._namespace}: it needs get/list on pods and get on pods/log there, which "
+            f"the Völundr chart's resident-logs Role grants (charts/volundr/templates/rbac.yaml)"
+        )
+
     async def _set_replica_count(self, runtime: ResidentRuntime, replicas: int) -> None:
         await self._patch_helmrelease(
             self._resident_release_name(runtime),
@@ -1142,6 +1228,105 @@ class FluxPodManager(
             message=str(condition.get("message") or ""),
             last_transition_at=transition,
         )
+
+
+#: A level word in plain-text log formats (Skuld's "... - INFO - ...", Ravn's "... INFO ...").
+_POD_LOG_LEVEL = re.compile(r"\b(DEBUG|INFO|WARNING|WARN|ERROR|CRITICAL|FATAL)\b")
+_POD_LOG_LEVEL_ALIASES = {"warn": "warning", "fatal": "critical"}
+
+
+def _started_containers(pod: Any) -> list[str]:
+    """Names of the pod's containers that have run, so Kubernetes holds their logs.
+
+    A container still waiting for its first start has no log yet (Kubernetes
+    answers 400); a crash-looping one keeps its last run's.
+    """
+    spec = pod.spec
+    status = pod.status
+    statuses = [
+        *(getattr(status, "init_container_statuses", None) or []),
+        *(getattr(status, "container_statuses", None) or []),
+    ]
+    started = {
+        container_status.name
+        for container_status in statuses
+        if _container_has_run(container_status)
+    }
+    declared = [
+        *(getattr(spec, "init_containers", None) or []),
+        *(getattr(spec, "containers", None) or []),
+    ]
+    return [container.name for container in declared if container.name in started]
+
+
+def _container_has_run(container_status: Any) -> bool:
+    state = container_status.state
+    last_state = getattr(container_status, "last_state", None)
+    return bool(
+        (state is not None and (state.running is not None or state.terminated is not None))
+        or (last_state is not None and last_state.terminated is not None)
+        or (container_status.restart_count or 0) > 0
+    )
+
+
+def parse_pod_logs(
+    payload: str,
+    *,
+    pod: str,
+    container: str,
+    min_level: str,
+) -> list[ResidentLogEntry]:
+    """Parse ``kubectl logs --timestamps`` output of one container into entries.
+
+    Every line starts with the kubelet's RFC 3339 timestamp. A JSON line (Skuld's
+    and Ravn's json log format) gives its own level and message; a plain line
+    gives the level word it carries, else one inferred like the local runtimes do.
+    """
+    minimum = LOG_LEVELS.get(_POD_LOG_LEVEL_ALIASES.get(min_level.lower(), min_level.lower()), 0)
+    entries: list[ResidentLogEntry] = []
+    for line in payload.splitlines():
+        stamp, _, message = line.partition(" ")
+        try:
+            timestamp = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        message = message.rstrip()
+        if not message:
+            continue
+        level, message = _pod_log_level_and_message(message)
+        if LOG_LEVELS.get(level, 20) < minimum:
+            continue
+        entries.append(
+            ResidentLogEntry(
+                timestamp_ms=int(timestamp.timestamp() * 1000),
+                level=level,
+                source=container,
+                target=container,
+                message=message,
+                fields={"pod": pod},
+            )
+        )
+    return entries
+
+
+def _pod_log_level_and_message(message: str) -> tuple[str, str]:
+    if message.startswith("{"):
+        try:
+            payload = json.loads(message)
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict):
+            raw_level = str(payload.get("level") or payload.get("levelname") or "").lower()
+            text = str(payload.get("message") or payload.get("msg") or payload.get("event") or "")
+            level = _POD_LOG_LEVEL_ALIASES.get(raw_level, raw_level)
+            if level not in LOG_LEVELS:
+                level = resident_log_level(text or message)
+            return level, text or message
+    match = _POD_LOG_LEVEL.search(message)
+    if match is not None:
+        word = match.group(1).lower()
+        return _POD_LOG_LEVEL_ALIASES.get(word, word), message
+    return resident_log_level(message), message
 
 
 def _resident_platform_exchange_url(values: dict) -> str:
