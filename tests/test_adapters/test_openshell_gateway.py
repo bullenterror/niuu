@@ -3611,23 +3611,27 @@ def _openshell_resident_manager(monkeypatch: pytest.MonkeyPatch):
     return adapter, client, manager
 
 
-def _bind_ravn_sessions(manager) -> str:
-    """Wire the Ravn session controller as composition does; returns the master."""
+def _bind_ravn_sessions(manager, store=None):
+    """Wire the Ravn session controller as composition does; returns its store."""
+    from niuu.adapters.memory_credential_store import MemoryCredentialStore
     from volundr.adapters.outbound.ravn_gateway import RavnResidentSessionController
 
-    master = "master-openshell-ravn-sessions"
-    RavnResidentSessionController(manager, _FakeCredentialStore({}), gateway_token=master)
-    return master
+    store = store or MemoryCredentialStore()
+    RavnResidentSessionController(manager, store)
+    return store
+
+
+async def _kept_shim_token(store, runtime) -> str | None:
+    kept = await store.get_value("resident", str(runtime.id), "ravn-openclaw")
+    return kept["token"] if kept else None
 
 
 @pytest.mark.asyncio
 async def test_ravn_resident_runs_its_openclaw_shim_with_its_own_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from volundr.adapters.outbound.ravn_gateway import resident_openclaw_token
-
     _, client, manager = _openshell_resident_manager(monkeypatch)
-    master = _bind_ravn_sessions(manager)
+    store = _bind_ravn_sessions(manager)
     runtime = _resident_runtime()
 
     await manager.deploy(runtime, _resident_profile())
@@ -3644,11 +3648,11 @@ async def test_ravn_resident_runs_its_openclaw_shim_with_its_own_token(
         "max_live_sessions": 64,
         "store_path": "/sandbox/workspace/.ravn/openclaw/state.db",
     }
-    token = resident_openclaw_token(master, runtime)
+    token = await _kept_shim_token(store, runtime)
+    assert token and len(token) >= 32
     assert {process["env"]["RAVN_OPENCLAW_TOKEN"] for process in client.execs} == {token}
     # The token reaches the processes only: never the sandbox's own environment.
     assert "RAVN_OPENCLAW_TOKEN" not in client.created["env"]
-    assert master not in str(client.created) and master not in str(client.execs)
 
 
 @pytest.mark.asyncio
@@ -3682,11 +3686,12 @@ async def test_a_profile_asking_for_the_shim_without_ravn_sessions_fails(
 async def test_restarting_missing_processes_keeps_the_shim_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from volundr.adapters.outbound.ravn_gateway import resident_openclaw_token
-
+    """The kept token survives a Volundr restart: relaunched processes get the same one."""
     _, _, manager = _openshell_resident_manager(monkeypatch)
-    master = _bind_ravn_sessions(manager)
+    store = _bind_ravn_sessions(manager)
     runtime = _resident_runtime()
+    first = await manager.resident_openclaw_token(runtime)
+    _bind_ravn_sessions(manager, store)  # a restarted Volundr, same credential store
     values = manager._with_brokered_credential_values(
         dict(_resident_profile().deployment["values"])
     )
@@ -3695,7 +3700,123 @@ async def test_restarting_missing_processes_keeps_the_shim_token(
         runtime, values, manager._resident_processes(runtime, values)
     )
 
-    assert env["RAVN_OPENCLAW_TOKEN"] == resident_openclaw_token(master, runtime)
+    assert env["RAVN_OPENCLAW_TOKEN"] == first
+
+
+@pytest.mark.asyncio
+async def test_a_running_ravn_process_keeps_its_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Migration: the token the Ravn process was started with is read back and adopted."""
+    adapter = _import_adapter(monkeypatch)
+    runtime = _deployed_resident(_resident_runtime())
+    client = _FakeOpenShellGatewayClient(adapter)
+    scripts: list[str] = []
+
+    def exec_script(**kwargs):
+        scripts.append(kwargs["script"])
+        return 0, "running-process-token\n"
+
+    client.exec_script = exec_script
+    manager = _deployed_resident_manager(adapter, client, runtime)
+    store = _bind_ravn_sessions(manager)
+
+    assert await manager.resident_openclaw_token(runtime) == "running-process-token"
+    assert await _kept_shim_token(store, runtime) == "running-process-token"
+    assert "/sandbox/.volundr/ravn.pid" in scripts[0] and "RAVN_OPENCLAW_TOKEN" in scripts[0]
+    # Kept from now on: never read back again.
+    assert await manager.resident_openclaw_token(runtime) == "running-process-token"
+    assert len(scripts) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_ravn_process_without_a_token_gets_a_new_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _import_adapter(monkeypatch)
+    runtime = _deployed_resident(_resident_runtime())
+    client = _FakeOpenShellGatewayClient(adapter)
+    client.exec_script = lambda **_kwargs: (0, "")
+    manager = _deployed_resident_manager(adapter, client, runtime)
+    store = _bind_ravn_sessions(manager)
+
+    token = await manager.resident_openclaw_token(runtime)
+
+    assert token and token == await _kept_shim_token(store, runtime)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_restarts_a_ravn_resident_once_to_start_its_shim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A resident deployed before Ravn sessions were on runs without the shim."""
+    adapter = _import_adapter(monkeypatch)
+    runtime = _deployed_resident(_resident_runtime())
+    client = _FakeOpenShellGatewayClient(adapter)
+    client.sandbox_exists = True
+    scripts: list[str] = []
+
+    def exec_script(**kwargs):
+        script = kwargs["script"]
+        scripts.append(script)
+        if ":4966" in script and "kill -0" not in script:  # the shim port 18790, in hex
+            return 1, ""  # not listening
+        if "/proc/$pid/environ" in script:
+            return 0, ""  # started without a token
+        return 0, ""
+
+    client.exec_script = exec_script
+    manager = _deployed_resident_manager(adapter, client, runtime)
+    store = _bind_ravn_sessions(manager)
+
+    await manager.reconcile(runtime, _resident_profile())
+
+    token = await _kept_shim_token(store, runtime)
+    assert token
+    assert {process["env"]["RAVN_OPENCLAW_TOKEN"] for process in client.execs} == {token}
+    ravn_yaml = yaml.safe_load(
+        client.written_files[-1]["files"]["/sandbox/.volundr/ravn.yaml"].decode()
+    )
+    assert ravn_yaml["gateway"]["channels"]["openclaw"]["port"] == 18790
+
+    # Never again from this Volundr, so a shim that cannot start never loops.
+    launched = len(client.execs)
+    await manager.reconcile(runtime, _resident_profile())
+    assert len(client.execs) == launched
+
+
+@pytest.mark.asyncio
+async def test_reconcile_leaves_a_ravn_resident_whose_shim_is_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _import_adapter(monkeypatch)
+    runtime = _deployed_resident(_resident_runtime())
+    client = _FakeOpenShellGatewayClient(adapter)
+    client.sandbox_exists = True
+    client.exec_script = lambda **_kwargs: (0, "")
+    manager = _deployed_resident_manager(adapter, client, runtime)
+    _bind_ravn_sessions(manager)
+
+    await manager.reconcile(runtime, _resident_profile())
+    await manager.reconcile(runtime, _resident_profile())
+
+    assert client.execs == []
+    assert client.written_files == []
+
+
+@pytest.mark.asyncio
+async def test_deleting_a_ravn_resident_forgets_its_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, manager = _openshell_resident_manager(monkeypatch)
+    store = _bind_ravn_sessions(manager)
+    runtime = _resident_runtime()
+    await manager.deploy(runtime, _resident_profile())
+    assert await _kept_shim_token(store, runtime)
+
+    await manager.delete(runtime)
+
+    assert await _kept_shim_token(store, runtime) is None
 
 
 @pytest.mark.asyncio

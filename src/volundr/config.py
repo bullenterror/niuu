@@ -443,18 +443,8 @@ class ResidentRuntimesConfig(BaseModel):
             'Ravn residents\' sessions ("channels") by default: Volundr drives them '
             "(RavnResidentSessionController) on every resident backend that hosts the Ravn "
             "OpenClaw shim, except a backend session_controllers already names a Ravn "
-            "controller for. charts/volundr sets it from ravnResidentSessions.enabled."
-        ),
-    )
-    ravn_gateway_token: str = Field(
-        default="",
-        repr=False,
-        description=(
-            "Master secret of the default Ravn residents' sessions; each resident's shim "
-            "token is derived from it. Empty: Volundr generates one once and keeps it in "
-            "its credential store. charts/volundr sets it (env "
-            "RESIDENT_RUNTIMES__RAVN_GATEWAY_TOKEN) from "
-            "ravnResidentSessions.gatewayToken.existingSecret."
+            "controller for. Each resident's shim token is its own, kept in the "
+            "credential store. charts/volundr sets it from ravnResidentSessions.enabled."
         ),
     )
     reconciliation_interval_seconds: float = Field(

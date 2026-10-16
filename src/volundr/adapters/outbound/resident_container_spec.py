@@ -784,7 +784,7 @@ def resident_openclaw_shim_enabled(
 ) -> bool:
     """Whether a Ravn resident runs its OpenClaw shim (its sessions, "channels").
 
-    On by default wherever Völundr provisions the residents' shim tokens (a Ravn
+    On by default wherever Völundr keeps the residents' shim tokens (a Ravn
     session controller drives the backend); a profile's
     ``resident.openclaw.enabled`` decides explicitly. A profile that asks for the
     shim where no token is provisioned cannot get one: that is fatal, not off.
@@ -799,8 +799,8 @@ def resident_openclaw_shim_enabled(
     if explicit and not tokens_provisioned:
         raise ValueError(
             f"Resident profile {runtime.profile_id} enables resident.openclaw, but no "
-            "RavnResidentSessionController provides its token on this backend; configure "
-            "resident_runtimes.ravn_gateway_token (charts/volundr ravnResidentSessions) "
+            "RavnResidentSessionController provides its token on this backend; enable "
+            "resident_runtimes.ravn_sessions_enabled (charts/volundr ravnResidentSessions) "
             "or disable resident.openclaw"
         )
     return bool(explicit)

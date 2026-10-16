@@ -7,7 +7,7 @@ Adapters implement these interfaces.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -909,6 +909,26 @@ class ResidentRuntimeProxyTargetResolver(ABC):
         """Resolve the backend service reached by the shared session proxy."""
 
 
+class ResidentOpenClawTokens(ABC):
+    """Each Ravn resident's own OpenClaw shim token, kept per resident.
+
+    No cluster-wide master: a resident's token is its own, generated once (or adopted
+    from the resident's running workload) and removed with the resident.
+    """
+
+    @abstractmethod
+    async def stored(self, runtime: ResidentRuntime) -> str | None:
+        """The resident's kept token; None before it has one."""
+
+    @abstractmethod
+    async def ensure(self, runtime: ResidentRuntime, *, adopt: str | None = None) -> str:
+        """The kept token; else keep ``adopt`` (the one the resident runs with) or a new one."""
+
+    @abstractmethod
+    async def forget(self, runtime: ResidentRuntime) -> None:
+        """Remove the resident's token (the resident is gone)."""
+
+
 class ResidentOpenClawShimHost(ABC):
     """Optional backend port: the backend runs a Ravn resident's OpenClaw shim.
 
@@ -920,11 +940,16 @@ class ResidentOpenClawShimHost(ABC):
     """
 
     @abstractmethod
-    def set_resident_openclaw_tokens(
-        self,
-        resident_token: Callable[[ResidentRuntime], str],
-    ) -> None:
-        """Provision each Ravn resident's own shim token, derived by Völundr."""
+    def set_resident_openclaw_tokens(self, tokens: ResidentOpenClawTokens) -> None:
+        """Where each Ravn resident's own shim token is kept."""
+
+    @abstractmethod
+    async def resident_openclaw_token(self, runtime: ResidentRuntime) -> str:
+        """The token the resident's shim checks.
+
+        The kept one; else the one the resident's running workload already has
+        (adopted, so a running resident keeps its sessions); else a new one.
+        """
 
     @abstractmethod
     def resident_openclaw_target(

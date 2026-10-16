@@ -5,11 +5,11 @@ reconciles into running session pods. Selected via the dynamic
 adapter pattern in config YAML.
 """
 
+import base64
 import copy
 import json
 import logging
 import re
-from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -55,6 +55,7 @@ from volundr.domain.ports import (
     PodStartResult,
     ResidentLogsUnavailableError,
     ResidentOpenClawShimHost,
+    ResidentOpenClawTokens,
     ResidentRuntimeController,
     ResidentRuntimeLogReader,
     ResidentRuntimeObservation,
@@ -160,12 +161,13 @@ class FluxPodManager(
         self._resident_platform_base_url = resident_platform_base_url
         self._resident_triggers_enabled = resident_triggers_enabled
         self._resident_budget_enabled = resident_budget_enabled
+        # Where each Ravn resident's own OpenClaw shim token is kept, handed over by
+        # the Ravn session controller (set_resident_openclaw_tokens). None: no Ravn
+        # sessions on this backend.
+        self._resident_openclaw_tokens: ResidentOpenClawTokens | None = None
         # Defaults for each resident's own home and workspace PVCs; a profile
         # overrides them per volume in deployment.volumes.<home|workspace>.
         # An empty storage class means the cluster's default class.
-        # Each Ravn resident's own OpenClaw shim token, derived from Volundr's master by
-        # the Ravn session controller (set_resident_openclaw_tokens). None: not configured.
-        self._resident_openclaw_token: Callable[[ResidentRuntime], str] | None = None
         self._resident_volume_defaults = {
             "home": {
                 "size": resident_home_size,
@@ -676,12 +678,48 @@ class FluxPodManager(
                     raise
                 logger.debug("Resident %s PVC %s is already absent", kind, name)
 
-    def set_resident_openclaw_tokens(
-        self,
-        resident_token: Callable[[ResidentRuntime], str],
-    ) -> None:
-        """Provision each Ravn resident's own shim token (RavnResidentSessionController)."""
-        self._resident_openclaw_token = resident_token
+    def set_resident_openclaw_tokens(self, tokens: ResidentOpenClawTokens) -> None:
+        """Where each Ravn resident's own shim token is kept (RavnResidentSessionController)."""
+        self._resident_openclaw_tokens = tokens
+
+    async def resident_openclaw_token(self, runtime: ResidentRuntime) -> str:
+        """The kept token; else the one in the resident's own Secret (adopted); else new.
+
+        A resident Volundr deployed before tokens were kept per resident runs with the
+        token in resident-<id>-openclaw; adopting it keeps its sessions across the
+        upgrade without a restart.
+        """
+        tokens = self._resident_openclaw_tokens
+        if tokens is None:
+            raise RuntimeError("Ravn resident sessions are not wired on helmrelease")
+        token = await tokens.stored(runtime)
+        if token:
+            return token
+        return await tokens.ensure(runtime, adopt=await self._read_resident_openclaw_token(runtime))
+
+    async def _read_resident_openclaw_token(self, runtime: ResidentRuntime) -> str | None:
+        """The token in the resident's own shim Secret, when Volundr wrote it."""
+        api = await self._get_core_api()
+        try:
+            secret = await api.read_namespaced_secret(
+                name=self._resident_openclaw_secret_name(runtime),
+                namespace=self._namespace,
+            )
+        except Exception as exc:
+            if getattr(exc, "status", None) == _HTTP_NOT_FOUND:
+                return None
+            raise
+        metadata = getattr(secret, "metadata", None)
+        labels = getattr(metadata, "labels", None) or {}
+        if not (
+            labels.get(LABEL_MANAGED_BY) == self._managed_by
+            and labels.get(LABEL_RESIDENT_ID) == str(runtime.id)
+        ):
+            return None
+        encoded = (getattr(secret, "data", None) or {}).get(RESIDENT_OPENCLAW_TOKEN_KEY)
+        if not encoded:
+            return None
+        return base64.b64decode(encoded).decode("utf-8") or None
 
     @staticmethod
     def _resident_openclaw_secret_name(runtime: ResidentRuntime) -> str:
@@ -696,7 +734,7 @@ class FluxPodManager(
         return resident_openclaw_shim_enabled(
             runtime,
             values if isinstance(values, dict) else {},
-            tokens_provisioned=self._resident_openclaw_token is not None,
+            tokens_provisioned=self._resident_openclaw_tokens is not None,
         )
 
     def resident_openclaw_target(
@@ -721,13 +759,11 @@ class FluxPodManager(
         runtime: ResidentRuntime,
         profile: ResidentDeploymentProfile,
     ) -> None:
-        """Write the resident's own shim token; the pod never sees Volundr's master."""
-        enabled = self._resident_openclaw_enabled(runtime, profile)
-        resident_token = self._resident_openclaw_token
-        if not enabled or resident_token is None:
+        """Write the resident's own shim token into its own Secret, for its pod."""
+        if not self._resident_openclaw_enabled(runtime, profile):
             return
         name = self._resident_openclaw_secret_name(runtime)
-        token = {RESIDENT_OPENCLAW_TOKEN_KEY: resident_token(runtime)}
+        token = {RESIDENT_OPENCLAW_TOKEN_KEY: await self.resident_openclaw_token(runtime)}
         api = await self._get_core_api()
         try:
             await api.create_namespaced_secret(
@@ -764,7 +800,7 @@ class FluxPodManager(
                 f"Secret {self._namespace}/{name} exists but is not resident "
                 f"{runtime.id}'s own shim token; delete or rename it before deploying"
             )
-        # Keep it in step with the master Volundr derives from now.
+        # Keep it in step with the token Volundr keeps for the resident.
         await api.patch_namespaced_secret(
             name=name,
             namespace=self._namespace,
@@ -772,9 +808,12 @@ class FluxPodManager(
         )
 
     async def _delete_resident_openclaw_secret(self, runtime: ResidentRuntime) -> None:
-        if self._resident_openclaw_token is None:
+        tokens = self._resident_openclaw_tokens
+        if tokens is None:
             # Without Ravn sessions Volundr writes no such Secret (and holds no Role for it).
             return
+        if runtime.engine is ResidentEngine.RAVN:
+            await tokens.forget(runtime)
         name = self._resident_openclaw_secret_name(runtime)
         api = await self._get_core_api()
         try:

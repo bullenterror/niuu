@@ -714,7 +714,7 @@ class TestResidentOpenClawShim:
         )
 
     def test_asking_for_it_without_a_token_is_fatal(self):
-        with pytest.raises(ValueError, match="ravn_gateway_token"):
+        with pytest.raises(ValueError, match="ravn_sessions_enabled"):
             resident_openclaw_shim_enabled(
                 _runtime(),
                 {"resident": {"openclaw": {"enabled": True}}},

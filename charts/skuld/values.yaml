@@ -639,8 +639,8 @@ resident:
     port: 18790
     # -- Secret holding this resident's own shim token (RAVN_OPENCLAW_TOKEN).
     # Empty means <release>-openclaw: the Secret Volundr's Flux resident controller
-    # creates for each resident it deploys (resident-<id>-openclaw, HMAC of
-    # Volundr's master secret and the resident id).
+    # writes for each resident it deploys (resident-<id>-openclaw: the resident's own
+    # token, kept per resident in Volundr's credential store).
     tokenSecret:
       name: ""
       key: token

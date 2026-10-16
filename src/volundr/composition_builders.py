@@ -360,14 +360,10 @@ def _create_resident_session_controllers(
     settings: Settings,
     runtime_controllers: list[ResidentRuntimeController],
     credential_store: CredentialStorePort,
-    *,
-    ravn_sessions_master: str = "",
 ) -> list[ResidentSessionController]:
     """Create configured engine adapters against their owning runtime backend.
 
-    Plus the default Ravn session controllers (``_default_ravn_session_controllers``)
-    when a master is at hand: ``resident_runtimes.ravn_gateway_token``, else
-    ``ravn_sessions_master`` (``_resolve_ravn_sessions_master``).
+    Plus the default Ravn session controllers (``_default_ravn_session_controllers``).
     """
     controllers_by_backend = {controller.backend: controller for controller in runtime_controllers}
     session_controllers: list[ResidentSessionController] = []
@@ -400,7 +396,6 @@ def _create_resident_session_controllers(
             runtime_controllers,
             session_controllers,
             credential_store,
-            settings.resident_runtimes.ravn_gateway_token or ravn_sessions_master,
         )
     )
     return session_controllers
@@ -422,59 +417,18 @@ def _ravn_session_hosts(
     ]
 
 
-async def _resolve_ravn_sessions_master(
-    settings: Settings,
-    runtime_controllers: list[ResidentRuntimeController],
-    credential_store: CredentialStorePort,
-) -> str:
-    """The master of the default Ravn session controllers.
-
-    The configured ``ravn_gateway_token`` wins. Without one, Volundr generates a master
-    once and keeps it in its credential store (``ensure_resident_sessions_master``),
-    only when some backend actually needs a default controller. A store that cannot
-    keep it leaves Ravn sessions off there, with a warning, rather than failing
-    startup.
-    """
-    from volundr.adapters.outbound.ravn_gateway import (
-        RavnResidentSessionController,
-        ensure_resident_sessions_master,
-    )
-
-    configured = {
-        config.runtime_backend
-        for config in settings.resident_runtimes.session_controllers
-        if issubclass(import_class(config.adapter), RavnResidentSessionController)
-    }
-    hosts = _ravn_session_hosts(settings, runtime_controllers, configured)
-    if not hosts:
-        return ""
-    if settings.resident_runtimes.ravn_gateway_token:
-        return settings.resident_runtimes.ravn_gateway_token
-    try:
-        return await ensure_resident_sessions_master(credential_store)
-    except Exception:
-        logger.warning(
-            "Ravn resident sessions are off on %s: the credential store could not keep "
-            "their master (set resident_runtimes.ravn_gateway_token, charts/volundr "
-            "ravnResidentSessions.gatewayToken.existingSecret)",
-            ", ".join(controller.backend.value for controller in hosts),
-            exc_info=True,
-        )
-        return ""
-
-
 def _default_ravn_session_controllers(
     settings: Settings,
     runtime_controllers: list[ResidentRuntimeController],
     configured: list[ResidentSessionController],
     credential_store: CredentialStorePort,
-    master: str,
 ) -> list[ResidentSessionController]:
     """Ravn sessions on every backend that hosts the Ravn OpenClaw shim.
 
-    A Ravn resident's sessions ("channels") need no per-cluster wiring: each
-    shim-hosting backend gets a RavnResidentSessionController unless
-    session_controllers already names a Ravn controller for it, which wins.
+    A Ravn resident's sessions ("channels") need no per-cluster wiring and no
+    secret: each shim-hosting backend gets a RavnResidentSessionController unless
+    session_controllers already names a Ravn controller for it, which wins. Each
+    resident's shim token is its own, kept in the credential store.
     """
     from volundr.adapters.outbound.ravn_gateway import RavnResidentSessionController
 
@@ -484,23 +438,9 @@ def _default_ravn_session_controllers(
         if controller.engine is ResidentEngine.RAVN
     }
     hosts = _ravn_session_hosts(settings, runtime_controllers, wired)
-    if not hosts:
-        return []
-    if not master:
-        logger.warning(
-            "Ravn resident sessions are off on %s: no master secret",
-            ", ".join(controller.backend.value for controller in hosts),
-        )
-        return []
     defaults: list[ResidentSessionController] = []
     for controller in hosts:
-        defaults.append(
-            RavnResidentSessionController(
-                controller,
-                credential_store,
-                gateway_token=master,
-            )
-        )
+        defaults.append(RavnResidentSessionController(controller, credential_store))
         logger.info("Resident session controller: Ravn on %s (default)", controller.backend.value)
     return defaults
 

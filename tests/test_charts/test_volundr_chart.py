@@ -1193,39 +1193,24 @@ class TestRavnResidentSessions:
         container = deployment["spec"]["template"]["spec"]["containers"][0]
         return {item["name"]: item for item in container.get("env", [])}
 
-    def test_on_by_default_with_no_secret_to_provision(self):
-        """Volundr keeps its own master in its credential store: the chart adds none."""
+    def test_on_by_default_without_any_master_secret(self):
+        """Each resident's token is its own, in Volundr's credential store: no Secret here."""
         documents = self._render()
         env = self._env(documents)
         assert env["RESIDENT_RUNTIMES__RAVN_SESSIONS_ENABLED"]["value"] == "true"
-        assert "RESIDENT_RUNTIMES__RAVN_GATEWAY_TOKEN" not in env
+        assert not [name for name in env if "RAVN_GATEWAY_TOKEN" in name]
         assert not [
             doc
             for doc in documents
             if doc["kind"] == "Secret" and "ravn" in doc["metadata"]["name"]
         ]
-
-    def test_an_existing_secret_wins(self):
-        documents = self._render(
-            "--set",
-            "ravnResidentSessions.gatewayToken.existingSecret=volundr-ravn-openclaw",
-        )
-        token = self._env(documents)["RESIDENT_RUNTIMES__RAVN_GATEWAY_TOKEN"]
-        assert token["valueFrom"]["secretKeyRef"] == {
-            "name": "volundr-ravn-openclaw",
-            "key": "token",
-        }
+        values = yaml.safe_load((CHART_DIR / "values.yaml").read_text())
+        assert values["ravnResidentSessions"] == {"enabled": True}
 
     def test_switched_off(self):
-        documents = self._render(
-            "--set",
-            "ravnResidentSessions.enabled=false",
-            "--set",
-            "ravnResidentSessions.gatewayToken.existingSecret=volundr-ravn-openclaw",
-        )
+        documents = self._render("--set", "ravnResidentSessions.enabled=false")
         env = self._env(documents)
         assert env["RESIDENT_RUNTIMES__RAVN_SESSIONS_ENABLED"]["value"] == "false"
-        assert "RESIDENT_RUNTIMES__RAVN_GATEWAY_TOKEN" not in env
 
 
 class TestPreviewCacheStorage:
