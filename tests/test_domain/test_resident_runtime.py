@@ -29,6 +29,7 @@ from volundr.domain.models import (
     ResidentSession,
 )
 from volundr.domain.ports import (
+    ResidentLogsUnavailableError,
     ResidentRuntimeLogReader,
     ResidentRuntimeObservation,
     ResidentRuntimeProxyTargetResolver,
@@ -41,6 +42,7 @@ from volundr.domain.services.resident_runtime import (
     ResidentRuntimeDeploymentError,
     ResidentRuntimeNotFoundError,
     ResidentRuntimeService,
+    ResidentRuntimeStateError,
     ResidentRuntimeValidationError,
 )
 
@@ -103,7 +105,9 @@ class MemoryResidentRuntimeRepository:
         return self.items.pop(runtime_id, None) is not None
 
 
-class MemoryResidentRuntimeController:
+class LifecycleResidentRuntimeController:
+    """A backend with lifecycle only: no log reader, so it cannot back ``logs``."""
+
     backend = ResidentBackend.OPENSHELL
 
     def __init__(self) -> None:
@@ -149,6 +153,12 @@ class MemoryResidentRuntimeController:
 
     async def close(self):
         self.actions.append("close")
+
+
+class MemoryResidentRuntimeController(LifecycleResidentRuntimeController, ResidentRuntimeLogReader):
+    async def logs(self, runtime, *, lines, sources, min_level):
+        self.actions.append("logs")
+        return ResidentLogPage()
 
 
 class ProxyResidentRuntimeController(
@@ -904,6 +914,37 @@ async def test_logs_are_authorized_and_read_through_backend_port() -> None:
     assert page.entries[0].message == "Muninn"
 
 
+def test_profile_advertising_logs_needs_a_backend_that_reads_them() -> None:
+    lifecycle_only = ResidentRuntimeService(
+        MemoryResidentRuntimeRepository(),
+        _profiles(),
+        [LifecycleResidentRuntimeController()],
+    )
+    with_logs = ResidentRuntimeService(
+        MemoryResidentRuntimeRepository(),
+        _profiles(),
+        [MemoryResidentRuntimeController()],
+    )
+
+    assert lifecycle_only.list_profiles() == []
+    with pytest.raises(ResidentProfileNotFoundError, match="not deployable"):
+        lifecycle_only._require_controller(_profiles().get("ravn-openshell"))
+    assert [profile.id for profile in with_logs.list_profiles()] == ["ravn-openshell"]
+
+
+async def test_logs_unavailable_in_the_resident_state_is_a_state_error() -> None:
+    class NoPodController(MemoryResidentRuntimeController):
+        async def logs(self, runtime, *, lines, sources, min_level):
+            raise ResidentLogsUnavailableError("resident 'Muninn' has no pod in namespace skuld")
+
+    repository = MemoryResidentRuntimeRepository()
+    service = ResidentRuntimeService(repository, _profiles(), [NoPodController()])
+    runtime = await service.create_record(_principal(), name="Muninn", profile_id="ravn-openshell")
+
+    with pytest.raises(ResidentRuntimeStateError, match="has no pod in namespace skuld"):
+        await service.logs(_principal(), runtime.id, lines=10)
+
+
 async def test_proxy_target_is_resolved_through_runtime_backend_port() -> None:
     repository = MemoryResidentRuntimeRepository()
     service = ResidentRuntimeService(
@@ -1089,7 +1130,7 @@ async def test_optional_resident_ports_fail_closed() -> None:
     service = ResidentRuntimeService(
         repository,
         _profiles(),
-        [MemoryResidentRuntimeController()],
+        [LifecycleResidentRuntimeController()],
     )
     principal = _principal()
     runtime = await service.create_record(

@@ -24,6 +24,7 @@ from volundr.domain.models import (
 from volundr.domain.ports import (
     ResidentChatConnection,
     ResidentDeploymentProfileProvider,
+    ResidentLogsUnavailableError,
     ResidentRuntimeController,
     ResidentRuntimeLogReader,
     ResidentRuntimeObservation,
@@ -59,6 +60,10 @@ class ResidentRuntimeAccessError(Exception):
 
 class ResidentRuntimeDeploymentError(Exception):
     """Raised when a resident backend operation fails."""
+
+
+class ResidentRuntimeStateError(Exception):
+    """Raised when the resident's current state cannot serve the request, e.g. no pod."""
 
 
 class ResidentRuntimeService:
@@ -102,6 +107,7 @@ class ResidentRuntimeService:
             if (controller := self._controllers.get(profile.backend))
             and controller.supports(profile)
             and self._profile_session_api_available(profile)
+            and self._profile_logs_available(profile, controller)
         ]
 
     async def create(
@@ -513,6 +519,8 @@ class ResidentRuntimeService:
                 sources=sources,
                 min_level=min_level,
             )
+        except ResidentLogsUnavailableError as exc:
+            raise ResidentRuntimeStateError(f"No logs to read: {exc}") from exc
         except Exception as exc:
             raise ResidentRuntimeDeploymentError(
                 f"Failed to read resident {runtime.name} logs: {exc}"
@@ -645,6 +653,7 @@ class ResidentRuntimeService:
             controller is None
             or not controller.supports(profile)
             or not self._profile_session_api_available(profile)
+            or not self._profile_logs_available(profile, controller)
         ):
             raise ResidentProfileNotFoundError(
                 f"Resident profile is not deployable on this target: {profile.id}"
@@ -659,6 +668,16 @@ class ResidentRuntimeService:
         }
         return not session_capabilities.intersection(profile.capabilities) or (
             profile.engine in self._session_controllers
+        )
+
+    @staticmethod
+    def _profile_logs_available(
+        profile: ResidentDeploymentProfile,
+        controller: ResidentRuntimeController,
+    ) -> bool:
+        """A profile advertises logs only on a backend that reads them."""
+        return ResidentCapability.LOGS not in profile.capabilities or isinstance(
+            controller, ResidentRuntimeLogReader
         )
 
     def _require_controller_for_runtime(

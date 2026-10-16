@@ -40,6 +40,7 @@ from volundr.domain.services.resident_runtime import (
     ResidentRuntimeDeploymentError,
     ResidentRuntimeNotFoundError,
     ResidentRuntimeService,
+    ResidentRuntimeStateError,
     ResidentRuntimeValidationError,
 )
 
@@ -107,7 +108,7 @@ def _resident_error(exc: Exception) -> HTTPException:
         return HTTPException(status.HTTP_403_FORBIDDEN, detail=str(exc))
     if isinstance(exc, ResidentRuntimeNotFoundError):
         return HTTPException(status.HTTP_404_NOT_FOUND, detail=str(exc))
-    if isinstance(exc, ResidentRuntimeConflictError):
+    if isinstance(exc, (ResidentRuntimeConflictError, ResidentRuntimeStateError)):
         return HTTPException(status.HTTP_409_CONFLICT, detail=str(exc))
     if isinstance(exc, (ResidentProfileNotFoundError, ResidentRuntimeValidationError)):
         return HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc))
