@@ -2,7 +2,7 @@ schema_version: 2
 id: 4e7ebec4-0cfa-4567-98dd-2ee4ce0bc308
 name: Research Thread
 description: Run one exploration thread on an assigned angle and produce a structured finding for the parent research campaign.
-version: 1.0.0
+version: 1.0.1
 persona_dependencies:
   research-explorer:
     id: research-explorer
@@ -41,7 +41,7 @@ graph:
       bindingMode: registry
       registryEntryId: mimir-yggdrasil
       url: https://mimir.yggdrasil.niuu.world/api/v1
-      authRef: integration:volundr
+      authRef: workload:mimir
       role: shared
       categories: [research, memory, sources]
       position: {x: 320, y: 480}
