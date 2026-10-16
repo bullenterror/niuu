@@ -156,12 +156,13 @@ subjects:
     namespace: {{ .Release.Namespace }}
 {{- end }}
 {{- /*
-Ravn resident sessions: the Flux resident controller writes each Ravn resident's
-own shim token Secret (resident-<id>-openclaw) into the residents' namespace.
+Ravn resident sessions (on by default, ravnResidentSessions): the Flux resident
+controller writes each Ravn resident's own shim token Secret
+(resident-<id>-openclaw) into the residents' namespace.
 Namespaced on purpose, like workflowExecutionCredentials above: never Secret
 writes cluster-wide.
 */}}
-{{- $ravnSessions := false -}}
+{{- $ravnSessions := .Values.ravnResidentSessions.enabled -}}
 {{- range .Values.residentRuntimeSessionControllers -}}
 {{- if contains "RavnResidentSessionController" .adapter -}}
 {{- $ravnSessions = true -}}

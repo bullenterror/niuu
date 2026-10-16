@@ -447,16 +447,22 @@ residentRuntimeSessionControllers: []
 #   optional: false
 #   kwargs: {}
 #   secretKwargs: []
-# Ravn residents on Flux: their sessions through each pod's OpenClaw shim (skuld
-# chart resident.openclaw). gateway_token is the master secret: the Flux resident
-# controller writes each resident's derived token into resident-<id>-openclaw in
-# the residents' namespace (namespaced Role in rbac.yaml); pods never see it.
+# Ravn residents' sessions need no entry here: ravnResidentSessions below wires them
+# on every backend that hosts the shim. An explicit entry replaces that default on
+# its backend; it takes no secret (gateway_token is ignored, with a warning).
 # - adapter: volundr.adapters.outbound.ravn_gateway.RavnResidentSessionController
 #   runtimeBackend: helmrelease
-#   secretKwargs:
-#     - kwarg: gateway_token
-#       secretName: volundr-ravn-openclaw
-#       secretKey: token
+
+# Ravn residents' sessions ("channels"), on by default: Volundr drives them through
+# each Ravn resident's OpenClaw shim on every resident backend that hosts it (Flux,
+# OpenShell). Each Ravn resident's shim token is its own: generated once (or adopted
+# from the running resident) and kept in Volundr's credential store per resident,
+# like the Hermes residents' API keys; no cluster-wide secret. Profiles get
+# session.list/create/delete wherever this is wired; a profile's
+# deployment.values.resident.openclaw.enabled: false switches one off.
+ravnResidentSessions:
+  # -- Wire Ravn residents' sessions by default
+  enabled: true
 
 # -- Seconds between resident HelmRelease/Deployment reconciliation passes
 residentRuntimeReconciliationIntervalSeconds: 10.0

@@ -11,11 +11,13 @@ from niuu.ports.realm_repository import RealmRepository
 from niuu.ports.session_proxy import SessionProxyTarget
 from volundr.domain.models import (
     Principal,
+    ResidentBackend,
     ResidentCapability,
     ResidentCondition,
     ResidentDeploymentProfile,
     ResidentDesiredState,
     ResidentEndpoint,
+    ResidentEngine,
     ResidentLogPage,
     ResidentObservedState,
     ResidentRuntime,
@@ -36,6 +38,13 @@ from volundr.domain.ports import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: The resident session API ("channels"), provided by an engine session controller.
+_SESSION_CAPABILITIES = (
+    ResidentCapability.SESSION_LIST,
+    ResidentCapability.SESSION_CREATE,
+    ResidentCapability.SESSION_DELETE,
+)
 
 
 class ResidentRuntimeNotFoundError(Exception):
@@ -90,11 +99,14 @@ class ResidentRuntimeService:
         self._controllers = {controller.backend: controller for controller in controllers or []}
         if len(self._controllers) != len(controllers or []):
             raise ValueError("Resident runtime controller backends must be unique")
+        # Keyed by (backend, engine): one engine can have a controller per backend
+        # (Ravn on Flux and on OpenShell). A backend of None drives any backend.
         self._session_controllers = {
-            controller.engine: controller for controller in session_controllers or []
+            (controller.runtime_backend, controller.engine): controller
+            for controller in session_controllers or []
         }
         if len(self._session_controllers) != len(session_controllers or []):
-            raise ValueError("Resident session controller engines must be unique")
+            raise ValueError("Resident session controller engines must be unique per backend")
         self._span_repository = span_repository
         self._event_repository = event_repository
         self._deployment_tasks: dict[UUID, asyncio.Task[None]] = {}
@@ -102,7 +114,7 @@ class ResidentRuntimeService:
     def list_profiles(self) -> list[ResidentDeploymentProfile]:
         """Return profiles that are actually enabled on this target."""
         return [
-            profile
+            self._with_wired_capabilities(profile)
             for profile in self._profiles.list()
             if (controller := self._controllers.get(profile.backend))
             and controller.supports(profile)
@@ -642,7 +654,40 @@ class ResidentRuntimeService:
         profile = self._profiles.get(profile_id)
         if profile is None:
             raise ResidentProfileNotFoundError(f"Resident profile not found: {profile_id}")
-        return profile
+        return self._with_wired_capabilities(profile)
+
+    def _with_wired_capabilities(
+        self,
+        profile: ResidentDeploymentProfile,
+    ) -> ResidentDeploymentProfile:
+        """The profile with the session capabilities its wiring provides.
+
+        A resident's sessions ("channels") exist wherever an engine session
+        controller drives the profile's backend, so the session API follows from
+        what is wired, not from a hand-kept list per profile. Reconciling a
+        resident refreshes its capabilities from this, so existing residents gain
+        them too.
+        """
+        controller = self._session_controller_for(profile.backend, profile.engine)
+        if controller is None or not controller.provides_sessions(profile):
+            return profile
+        missing = [
+            capability
+            for capability in _SESSION_CAPABILITIES
+            if capability not in profile.capabilities
+        ]
+        if not missing:
+            return profile
+        return profile.model_copy(update={"capabilities": [*profile.capabilities, *missing]})
+
+    def _session_controller_for(
+        self,
+        backend: ResidentBackend,
+        engine: ResidentEngine,
+    ) -> ResidentSessionController | None:
+        return self._session_controllers.get((backend, engine)) or self._session_controllers.get(
+            (None, engine)
+        )
 
     def _require_controller(
         self,
@@ -661,13 +706,8 @@ class ResidentRuntimeService:
         return controller
 
     def _profile_session_api_available(self, profile: ResidentDeploymentProfile) -> bool:
-        session_capabilities = {
-            ResidentCapability.SESSION_LIST,
-            ResidentCapability.SESSION_CREATE,
-            ResidentCapability.SESSION_DELETE,
-        }
-        return not session_capabilities.intersection(profile.capabilities) or (
-            profile.engine in self._session_controllers
+        return not set(_SESSION_CAPABILITIES).intersection(profile.capabilities) or (
+            self._session_controller_for(profile.backend, profile.engine) is not None
         )
 
     @staticmethod
@@ -692,10 +732,11 @@ class ResidentRuntimeService:
         return controller
 
     def _session_controller(self, runtime: ResidentRuntime) -> ResidentSessionController:
-        controller = self._session_controllers.get(runtime.engine)
+        controller = self._session_controller_for(runtime.backend, runtime.engine)
         if controller is None:
             raise ResidentRuntimeDeploymentError(
-                f"Resident engine session API is unavailable: {runtime.engine.value}"
+                "Resident engine session API is unavailable: "
+                f"{runtime.engine.value} on {runtime.backend.value}"
             )
         return controller
 

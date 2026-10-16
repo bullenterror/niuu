@@ -48,9 +48,9 @@ from niuu.ports.workload_identity import WorkloadTokenIssuer
 from volundr.adapters.outbound.brokered_credentials import BrokeredCredentialPodManager
 from volundr.adapters.outbound.local_process import LocalProcessPodManager
 from volundr.adapters.outbound.resident_container_spec import (
-    image_from_values as _shared_image_from_values,
-)
-from volundr.adapters.outbound.resident_container_spec import (
+    RAVN_OPENCLAW_PORT,
+    RAVN_OPENCLAW_TOKEN_ENV,
+    enable_resident_openclaw_shim,
     realm_charter_page_for,
     realm_mount_name_for,
     realm_routing_prefix_for,
@@ -60,6 +60,10 @@ from volundr.adapters.outbound.resident_container_spec import (
     resident_flock_runtime_config,
     resident_flock_skuld_config,
     resident_mesh_pod_metadata,
+    resident_openclaw_shim_enabled,
+)
+from volundr.adapters.outbound.resident_container_spec import (
+    image_from_values as _shared_image_from_values,
 )
 from volundr.adapters.outbound.resident_container_spec import (
     resident_attribution_headers as _shared_resident_attribution_headers,
@@ -103,6 +107,8 @@ from volundr.domain.ports import (
     PodManager,
     PodStartResult,
     ResidentDeviceApprover,
+    ResidentOpenClawShimHost,
+    ResidentOpenClawTokens,
     ResidentRuntimeController,
     ResidentRuntimeLogReader,
     ResidentRuntimeObservation,
@@ -851,6 +857,7 @@ class OpenShellGatewayPodManager(
     ResidentRuntimeLogReader,
     ResidentRuntimeProxyTargetResolver,
     ResidentDeviceApprover,
+    ResidentOpenClawShimHost,
 ):
     """Kubernetes OpenShell PodManager using OIDC and native gRPC."""
 
@@ -964,6 +971,129 @@ class OpenShellGatewayPodManager(
         self._resident_runtime_repository: ResidentRuntimeRepository | None = None
         self._workload_token_issuer: WorkloadTokenIssuer | None = None
         self._realm_repository: RealmRepository | None = None
+        # Where each Ravn resident's own OpenClaw shim token is kept, handed over by
+        # the Ravn session controller (set_resident_openclaw_tokens). None: no Ravn
+        # sessions on this backend.
+        self._resident_openclaw_tokens: ResidentOpenClawTokens | None = None
+        # Ravn residents whose shim this Volundr has seen up, or restarted once to start.
+        self._resident_openclaw_checked: set[str] = set()
+
+    def set_resident_openclaw_tokens(self, tokens: ResidentOpenClawTokens) -> None:
+        """Where each Ravn resident's own shim token is kept (RavnResidentSessionController)."""
+        self._resident_openclaw_tokens = tokens
+
+    async def resident_openclaw_token(self, runtime: ResidentRuntime) -> str:
+        """The kept token; else the one the resident's Ravn process runs with; else new."""
+        tokens = self._resident_openclaw_tokens
+        if tokens is None:
+            raise RuntimeError("Ravn resident sessions are not wired on openshell")
+        token = await tokens.stored(runtime)
+        if token:
+            return token
+        return await tokens.ensure(runtime, adopt=await self._read_resident_openclaw_token(runtime))
+
+    async def _read_resident_openclaw_token(self, runtime: ResidentRuntime) -> str | None:
+        """Read RAVN_OPENCLAW_TOKEN back from the running Ravn process, if it has one."""
+        sandbox_id = str(runtime.backend_ref.get("id") or "")
+        if not sandbox_id:
+            return None
+        try:
+            exit_code, output = await asyncio.to_thread(
+                self._client.exec_script,
+                sandbox_id=sandbox_id,
+                script=_resident_process_env_script("ravn", RAVN_OPENCLAW_TOKEN_ENV),
+                env={},
+            )
+        except Exception:
+            logger.debug("Could not read resident %s's shim token", runtime.id, exc_info=True)
+            return None
+        token = output.strip()
+        if exit_code != 0 or not token or any(c.isspace() for c in token):
+            return None
+        return token
+
+    def _resident_openclaw_enabled(
+        self,
+        runtime: ResidentRuntime,
+        values: dict[str, Any],
+    ) -> bool:
+        return resident_openclaw_shim_enabled(
+            runtime,
+            values,
+            tokens_provisioned=self._resident_openclaw_tokens is not None,
+        )
+
+    async def _resident_openclaw_environment(
+        self,
+        runtime: ResidentRuntime,
+        values: dict[str, Any],
+    ) -> dict[str, str]:
+        """The shim's token for the Ravn process; never in the sandbox's own env."""
+        if not self._resident_openclaw_enabled(runtime, values):
+            return {}
+        return {RAVN_OPENCLAW_TOKEN_ENV: await self.resident_openclaw_token(runtime)}
+
+    async def _forget_resident_openclaw_token(self, runtime: ResidentRuntime) -> None:
+        if runtime.engine is ResidentEngine.RAVN and self._resident_openclaw_tokens is not None:
+            await self._resident_openclaw_tokens.forget(runtime)
+
+    async def _start_resident_openclaw_shim(
+        self,
+        runtime: ResidentRuntime,
+        profile: ResidentDeploymentProfile,
+        values: dict[str, Any],
+        sandbox: OpenShellSandbox,
+    ) -> None:
+        """Restart a running Ravn resident once whose processes predate its shim.
+
+        A Ravn resident deployed before Ravn sessions were on by default runs without
+        the shim; restarting its processes (the restart path) starts it with the new
+        ravn.yaml and the resident's own token. Checked until seen up, and restarted at
+        most once per resident per Volundr, so a shim that cannot start never restarts
+        the resident in a loop.
+        """
+        runtime_id = str(runtime.id)
+        if runtime_id in self._resident_openclaw_checked:
+            return
+        if self._resident_process_lock(runtime).locked():
+            return
+        port = _resident_openclaw_port(values)
+        listening = await self._resident_processes_ready(sandbox.id, (), service_port=port)
+        self._resident_openclaw_checked.add(runtime_id)
+        if listening:
+            return
+        logger.info("Restarting resident %s to start its Ravn sessions shim", runtime.id)
+        try:
+            await self.restart(runtime, profile)
+        except Exception:
+            logger.warning(
+                "Could not restart resident %s to start its Ravn sessions shim",
+                runtime.id,
+                exc_info=True,
+            )
+
+    def resident_openclaw_target(
+        self,
+        runtime: ResidentRuntime,
+        port: int,
+    ) -> SessionProxyTarget | None:
+        """The shim's sandbox port over the same native TCP tunnel Hermes residents use."""
+        sandbox_id = str(runtime.backend_ref.get("id") or "")
+        if not sandbox_id:
+            return None
+        key = _openclaw_forwarder_key(runtime, sandbox_id)
+        forwarder = self._resident_forwarders.get(key)
+        if forwarder is None:
+            # A redeployed resident has a new sandbox: retire the old one's tunnel.
+            for stale in [k for k in self._resident_forwarders if _is_openclaw_key(k, runtime)]:
+                self._resident_forwarders.pop(stale).close()
+            forwarder = self._client.start_tcp_forward(sandbox_id=sandbox_id, target_port=port)
+            self._resident_forwarders[key] = forwarder
+        return SessionProxyTarget(
+            service_url=f"http://ravn-openclaw.internal:{port}/",
+            connect_host=forwarder.host,
+            connect_port=forwarder.port,
+        )
 
     def set_credential_store(self, store: CredentialStorePort) -> None:
         """Inject credential store for resolving OpenShell launch credentials."""
@@ -1731,6 +1861,7 @@ class OpenShellGatewayPodManager(
                 process_env["OPENCLAW_GATEWAY_TOKEN"] = machine_credential["gateway_token"]
             if runtime.engine is ResidentEngine.HERMES and machine_credential is not None:
                 process_env[HERMES_API_SERVER_KEY_ENV] = machine_credential["api_key"]
+            process_env.update(await self._resident_openclaw_environment(runtime, values))
             if resumed_deployment:
                 await self._launch_missing_resident_processes(ready.id, process_env, processes)
             else:
@@ -1766,6 +1897,7 @@ class OpenShellGatewayPodManager(
                 await self._credential_store.delete(
                     "resident", str(runtime.id), HERMES_CREDENTIAL_NAME
                 )
+            await self._forget_resident_openclaw_token(runtime)
             raise
 
         resolved_service_url = (service_url or self._gateway_public_url).rstrip("/")
@@ -1857,6 +1989,13 @@ class OpenShellGatewayPodManager(
                 and runtime.desired_state is ResidentDesiredState.RUNNING
             ):
                 await self._start_missing_resident_processes(runtime, values, sandbox, processes)
+            elif (
+                processes_ready
+                and runtime.backend_ref
+                and runtime.desired_state is ResidentDesiredState.RUNNING
+                and self._resident_openclaw_enabled(runtime, values)
+            ):
+                await self._start_resident_openclaw_shim(runtime, profile, values, sandbox)
         service_url = str(runtime.backend_ref.get("service_url") or "")
         if not service_url and runtime.engine is ResidentEngine.HERMES:
             service_url = HERMES_INTERNAL_SERVICE_URL
@@ -1935,6 +2074,7 @@ class OpenShellGatewayPodManager(
         env.update(resident_flock_environment(runtime))
         env.update(credential_context.environment)
         env.update(credential_context.process_environment)
+        env.update(await self._resident_openclaw_environment(runtime, values))
         if runtime.engine is ResidentEngine.OPENCLAW:
             if self._credential_store is None:
                 raise RuntimeError("OpenClaw residents require the configured credential store")
@@ -2021,9 +2161,13 @@ class OpenShellGatewayPodManager(
         runtime_id = str(runtime.id)
         self._service_urls.pop(runtime_id, None)
         self._resident_process_locks.pop(runtime_id, None)
-        forwarder = self._resident_forwarders.pop(runtime_id, None)
-        if forwarder is not None:
-            await asyncio.to_thread(forwarder.close)
+        self._resident_openclaw_checked.discard(runtime_id)
+        for key in [
+            key
+            for key in self._resident_forwarders
+            if key == runtime_id or _is_openclaw_key(key, runtime)
+        ]:
+            await asyncio.to_thread(self._resident_forwarders.pop(key).close)
         sandbox_name = self._resident_sandbox_name(runtime)
         grants = self._provider_grants.pop(runtime_id, ())
         if not grants:
@@ -2051,6 +2195,7 @@ class OpenShellGatewayPodManager(
             await self._credential_store.delete(
                 "resident", runtime_id, HERMES_LEGACY_CREDENTIAL_NAME
             )
+        await self._forget_resident_openclaw_token(runtime)
         return deleted
 
     async def logs(
@@ -2234,6 +2379,11 @@ class OpenShellGatewayPodManager(
         if runtime.engine is not ResidentEngine.RAVN:
             return {}
         realm_slug = await self._resolve_realm_slug(runtime)
+        ravn_config = _resident_ravn_config(
+            runtime, values, self._service_port, realm_slug, self._volundr_api_url
+        )
+        if self._resident_openclaw_enabled(runtime, values):
+            enable_resident_openclaw_shim(ravn_config, values)
         return {
             "/sandbox/.volundr/skuld.yaml": yaml.safe_dump(
                 _resident_skuld_config(
@@ -2244,12 +2394,7 @@ class OpenShellGatewayPodManager(
                 ),
                 sort_keys=False,
             ).encode(),
-            "/sandbox/.volundr/ravn.yaml": yaml.safe_dump(
-                _resident_ravn_config(
-                    runtime, values, self._service_port, realm_slug, self._volundr_api_url
-                ),
-                sort_keys=False,
-            ).encode(),
+            "/sandbox/.volundr/ravn.yaml": yaml.safe_dump(ravn_config, sort_keys=False).encode(),
         }
 
     async def _resolve_realm_slug(self, runtime: ResidentRuntime) -> str:
@@ -3654,6 +3799,32 @@ for name in {quoted}; do
   rm -f "$pid_file"
 done
 """
+
+
+def _resident_openclaw_port(values: dict[str, Any]) -> int:
+    resident = values.get("resident") if isinstance(values.get("resident"), dict) else {}
+    shim = resident.get("openclaw") if isinstance(resident.get("openclaw"), dict) else {}
+    return int(shim.get("port") or RAVN_OPENCLAW_PORT)
+
+
+def _resident_process_env_script(process_name: str, variable: str) -> str:
+    """Print one variable of a running resident process's environment, if set."""
+    pid_path = shlex.quote(f"/sandbox/.volundr/{process_name}.pid")
+    pattern = shlex.quote(f"s/^{variable}=//p")
+    return (
+        "set -eu\n"
+        f'pid="$(cat {pid_path})"\n'
+        f"tr '\\000' '\\n' < \"/proc/$pid/environ\" | sed -n {pattern}\n"
+    )
+
+
+def _openclaw_forwarder_key(runtime: ResidentRuntime, sandbox_id: str) -> str:
+    """A Ravn resident's shim tunnel to one sandbox, beside its skuld tunnel (its id)."""
+    return f"{runtime.id}:openclaw:{sandbox_id}"
+
+
+def _is_openclaw_key(key: str, runtime: ResidentRuntime) -> bool:
+    return key.startswith(f"{runtime.id}:openclaw:")
 
 
 def _resident_process_log_script(lines: int, sources: Sequence[str]) -> str:

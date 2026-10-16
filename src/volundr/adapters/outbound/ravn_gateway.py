@@ -5,15 +5,18 @@ Gateway that executes on Ravn, where every session key is its own Ravn
 conversation with its own transcript. So a Ravn resident's sessions are driven by
 the OpenClaw controller itself; this adapter supplies only what differs:
 
-* the route: the shim's port on the resident's in-cluster Service, not a backend
-  proxy target;
-* the token: each resident's shim checks its own token, HMAC-SHA256(master, resident
-  id). Volundr holds only the master (``gateway_token``) and hands the derivation to
-  the runtime controller, which writes that one resident's token into a Secret for
-  its pod; a pod never sees the master or another resident's token;
+* the route: the shim's own port in the resident's workload, which the owning
+  backend resolves (``ResidentOpenClawShimHost``: the resident's Service on Flux,
+  an OpenShell TCP forward on OpenShell), not the backend's skuld proxy target;
+* the token: each resident's shim checks its own token, generated per resident and
+  kept in Volundr's credential store like the Hermes residents' API keys
+  (``CredentialStoreOpenClawTokens``). The backend that deploys the resident hands
+  it to that one resident (a Secret for its pod on Flux, its process env on
+  OpenShell), adopting the token a running resident already has before ever minting
+  one; there is no cluster-wide master;
 * the machine identity: the shim trusts a device on first use behind that token, so
-  the device key is derived from the master and the resident id instead of being
-  minted and stored per resident;
+  the device key is derived from the resident's token instead of being minted and
+  stored per resident;
 * the participant: the resident itself, not NemoClaw.
 
 The resident's default room (its ``skuld-v1`` chat endpoint, session id = resident
@@ -24,10 +27,13 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
+import secrets
 from typing import Any
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from niuu.domain.models import SecretType
 from niuu.ports.credentials import CredentialStorePort
 from niuu.ports.session_proxy import SessionProxyTarget
 from volundr.adapters.outbound.openclaw_gateway import (
@@ -37,20 +43,58 @@ from volundr.adapters.outbound.openclaw_gateway import (
     _GatewayConnection,
     _new_machine_credential,
 )
-from volundr.domain.models import ResidentEngine, ResidentRuntime
+from volundr.domain.models import ResidentDeploymentProfile, ResidentEngine, ResidentRuntime
+from volundr.domain.ports import ResidentOpenClawShimHost, ResidentOpenClawTokens
 
-DEFAULT_SERVICE_HOST = "{release}-skuld.{namespace}.svc.cluster.local"
+logger = logging.getLogger(__name__)
+
 DEFAULT_SERVICE_PORT = 18790
+#: A Ravn resident's own shim token in the credential store: ("resident", id, name).
+RAVN_OPENCLAW_CREDENTIAL_NAME = "ravn-openclaw"
+_TOKEN_FIELD = "token"
 _DEVICE_SEED_CONTEXT = b"niuu-ravn-resident-openclaw-device:"
 
 
-def resident_openclaw_token(master: str, runtime: ResidentRuntime) -> str:
-    """The shim token of one resident: HMAC-SHA256(master, resident id), hex."""
-    return hmac.new(
-        master.encode("utf-8"),
-        str(runtime.id).encode("ascii"),
-        hashlib.sha256,
-    ).hexdigest()
+class CredentialStoreOpenClawTokens(ResidentOpenClawTokens):
+    """Each Ravn resident's own shim token, kept per resident in the credential store.
+
+    The same pattern as ``hermes_gateway.ensure_hermes_api_key``: generated once,
+    kept under ``("resident", <id>, "ravn-openclaw")``, removed with the resident.
+    """
+
+    def __init__(self, store: CredentialStorePort) -> None:
+        self._store = store
+
+    async def stored(self, runtime: ResidentRuntime) -> str | None:
+        existing = await self._store.get_value(
+            "resident", str(runtime.id), RAVN_OPENCLAW_CREDENTIAL_NAME
+        )
+        if not existing:
+            return None
+        token = existing.get(_TOKEN_FIELD)
+        if not token:
+            raise RuntimeError("Ravn resident shim credential is incomplete")
+        return token
+
+    async def ensure(self, runtime: ResidentRuntime, *, adopt: str | None = None) -> str:
+        token = await self.stored(runtime)
+        if token:
+            return token
+        token = adopt or secrets.token_urlsafe(32)
+        await self._store.store(
+            "resident",
+            str(runtime.id),
+            RAVN_OPENCLAW_CREDENTIAL_NAME,
+            SecretType.API_KEY,
+            {_TOKEN_FIELD: token},
+            metadata={"purpose": "ravn-openclaw-shim", "adopted": str(bool(adopt)).lower()},
+        )
+        if adopt:
+            logger.info("Adopted resident %s's running Ravn shim token", runtime.id)
+        return token
+
+    async def forget(self, runtime: ResidentRuntime) -> None:
+        await self._store.delete("resident", str(runtime.id), RAVN_OPENCLAW_CREDENTIAL_NAME)
 
 
 class RavnResidentSessionController(OpenClawResidentSessionController):
@@ -61,16 +105,23 @@ class RavnResidentSessionController(OpenClawResidentSessionController):
         runtime_controller: Any,
         credential_store: CredentialStorePort,
         *,
-        gateway_token: str = "",
-        service_host: str = DEFAULT_SERVICE_HOST,
         service_port: int = DEFAULT_SERVICE_PORT,
         retry_history_timeout_seconds: float = _RETRY_HISTORY_TIMEOUT_SECONDS,
         retry_history_poll_interval_seconds: float = _RETRY_HISTORY_POLL_INTERVAL_SECONDS,
+        gateway_token: str = "",
     ) -> None:
-        if not gateway_token:
+        if gateway_token:
+            logger.warning(
+                "RavnResidentSessionController ignores gateway_token: there is no Ravn "
+                "sessions master any more; each resident's shim token is its own, kept in "
+                "the credential store. Remove gateway_token (secretKwargs) from "
+                "residentRuntimeSessionControllers."
+            )
+        if not isinstance(runtime_controller, ResidentOpenClawShimHost):
             raise ValueError(
-                "RavnResidentSessionController requires gateway_token: the master secret "
-                "each Ravn resident's own OpenClaw shim token is derived from"
+                "RavnResidentSessionController needs a backend that hosts the Ravn OpenClaw "
+                f"shim ({getattr(runtime_controller, 'backend', runtime_controller)!r} does "
+                "not implement ResidentOpenClawShimHost)"
             )
         super().__init__(
             runtime_controller,
@@ -78,46 +129,36 @@ class RavnResidentSessionController(OpenClawResidentSessionController):
             retry_history_timeout_seconds=retry_history_timeout_seconds,
             retry_history_poll_interval_seconds=retry_history_poll_interval_seconds,
         )
-        self._gateway_token = gateway_token
-        self._service_host = service_host
+        self._shim_host: ResidentOpenClawShimHost = runtime_controller
         self._service_port = int(service_port)
-        # The backend that deploys the resident provisions the same per-resident token.
-        provision = getattr(runtime_controller, "set_resident_openclaw_tokens", None)
-        if callable(provision):
-            provision(self.resident_token)
-
-    def resident_token(self, runtime: ResidentRuntime) -> str:
-        """The token *runtime*'s shim checks (``RAVN_OPENCLAW_TOKEN`` in its pod)."""
-        return resident_openclaw_token(self._gateway_token, runtime)
+        # The backend that deploys the resident hands each resident its own token.
+        runtime_controller.set_resident_openclaw_tokens(
+            CredentialStoreOpenClawTokens(credential_store)
+        )
 
     @property
     def engine(self) -> ResidentEngine:
         return ResidentEngine.RAVN
 
+    def provides_sessions(self, profile: ResidentDeploymentProfile) -> bool:
+        """A profile that switches the shim off (resident.openclaw.enabled) has none."""
+        values = profile.deployment.get("values")
+        resident = values.get("resident") if isinstance(values, dict) else None
+        shim = resident.get("openclaw") if isinstance(resident, dict) else None
+        return not (isinstance(shim, dict) and shim.get("enabled") is False)
+
     def _proxy_target(self, runtime: ResidentRuntime) -> SessionProxyTarget | None:
-        namespace = str(runtime.backend_ref.get("namespace") or "")
-        release = str(runtime.backend_ref.get("name") or "")
-        if not namespace or not release:
-            return None
-        host = self._service_host.format(
-            release=release,
-            namespace=namespace,
-            runtime_id=runtime.id,
-        )
-        return SessionProxyTarget(
-            service_url=f"http://{host}:{self._service_port}/",
-            connect_host=host,
-            connect_port=self._service_port,
-        )
+        return self._shim_host.resident_openclaw_target(runtime, self._service_port)
 
     async def _machine_credentials(self, runtime: ResidentRuntime) -> dict[str, str]:
+        token = await self._shim_host.resident_openclaw_token(runtime)
         seed = hmac.new(
-            self._gateway_token.encode("utf-8"),
+            token.encode("utf-8"),
             _DEVICE_SEED_CONTEXT + str(runtime.id).encode("ascii"),
             hashlib.sha256,
         ).digest()
         credentials = _new_machine_credential(Ed25519PrivateKey.from_private_bytes(seed))
-        return {**credentials, "gateway_token": self.resident_token(runtime), "device_token": ""}
+        return {**credentials, "gateway_token": token, "device_token": ""}
 
     async def _remember_device_token(
         self,

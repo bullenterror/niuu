@@ -1887,40 +1887,56 @@ class TestFluxResidentPlatformTriggersAndBudget:
         assert "budget" not in values["resident"]
 
 
-_OPENCLAW_MASTER = "master-0a1b2c3d4e5f60718293a4b5c6d7e8f9"
-
-
 def _openclaw_profile() -> ResidentDeploymentProfile:
     profile = _resident_profile()
     profile.deployment["values"]["resident"]["openclaw"] = {"enabled": True}
     return profile
 
 
-def _bind_ravn_sessions(pod_manager: FluxPodManager) -> None:
-    """Wire the Ravn session controller the way composition does: it hands over the tokens."""
+def _bind_ravn_sessions(pod_manager: FluxPodManager, store=None):
+    """Wire the Ravn session controller the way composition does; returns its store."""
     from niuu.adapters.memory_credential_store import MemoryCredentialStore
     from volundr.adapters.outbound.ravn_gateway import RavnResidentSessionController
 
-    RavnResidentSessionController(
-        pod_manager, MemoryCredentialStore(), gateway_token=_OPENCLAW_MASTER
+    store = store or MemoryCredentialStore()
+    RavnResidentSessionController(pod_manager, store)
+    return store
+
+
+async def _kept_token(store, runtime) -> str | None:
+    kept = await store.get_value("resident", str(runtime.id), "ravn-openclaw")
+    return kept["token"] if kept else None
+
+
+def _volundr_shim_secret(runtime, token: str | None = None) -> SimpleNamespace:
+    """resident-<id>-openclaw as Volundr wrote it (before tokens were kept per resident)."""
+    import base64
+
+    return SimpleNamespace(
+        metadata=SimpleNamespace(
+            labels={
+                "app.kubernetes.io/managed-by": "volundr",
+                "niuu.world/resident-id": str(runtime.id),
+            }
+        ),
+        data={"token": base64.b64encode(token.encode()).decode()} if token else None,
     )
 
 
 class TestFluxResidentOpenClawToken:
-    """Each Ravn resident's shim gets its own derived token Secret; never the master."""
+    """Each Ravn resident's shim gets its own token Secret; no cluster-wide master."""
 
-    async def test_deploy_writes_the_residents_own_token_before_the_release(
+    async def test_deploy_generates_the_residents_own_token_before_the_release(
         self,
         pod_manager: FluxPodManager,
         mock_api,
         core_api: AsyncMock,
     ) -> None:
-        import hashlib
-        import hmac
         import json
 
-        _bind_ravn_sessions(pod_manager)
+        store = _bind_ravn_sessions(pod_manager)
         runtime = _resident_runtime()
+        core_api.read_namespaced_secret.side_effect = _ApiError(404)
         order: list[str] = []
         core_api.create_namespaced_secret.side_effect = lambda **kwargs: order.append(
             kwargs["body"]["metadata"]["name"]
@@ -1934,10 +1950,9 @@ class TestFluxResidentOpenClawToken:
         name = f"resident-{runtime.id}-openclaw"
         assert order == [name, f"resident-{runtime.id}"]
         secret = core_api.create_namespaced_secret.call_args.kwargs["body"]
-        expected = hmac.new(
-            _OPENCLAW_MASTER.encode(), str(runtime.id).encode(), hashlib.sha256
-        ).hexdigest()
-        assert secret["stringData"] == {"token": expected}
+        kept = await _kept_token(store, runtime)
+        assert kept and len(kept) >= 32
+        assert secret["stringData"] == {"token": kept}
         assert secret["metadata"]["namespace"] == "test-ns"
         assert secret["metadata"]["labels"] == {
             "app.kubernetes.io/managed-by": "volundr",
@@ -1950,23 +1965,139 @@ class TestFluxResidentOpenClawToken:
             "enabled": True,
             "tokenSecret": {"name": name, "key": "token"},
         }
-        rendered = json.dumps(values)
-        assert _OPENCLAW_MASTER not in rendered
-        assert expected not in rendered
+        assert kept not in json.dumps(values)
 
-    async def test_no_secret_without_resident_openclaw(
+    async def test_a_running_resident_keeps_the_token_its_secret_has(
+        self,
+        pod_manager: FluxPodManager,
+        mock_api,
+        core_api: AsyncMock,
+    ) -> None:
+        """Migration: the HMAC-derived token Volundr wrote before is adopted, unchanged."""
+        store = _bind_ravn_sessions(pod_manager)
+        runtime = _resident_runtime()
+        legacy = "a" * 64
+        core_api.read_namespaced_secret.return_value = _volundr_shim_secret(runtime, legacy)
+        core_api.create_namespaced_secret.side_effect = _ApiError(409)
+        with patch.object(pod_manager, "_get_api", return_value=mock_api):
+            await pod_manager.deploy(runtime, _openclaw_profile())
+
+        assert await _kept_token(store, runtime) == legacy
+        core_api.patch_namespaced_secret.assert_awaited_once_with(
+            name=f"resident-{runtime.id}-openclaw",
+            namespace="test-ns",
+            body={"stringData": {"token": legacy}},
+        )
+        # The session controller dials the shim with that same token, before any redeploy.
+        assert await pod_manager.resident_openclaw_token(runtime) == legacy
+
+    async def test_dialing_adopts_the_secrets_token_before_any_redeploy(
+        self, pod_manager: FluxPodManager, core_api: AsyncMock
+    ) -> None:
+        store = _bind_ravn_sessions(pod_manager)
+        runtime = _resident_runtime()
+        core_api.read_namespaced_secret.return_value = _volundr_shim_secret(runtime, "b" * 64)
+
+        assert await pod_manager.resident_openclaw_token(runtime) == "b" * 64
+        assert await _kept_token(store, runtime) == "b" * 64
+
+    async def test_a_foreign_secrets_token_is_never_adopted(
+        self, pod_manager: FluxPodManager, core_api: AsyncMock
+    ) -> None:
+        store = _bind_ravn_sessions(pod_manager)
+        runtime = _resident_runtime()
+        foreign = _volundr_shim_secret(_resident_runtime(), "c" * 64)
+        core_api.read_namespaced_secret.return_value = foreign
+
+        token = await pod_manager.resident_openclaw_token(runtime)
+        assert token != "c" * 64 and token == await _kept_token(store, runtime)
+
+    async def test_the_kept_token_survives_volundr_restarts_and_redeploys(
+        self,
+        pod_manager: FluxPodManager,
+        mock_api,
+        core_api: AsyncMock,
+    ) -> None:
+        store = _bind_ravn_sessions(pod_manager)
+        runtime = _resident_runtime()
+        core_api.read_namespaced_secret.side_effect = _ApiError(404)
+        first = await pod_manager.resident_openclaw_token(runtime)
+        core_api.read_namespaced_secret.reset_mock()
+
+        # A restarted Volundr: a new controller wiring over the same credential store.
+        _bind_ravn_sessions(pod_manager, store)
+        with patch.object(pod_manager, "_get_api", return_value=mock_api):
+            await pod_manager.deploy(runtime, _openclaw_profile())
+            await pod_manager.deploy(runtime, _openclaw_profile())
+
+        assert await pod_manager.resident_openclaw_token(runtime) == first
+        for call in core_api.create_namespaced_secret.call_args_list:
+            assert call.kwargs["body"]["stringData"] == {"token": first}
+        # Kept: the Secret is never read to adopt a token again.
+        core_api.read_namespaced_secret.assert_not_awaited()
+
+    async def test_shim_is_on_by_default_wherever_ravn_sessions_are_wired(
+        self,
+        pod_manager: FluxPodManager,
+        mock_api,
+        core_api: AsyncMock,
+    ) -> None:
+        """A profile need not mention resident.openclaw: channels follow from the wiring."""
+        _bind_ravn_sessions(pod_manager)
+        runtime = _resident_runtime()
+        core_api.read_namespaced_secret.side_effect = _ApiError(404)
+        with patch.object(pod_manager, "_get_api", return_value=mock_api):
+            await pod_manager.deploy(runtime, _resident_profile())
+
+        core_api.create_namespaced_secret.assert_awaited_once()
+        values = mock_api.create_namespaced_custom_object.call_args.kwargs["body"]["spec"]["values"]
+        assert values["resident"]["openclaw"] == {
+            "enabled": True,
+            "tokenSecret": {"name": f"resident-{runtime.id}-openclaw", "key": "token"},
+        }
+
+    async def test_a_profile_can_switch_the_shim_off(
         self,
         pod_manager: FluxPodManager,
         mock_api,
         core_api: AsyncMock,
     ) -> None:
         _bind_ravn_sessions(pod_manager)
+        profile = _resident_profile()
+        profile.deployment["values"]["resident"]["openclaw"] = {"enabled": False}
+        with patch.object(pod_manager, "_get_api", return_value=mock_api):
+            await pod_manager.deploy(_resident_runtime(), profile)
+
+        core_api.create_namespaced_secret.assert_not_awaited()
+        values = mock_api.create_namespaced_custom_object.call_args.kwargs["body"]["spec"]["values"]
+        assert values["resident"]["openclaw"] == {"enabled": False}
+
+    async def test_shim_is_explicitly_off_without_ravn_sessions(
+        self,
+        pod_manager: FluxPodManager,
+        mock_api,
+        core_api: AsyncMock,
+    ) -> None:
+        """The skuld chart turns the shim on by default; Volundr decides per resident."""
         with patch.object(pod_manager, "_get_api", return_value=mock_api):
             await pod_manager.deploy(_resident_runtime(), _resident_profile())
 
         core_api.create_namespaced_secret.assert_not_awaited()
         values = mock_api.create_namespaced_custom_object.call_args.kwargs["body"]["spec"]["values"]
-        assert "openclaw" not in values["resident"]
+        assert values["resident"]["openclaw"] == {"enabled": False}
+
+    def test_routes_to_the_shim_port_on_the_residents_service(
+        self, pod_manager: FluxPodManager
+    ) -> None:
+        runtime = _resident_runtime(
+            backend_ref={"namespace": "skuld", "name": "resident-abc"},
+        )
+        target = pod_manager.resident_openclaw_target(runtime, 18790)
+        host = "resident-abc-skuld.skuld.svc.cluster.local"
+        assert target is not None
+        assert target.service_url == f"http://{host}:18790/"
+        assert (target.connect_host, target.connect_port) == (host, 18790)
+        assert pod_manager.resident_openclaw_target(_resident_runtime(), 18790) is None
 
     async def test_openclaw_without_a_ravn_session_controller_fails_the_deploy(
         self,
@@ -2038,12 +2169,15 @@ class TestFluxResidentOpenClawToken:
         core_api: AsyncMock,
     ) -> None:
         runtime = _resident_runtime()
-        _bind_ravn_sessions(pod_manager)
+        store = _bind_ravn_sessions(pod_manager)
+        core_api.read_namespaced_secret.side_effect = _ApiError(404)
+        await pod_manager.resident_openclaw_token(runtime)
         with patch.object(pod_manager, "_get_api", return_value=mock_api):
             await pod_manager.delete(runtime)
             core_api.delete_namespaced_secret.assert_awaited_once_with(
                 name=f"resident-{runtime.id}-openclaw", namespace="test-ns"
             )
+            assert await _kept_token(store, runtime) is None
             core_api.delete_namespaced_secret.side_effect = _ApiError(404)
             await pod_manager.delete(runtime)
 

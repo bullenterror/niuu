@@ -909,6 +909,57 @@ class ResidentRuntimeProxyTargetResolver(ABC):
         """Resolve the backend service reached by the shared session proxy."""
 
 
+class ResidentOpenClawTokens(ABC):
+    """Each Ravn resident's own OpenClaw shim token, kept per resident.
+
+    No cluster-wide master: a resident's token is its own, generated once (or adopted
+    from the resident's running workload) and removed with the resident.
+    """
+
+    @abstractmethod
+    async def stored(self, runtime: ResidentRuntime) -> str | None:
+        """The resident's kept token; None before it has one."""
+
+    @abstractmethod
+    async def ensure(self, runtime: ResidentRuntime, *, adopt: str | None = None) -> str:
+        """The kept token; else keep ``adopt`` (the one the resident runs with) or a new one."""
+
+    @abstractmethod
+    async def forget(self, runtime: ResidentRuntime) -> None:
+        """Remove the resident's token (the resident is gone)."""
+
+
+class ResidentOpenClawShimHost(ABC):
+    """Optional backend port: the backend runs a Ravn resident's OpenClaw shim.
+
+    A Ravn resident's sessions ("channels") are served by Ravn's OpenClaw-protocol
+    shim inside the resident's own workload. A backend that implements this port
+    starts the shim with the resident's own token and routes Völundr to its port,
+    so Völundr wires Ravn sessions on it by default
+    (``RavnResidentSessionController``).
+    """
+
+    @abstractmethod
+    def set_resident_openclaw_tokens(self, tokens: ResidentOpenClawTokens) -> None:
+        """Where each Ravn resident's own shim token is kept."""
+
+    @abstractmethod
+    async def resident_openclaw_token(self, runtime: ResidentRuntime) -> str:
+        """The token the resident's shim checks.
+
+        The kept one; else the one the resident's running workload already has
+        (adopted, so a running resident keeps its sessions); else a new one.
+        """
+
+    @abstractmethod
+    def resident_openclaw_target(
+        self,
+        runtime: ResidentRuntime,
+        port: int,
+    ) -> SessionProxyTarget | None:
+        """Route to the resident's shim on ``port``; None before the backend reports it."""
+
+
 class ResidentDeviceApprover(ABC):
     """Optional runtime capability for approving resident engine devices."""
 
@@ -962,6 +1013,24 @@ class ResidentSessionController(ABC):
     @abstractmethod
     def engine(self) -> ResidentEngine:
         """Return the resident engine implemented by this controller."""
+
+    @property
+    def runtime_backend(self) -> ResidentBackend | None:
+        """The backend whose residents this controller drives; None drives any backend.
+
+        A controller bound to one runtime controller names its backend, so one
+        engine can have a controller per backend (Ravn on Flux and on OpenShell).
+        """
+        return None
+
+    def provides_sessions(self, profile: ResidentDeploymentProfile) -> bool:
+        """Whether residents of ``profile`` get sessions from this controller.
+
+        The resident session capabilities (session.list/create/delete) follow from
+        this; a controller whose engine can switch its session API off per profile
+        says so here.
+        """
+        return True
 
     @abstractmethod
     async def list_sessions(self, runtime: ResidentRuntime) -> list[ResidentSession]:

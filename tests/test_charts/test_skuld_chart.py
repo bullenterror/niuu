@@ -1683,9 +1683,31 @@ class TestResidentOpenClawSessions:
         "networkPolicy": {"enabled": True},
     }
 
-    def test_absent_by_default(self, tmp_path: Path) -> None:
+    def test_on_by_default_with_the_releases_own_token_secret(self, tmp_path: Path) -> None:
         rendered = _render_skuld_chart(
             tmp_path, {"resident": {"enabled": True, "persona": "product-steward"}}
+        )
+        assert _ravn_config_from_rendered(rendered)["gateway"]["channels"]["openclaw"]["enabled"]
+        ravn = next(
+            c
+            for c in _deployment_from_rendered(rendered)["spec"]["template"]["spec"]["containers"]
+            if c["name"] == "ravn"
+        )
+        token = next(e for e in ravn["env"] if e["name"] == "RAVN_OPENCLAW_TOKEN")
+        # Volundr's resident-<id>-openclaw for release resident-<id>.
+        assert token["valueFrom"]["secretKeyRef"]["name"].endswith("-openclaw")
+        assert token["valueFrom"]["secretKeyRef"]["key"] == "token"
+
+    def test_absent_when_switched_off(self, tmp_path: Path) -> None:
+        rendered = _render_skuld_chart(
+            tmp_path,
+            {
+                "resident": {
+                    "enabled": True,
+                    "persona": "product-steward",
+                    "openclaw": {"enabled": False},
+                }
+            },
         )
         assert "openclaw" not in _ravn_config_from_rendered(rendered)["gateway"]["channels"]
         assert "ravn-openclaw" not in rendered
@@ -1725,27 +1747,35 @@ class TestResidentOpenClawSessions:
         policy = next(d for d in documents if d["kind"] == "NetworkPolicy")
         assert {"ports": [{"protocol": "TCP", "port": 18790}]} in policy["spec"]["ingress"]
 
-    def test_requires_a_token_secret(self, tmp_path: Path) -> None:
+    def test_token_secret_defaults_to_the_releases_own(self) -> None:
         helm = shutil.which("helm")
         if not helm:
             pytest.skip("helm is not installed")
-        values_file = tmp_path / "values.yaml"
-        values_file.write_text(
-            yaml.safe_dump(
-                {
-                    "resident": {
-                        "enabled": True,
-                        "persona": "product-steward",
-                        "openclaw": {"enabled": True},
-                    }
-                }
-            ),
-            encoding="utf-8",
-        )
         result = subprocess.run(
-            [helm, "template", "skuld-test", str(CHART_DIR), "-f", str(values_file)],
+            [
+                helm,
+                "template",
+                "resident-abc",
+                str(CHART_DIR),
+                "--set",
+                "resident.enabled=true",
+                "--set",
+                "resident.persona=product-steward",
+            ],
             capture_output=True,
             text=True,
+            check=True,
         )
-        assert result.returncode != 0
-        assert "resident.openclaw.tokenSecret.name is required" in result.stderr
+        deployment = next(
+            doc
+            for doc in yaml.safe_load_all(result.stdout)
+            if isinstance(doc, dict) and doc.get("kind") == "Deployment"
+        )
+        ravn = next(
+            c for c in deployment["spec"]["template"]["spec"]["containers"] if c["name"] == "ravn"
+        )
+        token = next(e for e in ravn["env"] if e["name"] == "RAVN_OPENCLAW_TOKEN")
+        assert token["valueFrom"]["secretKeyRef"] == {
+            "name": "resident-abc-openclaw",
+            "key": "token",
+        }
