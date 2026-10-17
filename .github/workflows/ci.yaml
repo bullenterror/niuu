@@ -773,3 +773,96 @@ jobs:
           # untrusted input (inference only). Remove once upstream ships a fix.
           # Keep dependency review strict elsewhere while allowing these upstream-only cases.
           allow-ghsas: GHSA-v2v4-37r5-5v8g, GHSA-rrmf-rvhw-rf47
+
+  # ---------------------------------------------------------------------------
+  # CI gate — the one check a ruleset on dev requires. Runs even when an
+  # upstream job failed or was cancelled (a skipped required check counts as
+  # passing), and passes only when every job the tier and the change set
+  # called for succeeded. A job may be skipped only when `changes` said it
+  # should not run: a light-tier PR skips containers, scan, the smoke test and
+  # the charts; a fork PR skips scan and the smoke test; the path filter
+  # skips the Python and web-next jobs on light-tier PRs that do not touch
+  # them. `changes` itself must succeed, or every skip would look legitimate.
+  # ---------------------------------------------------------------------------
+  ci-gate:
+    name: ci-gate
+    needs:
+      - changes
+      - python
+      - python-integration-test-volundr
+      - python-integration-test-ting
+      - python-integration-test-sleipnir
+      - web-next
+      - web-next-consumer-e2e
+      - helm-lint
+      - helm-smoke-test
+      - containers
+      - build-charts
+      - scan
+      - dependency-review
+    if: always()
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      - name: Check every required job
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          PYTHON: ${{ needs.changes.outputs.python }}
+          WEB_NEXT: ${{ needs.changes.outputs.web_next }}
+          HELM: ${{ needs.changes.outputs.helm }}
+          HAS_CONTAINERS: ${{ needs.changes.outputs.has_containers }}
+          TIER: ${{ needs.changes.outputs.tier }}
+          PUBLISH: ${{ needs.changes.outputs.publish }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+
+          needs = json.loads(os.environ["NEEDS"])
+          on = lambda name: os.environ.get(name) == "true"
+          full = os.environ.get("TIER") == "full"
+          publish = on("PUBLISH")
+
+          # Mirrors each job's `if:` above. Keep the two in step: a job
+          # missing here fails the gate rather than passing unchecked.
+          expected = {
+              "changes": True,
+              "python": on("PYTHON"),
+              "python-integration-test-volundr": on("PYTHON"),
+              "python-integration-test-ting": on("PYTHON"),
+              "python-integration-test-sleipnir": on("PYTHON"),
+              "web-next": on("WEB_NEXT"),
+              "web-next-consumer-e2e": on("WEB_NEXT"),
+              "helm-lint": True,
+              "helm-smoke-test": full and on("HELM") and publish,
+              "containers": full and on("HAS_CONTAINERS"),
+              "build-charts": full and on("HELM"),
+              "scan": full and on("HAS_CONTAINERS") and publish,
+              "dependency-review": True,
+          }
+
+          failed = []
+          for job, info in sorted(needs.items()):
+              result = info["result"]
+              if job not in expected:
+                  failed.append(f"{job}: {result} (not listed in the gate)")
+              elif expected[job] and result != "success":
+                  failed.append(f"{job}: {result} (required)")
+              elif not expected[job] and result not in ("skipped", "success"):
+                  failed.append(f"{job}: {result}")
+              else:
+                  state = "required" if expected[job] else "not required"
+                  print(f"ok  {job}: {result} ({state})")
+
+          if failed:
+              for line in failed:
+                  print(f"::error title=ci-gate::{line}")
+              raise SystemExit(1)
+          print("All required jobs passed.")
+          PY
