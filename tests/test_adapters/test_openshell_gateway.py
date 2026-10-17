@@ -2069,17 +2069,36 @@ async def test_resident_delete_retains_provider_grants_until_sandbox_is_gone(
     runtime = _resident_runtime()
     client = _FakeOpenShellGatewayClient(adapter)
     client.created = {"providers": ("volundr-provider",)}
-    client.delete_polls_remaining = 1
+    client.delete_polls_remaining = 10**9
+    monkeypatch.setattr(adapter.asyncio, "sleep", AsyncMock())
     manager = adapter.OpenShellGatewayPodManager(
         client=client,
         resource_delete_timeout=0,
+        resident_sandbox_delete_timeout_seconds=0.01,
     )
 
-    with pytest.raises(RuntimeError, match="was not deleted within 0s"):
+    # A resident's sandbox is waited for as long as a resident's takes, not a session's.
+    with pytest.raises(RuntimeError, match="was not deleted within 0.01s"):
         await manager.delete(runtime)
 
     assert client.deleted_grants == []
-    assert client.cleanup_events == ["sandbox-present"]
+    assert set(client.cleanup_events) == {"sandbox-present"}
+
+
+@pytest.mark.asyncio
+async def test_sessions_keep_the_short_delete_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter = _import_adapter(monkeypatch)
+    client = _FakeOpenShellGatewayClient(adapter)
+    client.delete_polls_remaining = 10**9
+    monkeypatch.setattr(adapter.asyncio, "sleep", AsyncMock())
+    manager = adapter.OpenShellGatewayPodManager(
+        client=client,
+        resource_delete_timeout=0.01,
+        resident_sandbox_delete_timeout_seconds=180,
+    )
+
+    with pytest.raises(RuntimeError, match="was not deleted within 0.01s"):
+        await manager._cleanup_resources("s-session", ())
 
 
 @pytest.mark.asyncio
