@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import io
+import json
 import logging
 import os
 import re
@@ -20,13 +21,18 @@ from tests.test_adapters.test_openshell_gateway import (
     _FakeCredentialStore,
     _FakeOpenShellGatewayClient,
     _FakeWorkloadTokenIssuer,
+    _hermes_profile,
+    _hermes_runtime,
     _import_adapter,
     _resident_profile,
     _resident_runtime,
 )
 from volundr.adapters.outbound import openshell_resident_workspace as workspace_module
 from volundr.domain.models import (
+    ResidentBackend,
+    ResidentCapability,
     ResidentDeploymentProfile,
+    ResidentEngine,
     ResidentObservedState,
 )
 
@@ -133,6 +139,10 @@ class _Sandbox:
         self.workspace: dict[str, bytes] = workspace if workspace is not None else {}
         self.running = False
         self.links: dict[str, str] = {}
+        #: A plain directory at the workspace path, off the claim (relative path -> bytes).
+        self.stray: dict[str, bytes] | None = None
+        #: What the link step moved aside: path -> its files.
+        self.aside: dict[str, dict[str, bytes]] = {}
 
 
 class _SandboxFleetClient(_FakeOpenShellGatewayClient):
@@ -221,13 +231,26 @@ class _SandboxFleetClient(_FakeOpenShellGatewayClient):
     # -- files and processes ---------------------------------------------------------
     def _resolve(self, sandbox: _Sandbox, path: str) -> tuple[dict[str, bytes], str]:
         if path == WORKSPACE or path.startswith(f"{WORKSPACE}/"):
-            return sandbox.workspace, path[len(WORKSPACE) :].strip("/")
+            store = sandbox.stray if sandbox.stray is not None else sandbox.workspace
+            return store, path[len(WORKSPACE) :].strip("/")
         return sandbox.home, path
+
+    def _extract_like_gnu_tar(self, sandbox: _Sandbox, files: dict[str, bytes]) -> None:
+        """GNU tar replaces a symlink with a new directory for a directory entry of its name."""
+        for root, data in self._adapter._credential_file_archives(files):
+            with tarfile.open(fileobj=io.BytesIO(data), mode="r") as tar:
+                for member in tar.getmembers():
+                    path = f"{root.rstrip('/')}/{member.name}"
+                    if member.isdir() and path in sandbox.links:
+                        del sandbox.links[path]
+                        if path == WORKSPACE:
+                            sandbox.stray = {}
 
     def write_files(self, *, sandbox_id: str, files: dict[str, bytes]) -> None:
         self.written_files.append({"sandbox_id": sandbox_id, "files": files})
         sandbox = self.by_id(sandbox_id)
         self.events.append(f"written:{sandbox.name}")
+        self._extract_like_gnu_tar(sandbox, files)
         if self.fail_writes.get(sandbox.name):
             self.fail_writes[sandbox.name] -= 1
             raise RuntimeError(
@@ -269,12 +292,22 @@ class _SandboxFleetClient(_FakeOpenShellGatewayClient):
             sandbox.workspace.clear()
             self.events.append(f"cleared:{sandbox.name}")
             return 0, ""
+        if "echo mounted" in script:  # the workspace link's state
+            if sandbox.links.get(WORKSPACE) == VOLUME:
+                return 0, "linked\n"
+            return 0, "directory\n" if sandbox.stray is not None else "missing\n"
         if "ln -s" in script:
             link = re.search(r"link=(\S+)", script).group(1)
             target = re.search(r"target=(\S+)", script).group(1)
+            output = ""
+            if link == WORKSPACE and sandbox.stray is not None and link not in sandbox.links:
+                aside = f"{WORKSPACE}.pre-link-20261017T172900Z"
+                sandbox.aside[aside] = sandbox.stray
+                sandbox.stray = None
+                output = f"moved-aside={aside}\n"
             sandbox.links[link] = target
             self.events.append(f"linked:{sandbox.name}:{link}")
-            return 0, ""
+            return 0, output
         return 0, ""
 
     def _tree(self, sandbox: _Sandbox, source: str) -> dict[str, bytes] | None:
@@ -871,6 +904,7 @@ async def test_resident_already_on_its_claim_is_untouched(monkeypatch):
     runtime = _resident_runtime()
     sandbox = harness.old_sandbox(runtime, image=TARGET_IMAGE)
     sandbox.annotations["volundr.niuu.io/workspace-claim"] = _claim_name(runtime)
+    sandbox.links[WORKSPACE] = VOLUME
     runtime = _running(runtime, sandbox.name)
 
     observation = await harness.manager.reconcile(runtime, _resident_profile())
@@ -1525,11 +1559,12 @@ async def test_restart_on_the_claim_keeps_ravn_home_on_it(monkeypatch):
     runtime = _resident_runtime()
     sandbox = harness.old_sandbox(runtime, image=TARGET_IMAGE)
     sandbox.annotations["volundr.niuu.io/workspace-claim"] = _claim_name(runtime)
+    sandbox.links[WORKSPACE] = VOLUME
     runtime = _running(runtime, sandbox.name)
 
     observation = await harness.manager.restart(runtime, _resident_profile())
 
-    assert sandbox.links == {"/sandbox/.ravn": f"{WORKSPACE}/.ravn-home"}
+    assert sandbox.links == {WORKSPACE: VOLUME, "/sandbox/.ravn": f"{WORKSPACE}/.ravn-home"}
     assert harness.events.index(f"stopped:{sandbox.name}") < harness.events.index(
         f"linked:{sandbox.name}:/sandbox/.ravn"
     )
@@ -1815,7 +1850,7 @@ def _gnu_stat() -> bool:
 
 
 @pytest.mark.skipif(not _gnu_stat(), reason="the sandbox images ship GNU stat")
-def test_workspace_link_points_at_the_volume_and_never_replaces_state(monkeypatch, tmp_path):
+def test_workspace_link_points_at_the_volume_and_never_replaces_another_link(monkeypatch, tmp_path):
     adapter = _import_adapter(monkeypatch)
     volume = tmp_path / "volume"
     volume.mkdir()
@@ -1832,10 +1867,253 @@ def test_workspace_link_points_at_the_volume_and_never_replaces_state(monkeypatc
     assert _run_script(script).returncode == 0
     assert link.is_symlink()
 
+    # A link somewhere else is never replaced.
     link.unlink()
-    link.mkdir()
-    (link / "state.db").write_bytes(b"real state")
+    link.symlink_to(tmp_path)
     result = _run_script(script)
     assert result.returncode == 1
-    assert b"refusing to replace it" in result.stderr
-    assert (link / "state.db").read_bytes() == b"real state"
+    assert b"not " in result.stderr
+    assert os.readlink(link) == str(tmp_path)
+
+
+# -- every engine runs on its volume: the workspace link survives file projection ------
+
+OPENCLAW_CONFIG = f"{WORKSPACE}/.openclaw/openclaw.json"
+
+
+def _openclaw_runtime():
+    return _resident_runtime().model_copy(
+        update={
+            "engine": ResidentEngine.OPENCLAW,
+            "profile_id": "nemoclaw-openshell",
+            "model": "niuu/nvidia/nemotron-3-super",
+        }
+    )
+
+
+def _openclaw_profile() -> ResidentDeploymentProfile:
+    config = {
+        "gateway": {"bind": "loopback", "mode": "local"},
+        "agents": {"defaults": {"workspace": WORKSPACE}},
+        "models": {"providers": {"niuu": {"baseUrl": "http://bifrost.example.test/v1"}}},
+    }
+    return ResidentDeploymentProfile(
+        id="nemoclaw-openshell",
+        display_name="NemoClaw",
+        backend=ResidentBackend.OPENSHELL,
+        engine=ResidentEngine.OPENCLAW,
+        capabilities=[ResidentCapability.CHAT, ResidentCapability.RUNTIME_RESTART],
+        deployment={
+            "values": {
+                "image": "ghcr.io/nvidia/openshell-community/sandboxes/openclaw@sha256:abc",
+                "openshell": {
+                    "processMode": "replace",
+                    "service": {"name": "openclaw", "port": 18789},
+                    "processes": [
+                        {
+                            "name": "openclaw",
+                            "command": ["openclaw", "gateway", "run"],
+                            "logPath": "/sandbox/.volundr/openclaw.log",
+                            "files": {OPENCLAW_CONFIG: json.dumps(config)},
+                        }
+                    ],
+                },
+            }
+        },
+    )
+
+
+_ENGINES = {
+    "ravn": (_resident_runtime, _resident_profile, "/sandbox/.volundr/ravn.yaml"),
+    "openclaw": (_openclaw_runtime, _openclaw_profile, OPENCLAW_CONFIG),
+    "hermes": (_hermes_runtime, _hermes_profile, f"{WORKSPACE}/.hermes/config.yaml"),
+}
+
+
+def test_file_projection_never_carries_a_directory_entry_for_a_link(monkeypatch):
+    adapter = _import_adapter(monkeypatch)
+    archives = adapter._credential_file_archives(
+        {
+            OPENCLAW_CONFIG: b"{}",
+            f"{WORKSPACE}/.hermes/config.yaml": b"model: x",
+            "/sandbox/.ravn/skills/note.md": b"skill",
+            "/sandbox/.volundr/ravn.yaml": b"rendered",
+        }
+    )
+
+    ((root, data),) = archives
+    assert root == "/sandbox"
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r") as tar:
+        directories = {member.name for member in tar.getmembers() if member.isdir()}
+        files = {member.name for member in tar.getmembers() if member.isfile()}
+    # GNU tar would replace the workspace and ~/.ravn links with new directories.
+    assert "workspace" not in directories
+    assert ".ravn" not in directories
+    assert {"workspace/.openclaw", "workspace/.hermes", ".ravn/skills", ".volundr"} <= directories
+    assert "workspace/.openclaw/openclaw.json" in files
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("engine", sorted(_ENGINES))
+async def test_every_engine_runs_on_its_volume(monkeypatch, engine):
+    harness = _Harness(monkeypatch)
+    make_runtime, make_profile, config = _ENGINES[engine]
+    runtime = make_runtime()
+
+    observation = await harness.manager.deploy(runtime, make_profile())
+
+    sandbox = harness.client.sandboxes[observation.backend_ref["name"]]
+    assert sandbox.links[WORKSPACE] == VOLUME
+    assert sandbox.stray is None
+    assert harness.events.index(f"linked:{sandbox.name}:{WORKSPACE}") < harness.events.index(
+        f"written:{sandbox.name}"
+    )
+    files = harness.client.claim_files[_claim_name(runtime)]
+    if config.startswith(f"{WORKSPACE}/"):
+        # The engine's configuration landed on the volume, through the link.
+        assert config.removeprefix(f"{WORKSPACE}/") in files
+    assert observation.backend_ref["workspace_claim"] == _claim_name(runtime)
+    assert observation.observed_state is ResidentObservedState.ACTIVE
+
+
+@pytest.mark.asyncio
+async def test_an_existing_directory_at_the_workspace_is_moved_aside_and_linked(monkeypatch):
+    harness = _Harness(monkeypatch)
+    runtime = _openclaw_runtime()
+    real = {"AGENTS.md": b"# agents", ".openclaw/agents/main/agent/models.json": b"{}"}
+    harness.client.claim_files[_claim_name(runtime)] = dict(real)
+    original = harness.client.create_sandbox
+
+    def create_with_a_workspace_directory(**kwargs):
+        created = original(**kwargs)
+        # The image (or its runtime) made /sandbox/workspace before Völundr linked it.
+        harness.client.sandboxes[kwargs["name"]].stray = {"leftover.txt": b"from the image"}
+        return created
+
+    harness.client.create_sandbox = create_with_a_workspace_directory
+
+    observation = await harness.manager.deploy(runtime, _openclaw_profile())
+
+    sandbox = harness.client.sandboxes[observation.backend_ref["name"]]
+    assert sandbox.links[WORKSPACE] == VOLUME
+    assert sandbox.aside == {
+        f"{WORKSPACE}.pre-link-20261017T172900Z": {"leftover.txt": b"from the image"}
+    }
+    files = harness.client.claim_files[_claim_name(runtime)]
+    assert files["AGENTS.md"] == b"# agents"
+    assert "leftover.txt" not in files
+
+
+async def _off_its_volume(harness, runtime, profile):
+    """Deploy a resident, then leave its workspace a plain directory, as on Noatun."""
+    observation = await harness.manager.deploy(runtime, profile)
+    sandbox = harness.client.sandboxes[observation.backend_ref["name"]]
+    del sandbox.links[WORKSPACE]
+    sandbox.stray = {".openclaw/openclaw.json": b"{}", ".openclaw/update-check.json": b"{}"}
+    harness.manager._linked_workspaces.clear()  # as after Völundr restarts
+    return runtime.model_copy(update={"backend_ref": observation.backend_ref}), sandbox
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("engine", ["openclaw", "hermes"])
+async def test_reconcile_puts_a_resident_off_its_volume_back_on_it(monkeypatch, engine):
+    harness = _Harness(monkeypatch)
+    make_runtime, make_profile, _ = _ENGINES[engine]
+    runtime, profile = make_runtime(), make_profile()
+    claim = _claim_name(runtime)
+    harness.client.claim_files[claim] = {"AGENTS.md": b"# agents", "memory/notes.md": b"kept"}
+    running, sandbox = await _off_its_volume(harness, runtime, profile)
+    state_before = {
+        key: value
+        for key, value in harness.client.claim_files[claim].items()
+        if key in ("AGENTS.md", "memory/notes.md")
+    }
+    repair_from = len(harness.events)
+
+    observation = await harness.manager.reconcile(running, profile)
+
+    repair = harness.events[repair_from:]
+    # Stop, move the stray directory aside, link, project the files, start again.
+    assert repair.index(f"stopped:{sandbox.name}") < repair.index(
+        f"linked:{sandbox.name}:{WORKSPACE}"
+    )
+    assert repair.index(f"linked:{sandbox.name}:{WORKSPACE}") < repair.index(
+        f"written:{sandbox.name}"
+    )
+    assert repair.index(f"written:{sandbox.name}") < repair.index(f"launched:{sandbox.name}")
+    assert not any(event.startswith(("archived:", "restored:", "cleared:")) for event in repair)
+    assert not any(event.startswith(("created:", "deleted:")) for event in repair)
+    assert sandbox.links[WORKSPACE] == VOLUME
+    assert sandbox.running
+    assert list(sandbox.aside.values()) == [
+        {".openclaw/openclaw.json": b"{}", ".openclaw/update-check.json": b"{}"}
+    ]
+    files = harness.client.claim_files[claim]
+    assert {key: files[key] for key in state_before} == state_before
+    assert "update-check.json" not in str(sorted(files))
+    assert observation.backend_ref["name"] == sandbox.name
+    assert observation.observed_state is ResidentObservedState.ACTIVE
+    assert (
+        harness.core.pvcs[claim].metadata.annotations.get(
+            workspace_module.ANNOTATION_MIGRATION_PHASE
+        )
+        is None
+    )
+
+    # Once on its volume, later passes only look once per sandbox.
+    settled_from = len(harness.events)
+    await harness.manager.reconcile(running, profile)
+    assert not any(
+        event.startswith(("stopped:", "linked:")) for event in harness.events[settled_from:]
+    )
+
+
+@pytest.mark.asyncio
+async def test_restart_puts_a_resident_off_its_volume_back_on_it(monkeypatch):
+    harness = _Harness(monkeypatch)
+    runtime, profile = _openclaw_runtime(), _openclaw_profile()
+    running, sandbox = await _off_its_volume(harness, runtime, profile)
+
+    await harness.manager.restart(running, profile)
+
+    assert sandbox.links[WORKSPACE] == VOLUME
+    assert len(sandbox.aside) == 1
+    assert sandbox.running
+    assert "AGENTS.md" not in str(sandbox.aside)
+
+
+@pytest.mark.asyncio
+async def test_adopting_a_sandbox_off_its_volume_restarts_all_its_processes(monkeypatch):
+    harness = _Harness(monkeypatch)
+    runtime, profile = _openclaw_runtime(), _openclaw_profile()
+    running, sandbox = await _off_its_volume(harness, runtime, profile)
+    launched_before = harness.events.count(f"launched:{sandbox.name}")
+    unadopted = running.model_copy(update={"observed_state": ResidentObservedState.PENDING})
+
+    observation = await harness.manager.deploy(unadopted, profile)
+
+    assert observation.backend_ref["name"] == sandbox.name
+    assert sandbox.links[WORKSPACE] == VOLUME
+    assert harness.events.count(f"launched:{sandbox.name}") > launched_before
+    assert f"stopped:{sandbox.name}" in harness.events
+    assert len(sandbox.aside) == 1
+
+
+@pytest.mark.skipif(not _gnu_stat(), reason="the sandbox images ship GNU stat")
+def test_workspace_link_moves_a_directory_with_state_aside(monkeypatch, tmp_path):
+    adapter = _import_adapter(monkeypatch)
+    volume = tmp_path / "volume"
+    volume.mkdir()
+    link = tmp_path / "home" / "workspace"
+    link.mkdir(parents=True)
+    (link / "state.db").write_bytes(b"fresh state")
+
+    result = _run_script(adapter._workspace_link_script(str(link), str(volume)))
+
+    assert result.returncode == 0, result.stderr
+    assert link.is_symlink() and os.readlink(link) == str(volume)
+    (aside,) = [path for path in link.parent.iterdir() if ".pre-link-" in path.name]
+    assert (aside / "state.db").read_bytes() == b"fresh state"
+    assert f"moved-aside={aside}" in result.stdout.decode()
+    state = _run_script(adapter._workspace_link_state_script(str(link), str(volume)))
+    assert state.stdout.decode().strip() == "linked"

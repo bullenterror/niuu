@@ -186,6 +186,10 @@ RAVN_PERSISTED_HOME_DIR = ".ravn-home"
 #: (1000). Völundr then cannot write ``/sandbox/.volundr`` or link ``~/.ravn``.
 RESIDENT_WORKSPACE_VOLUME_PATH = "/resident-workspace"
 RESIDENT_WORKSPACE_VOLUME_NAME = "resident-workspace"
+#: What the workspace path of a claim-backed sandbox can be (_workspace_link_state_script).
+WORKSPACE_LINK_STATES = frozenset({"linked", "mounted", "foreign", "directory", "missing"})
+#: The states in which the workspace path is the resident's volume.
+WORKSPACE_ON_VOLUME = frozenset({"linked", "mounted"})
 DEFAULT_WORKSPACE_MIGRATION_LEASE_SECONDS = 300.0
 DEFAULT_WORKSPACE_MIGRATION_TIMEOUT_SECONDS = 1800.0
 # Backoff for calls the gateway rejected because its SQLite store was locked by
@@ -1150,6 +1154,8 @@ class OpenShellGatewayPodManager(
         # The sandbox a resident's failed migration created and could not remove,
         # by resident id: reconcile removes it (_remove_abandoned_migration_sandbox).
         self._abandoned_migration_sandboxes: dict[str, str] = {}
+        # Claim-backed sandboxes whose workspace path this Völundr saw on the volume.
+        self._linked_workspaces: set[str] = set()
         self._gateway_public_url = gateway_public_url.rstrip("/")
         gateway_hostport = _endpoint_hostport(gateway_endpoint)
         gateway_host, separator, gateway_port = gateway_hostport.rpartition(":")
@@ -2238,7 +2244,16 @@ class OpenShellGatewayPodManager(
                     policy=self._resident_sandbox_policy(claim),
                 )
             ready = await self._wait_for_sandbox_name(sandbox.name, self._ready_timeout)
+            processes = self._resident_processes(runtime, values)
+            relaunch = False
             if claim is not None:
+                if resumed_deployment and (
+                    await self._resident_workspace_link_state(ready) not in WORKSPACE_ON_VOLUME
+                ):
+                    # Its processes run off the volume: stop them, link, start them all.
+                    await self._stop_resident_processes_in(ready, processes)
+                    relaunch = True
+                # Every engine, before anything is written into the workspace.
                 await self._ensure_resident_workspace_link(ready)
             if before_start is not None:
                 await before_start(ready)
@@ -2246,7 +2261,6 @@ class OpenShellGatewayPodManager(
                 **credential_context.files,
                 **await self._resident_config_files(runtime, values),
             }
-            processes = self._resident_processes(runtime, values)
             for process in processes:
                 files.update(_shared_resident_process_files(runtime, process.files))
             await asyncio.to_thread(
@@ -2261,8 +2275,9 @@ class OpenShellGatewayPodManager(
                 process_env[HERMES_API_SERVER_KEY_ENV] = machine_credential["api_key"]
             process_env.update(await self._resident_openclaw_environment(runtime, values))
             if claim is not None:
+                await self._verify_resident_workspace_link(ready)
                 await self._ensure_resident_home_links(runtime, ready)
-            if resumed_deployment:
+            if resumed_deployment and not relaunch:
                 await self._launch_missing_resident_processes(ready.id, process_env, processes)
             else:
                 await self._launch_resident_processes(ready.id, process_env, processes)
@@ -2997,6 +3012,121 @@ class OpenShellGatewayPodManager(
                 f"Could not link {self._sandbox_workspace} to the workspace volume in "
                 f"{sandbox.name}: {output.strip()}"
             )
+        for line in output.splitlines():
+            if line.startswith("moved-aside="):
+                logger.warning(
+                    "Moved %s in sandbox %s aside to %s (it was not the workspace volume) "
+                    "and linked it to %s",
+                    self._sandbox_workspace,
+                    sandbox.name,
+                    line.removeprefix("moved-aside="),
+                    RESIDENT_WORKSPACE_VOLUME_PATH,
+                )
+        self._linked_workspaces.add(sandbox.id)
+
+    async def _stop_resident_processes_in(
+        self,
+        sandbox: OpenShellSandbox,
+        processes: Sequence[OpenShellRuntimeProcess],
+    ) -> None:
+        exit_code, output = await asyncio.to_thread(
+            self._client.exec_script,
+            sandbox_id=sandbox.id,
+            script=_resident_stop_script(tuple(process.name for process in processes)),
+            env={},
+        )
+        if exit_code != 0:
+            raise RuntimeError(f"OpenShell resident process stop failed: {output.strip()}")
+
+    async def _resident_workspace_link_state(self, sandbox: OpenShellSandbox) -> str:
+        exit_code, output = await asyncio.to_thread(
+            self._client.exec_script,
+            sandbox_id=sandbox.id,
+            script=_workspace_link_state_script(
+                self._sandbox_workspace, RESIDENT_WORKSPACE_VOLUME_PATH
+            ),
+            env={},
+        )
+        state = output.strip().splitlines()[-1] if output.strip() else ""
+        if exit_code != 0 or state not in WORKSPACE_LINK_STATES:
+            raise RuntimeError(
+                f"Could not read {self._sandbox_workspace} in {sandbox.name}: {output.strip()}"
+            )
+        return state
+
+    async def _verify_resident_workspace_link(self, sandbox: OpenShellSandbox) -> None:
+        """Fail the deployment if the workspace path is no longer the volume."""
+        state = await self._resident_workspace_link_state(sandbox)
+        if state not in WORKSPACE_ON_VOLUME:
+            self._linked_workspaces.discard(sandbox.id)
+            raise RuntimeError(
+                f"{self._sandbox_workspace} in {sandbox.name} is a {state}, not the resident's "
+                "workspace volume; not starting the resident on it"
+            )
+
+    async def _repair_resident_workspace_link(
+        self,
+        runtime: ResidentRuntime,
+        values: dict[str, Any],
+        sandbox: OpenShellSandbox,
+        processes: Sequence[OpenShellRuntimeProcess],
+        service_port: int,
+    ) -> bool:
+        """Put a running resident back on its volume if its workspace path is not the link.
+
+        Checked once per sandbox in this Völundr. The resident's processes stop,
+        what is at the workspace path is moved aside (never deleted), the path is
+        linked, and the processes start again with their files projected anew.
+        The volume itself is not written by the repair. Returns whether it ran.
+        """
+        if sandbox.id in self._linked_workspaces:
+            return False
+        lock = self._resident_process_lock(runtime)
+        if lock.locked():
+            return False
+        async with lock:
+            try:
+                state = await self._resident_workspace_link_state(sandbox)
+                if state in WORKSPACE_ON_VOLUME:
+                    self._linked_workspaces.add(sandbox.id)
+                    return False
+                logger.warning(
+                    "Resident %s's sandbox %s runs with %s %s, not on its workspace volume; "
+                    "stopping its processes, linking %s to %s and starting them again",
+                    runtime.name,
+                    sandbox.name,
+                    self._sandbox_workspace,
+                    "missing" if state == "missing" else f"a {state}",
+                    self._sandbox_workspace,
+                    RESIDENT_WORKSPACE_VOLUME_PATH,
+                )
+                files, env = await self._resident_launch_inputs(runtime, values, processes)
+                await self._stop_resident_processes_in(sandbox, processes)
+                await self._ensure_resident_workspace_link(sandbox)
+                await asyncio.to_thread(
+                    self._client.write_files, sandbox_id=sandbox.id, files=files
+                )
+                await self._verify_resident_workspace_link(sandbox)
+                await self._ensure_resident_home_links(runtime, sandbox)
+                await self._launch_resident_processes(sandbox.id, env, processes)
+                await self._wait_for_resident_processes(
+                    sandbox.id, processes, service_port=service_port
+                )
+            except Exception:
+                logger.warning(
+                    "Could not put resident %s's sandbox %s back on its workspace volume; "
+                    "retrying on the next pass",
+                    runtime.name,
+                    sandbox.name,
+                    exc_info=True,
+                )
+                return True
+        logger.info(
+            "Resident %s runs on its workspace volume again in sandbox %s",
+            runtime.name,
+            sandbox.name,
+        )
+        return True
 
     def _require_workspace_claims(self) -> ResidentWorkspaceClaims:
         if self._workspace_claims is None:
@@ -3113,6 +3243,10 @@ class OpenShellGatewayPodManager(
         service_name, service_port = _resident_service(
             values, self._service_name, self._service_port
         )
+        if running_resident and claim is not None and _sandbox_mounts_claim(sandbox, claim):
+            await self._repair_resident_workspace_link(
+                runtime, values, sandbox, processes, service_port
+            )
         if sandbox.ready:
             processes_ready = await self._resident_processes_ready(
                 sandbox.id,
@@ -3461,11 +3595,17 @@ class OpenShellGatewayPodManager(
         )
         if exit_code != 0:
             raise RuntimeError(f"OpenShell resident process stop failed: {output.strip()}")
+        on_claim = claim is not None and _sandbox_mounts_claim(sandbox, claim)
+        if on_claim:
+            # A Restart also puts a resident that runs off its volume back on it.
+            await self._ensure_resident_workspace_link(sandbox)
         await asyncio.to_thread(
             self._client.write_files,
             sandbox_id=sandbox.id,
             files=files,
         )
+        if on_claim:
+            await self._verify_resident_workspace_link(sandbox)
         if claim is not None:
             await self._ensure_resident_home_links(runtime, sandbox)
         await self._launch_resident_processes(sandbox.id, env, processes)
@@ -5282,7 +5422,9 @@ def _workspace_link_script(link: str, target: str) -> str:
     """Make ``link`` (the workspace path) a symlink to the mounted volume ``target``.
 
     A sandbox that mounts the volume at ``link`` itself (created before the volume
-    moved out of /sandbox) is left as it is; real state at ``link`` never goes.
+    moved out of /sandbox) is left as it is. Anything else at ``link`` (a directory
+    a file projection or the runtime created) is moved aside, never deleted, and
+    its new path printed.
     """
     return (
         "set -eu\n"
@@ -5293,23 +5435,42 @@ def _workspace_link_script(link: str, target: str) -> str:
         '  echo "$link links to $(readlink "$link"), not $target" >&2\n'
         "  exit 1\n"
         "fi\n"
-        'if [ -d "$link" ]; then\n'
-        '  if [ "$(stat -c %d "$link")" != "$(stat -c %d "${link%/*}")" ]; then\n'
-        "    exit 0\n"
-        "  fi\n"
-        '  if ! rmdir "$link" 2>/dev/null; then\n'
-        '    echo "$link holds state outside the workspace volume; refusing to replace it" >&2\n'
-        "    exit 1\n"
-        "  fi\n"
-        'elif [ -e "$link" ]; then\n'
-        '  echo "$link is not a directory; refusing to replace it" >&2\n'
+        'if [ -d "$link" ] && [ "$(stat -c %d "$link")" != "$(stat -c %d "${link%/*}")" ]; then\n'
+        '  [ ! -e "$target" ] && exit 0\n'
+        '  echo "$link is a mount of its own, and the workspace volume is at $target" >&2\n'
         "  exit 1\n"
         "fi\n"
         'if [ ! -d "$target" ]; then\n'
         '  echo "the workspace volume is not mounted at $target" >&2\n'
         "  exit 1\n"
         "fi\n"
+        'if [ -d "$link" ] && rmdir "$link" 2>/dev/null; then\n'
+        "  :\n"
+        'elif [ -e "$link" ]; then\n'
+        '  aside="$link.pre-link-$(date -u +%Y%m%dT%H%M%SZ)"\n'
+        '  [ -e "$aside" ] && aside="$aside-$$"\n'
+        '  mv "$link" "$aside"\n'
+        '  echo "moved-aside=$aside"\n'
+        "fi\n"
         'ln -s "$target" "$link"\n'
+    )
+
+
+def _workspace_link_state_script(link: str, target: str) -> str:
+    """Print what the workspace path is: linked, mounted, foreign, directory or missing."""
+    return (
+        "set -eu\n"
+        f"link={shlex.quote(link)}\n"
+        f"target={shlex.quote(target)}\n"
+        'if [ -L "$link" ]; then\n'
+        '  if [ "$(readlink "$link")" = "$target" ]; then echo linked; else echo foreign; fi\n'
+        'elif [ -d "$link" ] && [ "$(stat -c %d "$link")" != "$(stat -c %d "${link%/*}")" ]; then\n'
+        "  echo mounted\n"
+        'elif [ -e "$link" ]; then\n'
+        "  echo directory\n"
+        "else\n"
+        "  echo missing\n"
+        "fi\n"
     )
 
 
@@ -5923,6 +6084,13 @@ def _credential_file_archives(files: dict[str, bytes]) -> list[tuple[str, bytes]
     ]
 
 
+#: Directories Völundr may make symlinks in a resident's sandbox (the workspace,
+#: onto its volume, and ~/.ravn, onto the volume's .ravn-home). A file projection
+#: never carries a directory entry for them: GNU tar replaces a symlink with a
+#: new, empty directory when it extracts a directory entry of that name.
+_LINKED_SANDBOX_DIRECTORIES = frozenset({"/sandbox/workspace", "/sandbox/.ravn"})
+
+
 def _credential_file_archive(
     files: dict[str, bytes],
     *,
@@ -5946,6 +6114,11 @@ def _credential_file_archive(
                 if parent_str == ".":
                     continue
                 if parent_str in directories:
+                    continue
+                if str(root / parent) in _LINKED_SANDBOX_DIRECTORIES:
+                    # Extracted through whatever is there: a link, or a directory
+                    # tar creates itself.
+                    directories.add(parent_str)
                     continue
                 directory = tarfile.TarInfo(parent_str)
                 directory.type = tarfile.DIRTYPE
