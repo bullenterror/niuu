@@ -191,6 +191,12 @@ previewCache:
   # -- Size limit for the preview cache emptyDir volume (leave empty/"" for no limit)
   sizeLimit: 1Gi
 
+scratch:
+  # -- Size limit for the /tmp emptyDir (the root filesystem is read-only). It holds
+  # temporary files such as a resident workspace migration's archive and read-back
+  # spools (two copies of a workspace of up to 1Gi). Leave empty/"" for no limit.
+  sizeLimit: 4Gi
+
 # Database configuration
 database:
   # -- Database name
