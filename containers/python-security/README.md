@@ -43,7 +43,9 @@ statement can be issued.
 Only after verification, `vex.py` creates OpenVEX `fixed` statements for these
 two CVEs and the exact Python package/runtime path in that same image digest.
 It rejects unrelated image scans, module hashes, versions and interpreter
-locations. Every scan retains the raw Grype JSON, runtime hash/test evidence,
+locations. Syft catalogs each image once (`scan.sh`); both Grype passes match
+that SBOM, with Syft and Grype pinned by checksum in `install-scanners.sh`.
+Every scan retains the Syft SBOM, the raw Grype JSON, runtime hash/test evidence,
 VEX document and filtered Grype JSON as CI artifacts for 30 days. The filtered
 JSON retains the original findings in `ignoredMatches` with the VEX reason;
 SARIF reports the remaining actionable findings. No global ignore rule or

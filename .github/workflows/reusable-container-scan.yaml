@@ -1,5 +1,6 @@
-# Reusable: run Grype against container images and upload SARIF.
+# Reusable: catalog container images with Syft, match them with Grype, upload SARIF.
 # Called by ci.yaml and dev.yaml after container manifests are published.
+# Syft and Grype are pinned with checksums in containers/python-security/install-scanners.sh.
 name: Reusable — Container Scan
 
 on:
@@ -17,9 +18,6 @@ on:
         description: Container registry.
         type: string
         default: ghcr.io
-      grype-version:
-        type: string
-        default: "0.118.0"
 
 permissions:
   contents: read
@@ -51,37 +49,59 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install Grype
-        env:
-          GRYPE_VERSION: ${{ inputs.grype-version }}
+      - name: Install Syft and Grype
+        id: scanners
         run: |
           set -euo pipefail
+          bash containers/python-security/install-scanners.sh
+          echo "GRYPE_DB_CACHE_DIR=$RUNNER_TEMP/grype-db" >> "$GITHUB_ENV"
 
-          install_grype() {
-            curl --retry 5 --retry-all-errors --retry-delay 2 -sSfL \
-              https://raw.githubusercontent.com/anchore/grype/247f5d72abf2131aa37f3164a98495c121b29029/install.sh \
-              | sh -s -- -b /usr/local/bin "v${GRYPE_VERSION}"
-          }
+      # The DB is cached per Grype version (which fixes the schema) and saved
+      # under its own build time, so a new cache entry appears only when Anchore
+      # publishes a new DB, not once per run or hour. Restore takes the newest.
+      - name: Restore Grype DB
+        id: grype-db-restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/grype-db
+          key: grype-db-${{ runner.os }}-${{ steps.scanners.outputs.grype-version }}-latest
+          restore-keys: grype-db-${{ runner.os }}-${{ steps.scanners.outputs.grype-version }}-
 
+      # Update once, explicitly, so the scan's Grype runs skip the check
+      # (GRYPE_DB_AUTO_UPDATE=false). The 5-day max-age validation stays on.
+      - name: Update Grype DB
+        id: grype-db
+        env:
+          GRYPE_VERSION: ${{ steps.scanners.outputs.grype-version }}
+        run: |
+          set -euo pipefail
           for attempt in 1 2 3; do
-            if install_grype; then
-              grype version
-              exit 0
+            if grype db update; then
+              break
             fi
-
             if [ "$attempt" -eq 3 ]; then
-              exit 1
+              # No reachable update: a restored DB still counts if it validates.
+              echo "::warning::Grype DB update check failed; scanning with the restored DB"
+              break
             fi
-
             sleep $((attempt * 5))
           done
+          grype db status
+          built=$(grype db status -o json | jq -r '(.schemaVersion | gsub("[^0-9.]"; "")) + "-" + (.built | gsub("[^0-9]"; ""))')
+          echo "key=grype-db-${RUNNER_OS}-${GRYPE_VERSION}-${built}" >> "$GITHUB_OUTPUT"
 
-          grype version
+      - name: Save Grype DB
+        if: strategy.job-index == 0 && steps.grype-db.outputs.key != steps.grype-db-restore.outputs.cache-matched-key
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/grype-db
+          key: ${{ steps.grype-db.outputs.key }}
 
-      - name: Scan container with Grype
+      - name: Scan container with Syft and Grype
         env:
           IMAGE: ${{ inputs.registry }}/${{ github.repository_owner }}/${{ matrix.container }}:${{ inputs.tag }}
           CONTAINER: ${{ matrix.container }}
+          GRYPE_DB_AUTO_UPDATE: "false"
         run: bash containers/python-security/scan.sh "$IMAGE" "$CONTAINER"
 
       # FinalizeArtifact sometimes fails with ECONNRESET: retry once.
@@ -95,6 +115,7 @@ jobs:
           path: |
             grype-${{ matrix.container }}-*.json
             python-security-${{ matrix.container }}*.json
+            sbom-${{ matrix.container }}.syft.json
           retention-days: 30
 
       - name: Wait before retrying the evidence upload
