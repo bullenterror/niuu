@@ -133,6 +133,10 @@ def renderer(base: str = "https://forge.example.com") -> NotificationRenderer:
         public_base_url=base,
         session_link_path="/volundr/session/{session_id}#notification-{notification_id}",
         feed_link_path="/volundr/notifications",
+        resident_link_path="/ravn?ravn={resident_id}&tab=chat",
+        resident_session_link_path=(
+            "/ravn?ravn={resident_id}&tab=chat&session={resident_session_id}"
+        ),
         host_label="thor",
     )
 
@@ -639,6 +643,8 @@ class TestLifecycle:
                 public_base_url="",
                 session_link_path="/s/{session_id}",
                 feed_link_path="/f",
+                resident_link_path="/r/{resident_id}",
+                resident_session_link_path="/r/{resident_id}/{resident_session_id}",
             ),
             h.settings,
             clock=h.clock,

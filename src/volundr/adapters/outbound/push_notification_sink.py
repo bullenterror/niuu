@@ -92,6 +92,8 @@ class PushNotificationSink(NotificationSink):
             event_type=PUSH_NOTIFICATION_EVENT,
             notification_id=message.notification_id,
             url=message.url or "",
+            resident_id=message.resident_id or "",
+            resident_session_id=message.resident_session_id or "",
         )
         detail = await self._channel.deliver(push, devices)
         return DeliveryResult(detail=detail)

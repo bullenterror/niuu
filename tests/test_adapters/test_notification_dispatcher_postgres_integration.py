@@ -172,6 +172,10 @@ def dispatcher(pool, sinks, **overrides) -> NotificationDispatcher:
             public_base_url="https://forge.example.com",
             session_link_path="/volundr/session/{session_id}#notification-{notification_id}",
             feed_link_path="/volundr/notifications",
+            resident_link_path="/ravn?ravn={resident_id}&tab=chat",
+            resident_session_link_path=(
+                "/ravn?ravn={resident_id}&tab=chat&session={resident_session_id}"
+            ),
             host_label="thor",
         ),
         settings(**overrides),

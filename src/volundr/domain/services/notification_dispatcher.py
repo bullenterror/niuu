@@ -116,19 +116,43 @@ class NotificationRenderer:
         public_base_url: str,
         session_link_path: str,
         feed_link_path: str,
+        resident_link_path: str,
+        resident_session_link_path: str,
         host_label: str = "",
     ) -> None:
         self._base = public_base_url.strip().rstrip("/")
         self._session_link_path = session_link_path
         self._feed_link_path = feed_link_path
+        self._resident_link_path = resident_link_path
+        self._resident_session_link_path = resident_session_link_path
         self._host_label = host_label.strip()
 
-    def deep_link(self, notification_id: str, session_id: str | None) -> str | None:
+    def deep_link(
+        self,
+        notification_id: str,
+        session_id: str | None,
+        *,
+        resident_id: str | None = None,
+        resident_session_id: str | None = None,
+    ) -> str | None:
+        """The session at the notification, the resident's channel, or else the feed."""
         if not self._base:
             return None
         if session_id:
             path = self._session_link_path.format(
                 session_id=session_id, notification_id=notification_id
+            )
+            return self._base + path
+        if resident_id and resident_session_id:
+            path = self._resident_session_link_path.format(
+                resident_id=resident_id,
+                resident_session_id=resident_session_id,
+                notification_id=notification_id,
+            )
+            return self._base + path
+        if resident_id:
+            path = self._resident_link_path.format(
+                resident_id=resident_id, notification_id=notification_id
             )
             return self._base + path
         return self._base + self._feed_link_path
@@ -155,7 +179,14 @@ class NotificationRenderer:
             session_label=notification.session_name,
             host_label=self._host_label or None,
             project_id=notification.project_id,
-            url=self.deep_link(notification_id, session_id),
+            url=self.deep_link(
+                notification_id,
+                session_id,
+                resident_id=notification.resident_id,
+                resident_session_id=notification.resident_session_id,
+            ),
+            resident_id=notification.resident_id,
+            resident_session_id=notification.resident_session_id,
             links=tuple(
                 OutboundLink(label=link.label, url=self._absolute(link.url), kind=link.kind.value)
                 for link in notification.links

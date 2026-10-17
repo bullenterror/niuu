@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
@@ -26,10 +26,17 @@ from niuu.domain.notifications import (
     NotificationSeverity,
     NotificationSource,
     draft_from_log_payload,
+    notification_id,
     summarize_reply,
     turn_dedupe_key,
 )
-from volundr.domain.models import EventType, RealtimeEvent, Session, SessionLogEntry
+from volundr.domain.models import (
+    EventType,
+    RealtimeEvent,
+    ResidentRuntime,
+    Session,
+    SessionLogEntry,
+)
 from volundr.domain.notification_ports import (
     NotificationDeliveryRepository,
     NotificationRecorder,
@@ -38,6 +45,8 @@ from volundr.domain.notification_ports import (
 )
 from volundr.domain.notifications import (
     INTEGRATION_SINK,
+    RESIDENT_ID_KEY,
+    RESIDENT_SESSION_ID_KEY,
     Notification,
     NotificationCandidate,
     NotificationDelivery,
@@ -82,13 +91,20 @@ def engine_resolver_for(
 
 @dataclass(frozen=True)
 class _SessionContext:
-    session_id: UUID
+    """Who a notification belongs to and what it is about.
+
+    ``session_id`` is null for a resident's notification: it is anchored by
+    ``anchor`` (the resident and its channel) instead.
+    """
+
+    session_id: UUID | None
     session_name: str
     owner_id: str
     tenant_id: str | None
     project_id: str | None
     engine: str | None
     model: str | None
+    anchor: dict[str, str] = field(default_factory=dict)
 
 
 def _bounded(text: str, limit: int) -> str:
@@ -122,6 +138,33 @@ def attention_dedupe_key(session_id: UUID, state_since: datetime, request_id: st
 
 def submit_dedupe_key(session_id: UUID | None, principal_id: str, idempotency_key: str) -> str:
     return f"submit:{session_id or '-'}:{principal_id}:{idempotency_key}"
+
+
+def _resident_anchor(resident_id: UUID, resident_session_id: UUID | None) -> str:
+    return f"{resident_id}:{resident_session_id or 'room'}"
+
+
+def resident_attention_dedupe_key(
+    resident_id: UUID, resident_session_id: UUID | None, request_id: str
+) -> str:
+    """Dedupe key for one request a resident waits on its owner for.
+
+    ``resident-attention:{resident}:{channel or 'room'}:{request_id}``. The resident
+    names the request, so a re-published question stays one notification and its
+    answer retires exactly that one.
+    """
+    if not request_id:
+        raise ValueError("A resident attention request needs a request_id")
+    return f"resident-attention:{_resident_anchor(resident_id, resident_session_id)}:{request_id}"
+
+
+def resident_notify_dedupe_key(
+    resident_id: UUID, resident_session_id: UUID | None, idempotency_key: str
+) -> str:
+    """Dedupe key for a notification a resident's agent sent on purpose."""
+    if not idempotency_key:
+        raise ValueError("A resident notification needs an idempotency_key")
+    return f"resident-notify:{_resident_anchor(resident_id, resident_session_id)}:{idempotency_key}"
 
 
 class NotificationService(NotificationRecorder):
@@ -276,6 +319,138 @@ class NotificationService(NotificationRecorder):
                 return retired
             after = page[-1].seq
 
+    # -- Residents ---------------------------------------------------------
+    #
+    # A resident (a long-lived Ravn) is not a Forge session, so its notifications
+    # carry no session_id. They are anchored to the resident and, when they come
+    # from one of its channels, that channel (metadata resident_id /
+    # resident_session_id, on the wire as top-level fields). Ownership comes from
+    # the resident's own record; everything else (dedupe, delivery scheduling, the
+    # live event) is the same path a session's notification takes.
+
+    async def record_resident_attention(
+        self,
+        resident: ResidentRuntime,
+        *,
+        resident_session_id: UUID | None,
+        kind: str,
+        prompt: str,
+        request_id: str,
+    ) -> Notification | None:
+        """Record (idempotently) that ``resident`` waits for its owner on ``request_id``.
+
+        The same ``attention`` / ``system`` item a waiting session raises, so the
+        owner's "Needs-input pushes" rule delivers it. ``None`` when it was already
+        recorded.
+        """
+        context = self._resident_context(resident, resident_session_id)
+        draft = NotificationDraft(
+            kind=NotificationKind.ATTENTION,
+            severity=NotificationSeverity.WARNING,
+            title=_bounded(f"{context.session_name} needs your input", MAX_TITLE_CHARS),
+            body=_bounded(
+                prompt.strip() or _DEFAULT_ATTENTION_PROMPTS.get(kind, _DEFAULT_ATTENTION_PROMPT),
+                MAX_BODY_CHARS,
+            ),
+        )
+        candidate = self._candidate(
+            context,
+            dedupe_key=resident_attention_dedupe_key(resident.id, resident_session_id, request_id),
+            draft=draft,
+            source=NotificationSource.SYSTEM,
+            session_seq=None,
+            metadata={"input_kind": kind, "request_id": request_id},
+        )
+        created = await self._record([candidate])
+        return created[0] if created else None
+
+    async def retire_resident_attention(
+        self,
+        resident: ResidentRuntime,
+        *,
+        resident_session_id: UUID | None,
+        request_ids: list[str],
+    ) -> int:
+        """Acknowledge the owner's unread attention items for these settled requests.
+
+        Mirrors :meth:`retire_attention`: once the resident stops waiting (its owner
+        answered), its "needs your input" items must not stay unread. Each is marked
+        read individually, so the rest of the owner's read state is untouched. A
+        request that was never recorded has nothing to retire.
+        """
+        owner = resident.owner_id
+        ids: list[UUID] = []
+        for request_id in request_ids:
+            candidate_id = notification_id(
+                resident_attention_dedupe_key(resident.id, resident_session_id, request_id)
+            )
+            if await self._repository.get(candidate_id) is not None:
+                ids.append(candidate_id)
+        if not ids:
+            return 0
+        already = await self._repository.read_ids(owner, ids)
+        retired = 0
+        for item_id in ids:
+            if item_id not in already:
+                await self._repository.mark_read(owner, item_id)
+                retired += 1
+        return retired
+
+    async def submit_for_resident(
+        self,
+        resident: ResidentRuntime,
+        draft: NotificationDraft,
+        *,
+        resident_session_id: UUID | None,
+        idempotency_key: str,
+    ) -> tuple[Notification, bool]:
+        """Record a notification the resident's agent sent on purpose (``source=agent``).
+
+        The resident counterpart of a session submitting for itself: the same kinds
+        are allowed and a retry with the same key returns the recorded notification.
+        Returns ``(notification, created)``.
+        """
+        if draft.kind not in AGENT_KINDS:
+            raise NotificationValidationError(
+                f"Kind {draft.kind.value!r} is derived by Forge and cannot be submitted"
+            )
+        context = self._resident_context(resident, resident_session_id)
+        candidate = self._candidate(
+            context,
+            dedupe_key=resident_notify_dedupe_key(
+                resident.id, resident_session_id, idempotency_key
+            ),
+            draft=draft,
+            source=NotificationSource.AGENT,
+            session_seq=None,
+            metadata={"submitted_by": f"resident:{resident.id}"},
+        )
+        created = await self._record([candidate])
+        if created:
+            return created[0], True
+        existing = await self._repository.get(candidate.id)
+        if existing is None:
+            raise RuntimeError(f"Deduplicated notification {candidate.id} is not readable")
+        return existing, False
+
+    @staticmethod
+    def _resident_context(
+        resident: ResidentRuntime, resident_session_id: UUID | None
+    ) -> _SessionContext:
+        anchor = {RESIDENT_ID_KEY: str(resident.id)}
+        if resident_session_id is not None:
+            anchor[RESIDENT_SESSION_ID_KEY] = str(resident_session_id)
+        return _SessionContext(
+            session_id=None,
+            session_name=resident.name,
+            owner_id=resident.owner_id,
+            tenant_id=resident.tenant_id,
+            project_id=None,
+            engine=resident.engine.value,
+            model=resident.model or None,
+            anchor=anchor,
+        )
+
     async def submit(
         self,
         session: Session,
@@ -355,7 +530,7 @@ class NotificationService(NotificationRecorder):
             engine=context.engine,
             model=context.model,
             correlation_id=draft.correlation_id,
-            metadata=metadata,
+            metadata={**metadata, **context.anchor},
         )
 
     async def _record(self, candidates: list[NotificationCandidate]) -> list[Notification]:

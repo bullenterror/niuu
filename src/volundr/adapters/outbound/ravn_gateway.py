@@ -17,7 +17,10 @@ the OpenClaw controller itself; this adapter supplies only what differs:
 * the machine identity: the shim trusts a device on first use behind that token, so
   the device key is derived from the resident's token instead of being minted and
   stored per resident;
-* the participant: the resident itself, not NemoClaw.
+* the participant: the resident itself, not NemoClaw;
+* the notification outbox: the shim also serves the resident's notification
+  outbox (``notifications.*``), which Forge's ``ResidentNotificationRelay`` drains
+  over this same authenticated connection (``ResidentNotificationSource``).
 
 The resident's default room (its ``skuld-v1`` chat endpoint, session id = resident
 id) is a different endpoint and is unaffected.
@@ -25,26 +28,38 @@ id) is a different endpoint and is unaffected.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import logging
 import secrets
+from contextlib import suppress
 from typing import Any
+from uuid import UUID
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from niuu.domain.models import SecretType
+from niuu.domain.resident_notifications import ResidentNotificationEntry
 from niuu.ports.credentials import CredentialStorePort
 from niuu.ports.session_proxy import SessionProxyTarget
 from volundr.adapters.outbound.openclaw_gateway import (
     _RETRY_HISTORY_POLL_INTERVAL_SECONDS,
     _RETRY_HISTORY_TIMEOUT_SECONDS,
+    OpenClawGatewayError,
     OpenClawResidentSessionController,
     _GatewayConnection,
     _new_machine_credential,
+    _session_uuid,
 )
 from volundr.domain.models import ResidentDeploymentProfile, ResidentEngine, ResidentRuntime
-from volundr.domain.ports import ResidentOpenClawShimHost, ResidentOpenClawTokens
+from volundr.domain.ports import (
+    ResidentNotificationSource,
+    ResidentNotificationStream,
+    ResidentNotificationsUnavailableError,
+    ResidentOpenClawShimHost,
+    ResidentOpenClawTokens,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +68,9 @@ DEFAULT_SERVICE_PORT = 18790
 RAVN_OPENCLAW_CREDENTIAL_NAME = "ravn-openclaw"
 _TOKEN_FIELD = "token"
 _DEVICE_SEED_CONTEXT = b"niuu-ravn-resident-openclaw-device:"
+#: The shim's answer to an RPC it does not serve (an older Ravn, or no outbox).
+_UNSUPPORTED = "UNSUPPORTED"
+_NOTIFICATIONS_CHANGED_EVENT = "notifications.changed"
 
 
 class CredentialStoreOpenClawTokens(ResidentOpenClawTokens):
@@ -97,7 +115,55 @@ class CredentialStoreOpenClawTokens(ResidentOpenClawTokens):
         await self._store.delete("resident", str(runtime.id), RAVN_OPENCLAW_CREDENTIAL_NAME)
 
 
-class RavnResidentSessionController(OpenClawResidentSessionController):
+class _ShimNotificationStream(ResidentNotificationStream):
+    """One resident's notification outbox, read over its OpenClaw shim connection."""
+
+    def __init__(self, connection: _GatewayConnection) -> None:
+        self._connection = connection
+
+    async def pending(self, *, limit: int) -> list[ResidentNotificationEntry]:
+        payload = await self._connection.request("notifications.pull", {"limit": limit})
+        rows = payload.get("entries") if isinstance(payload, dict) else None
+        if not isinstance(rows, list):
+            raise OpenClawGatewayError("notifications.pull answered without entries")
+        return [ResidentNotificationEntry.model_validate(row) for row in rows]
+
+    async def acknowledge(self, *, through_seq: int) -> None:
+        await self._connection.request("notifications.ack", {"throughSeq": through_seq})
+
+    async def wait_for_more(self, *, timeout: float) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return
+            try:
+                frame = await asyncio.wait_for(self._connection.events.get(), remaining)
+            except TimeoutError:
+                return
+            event = str(frame.get("event") or "")
+            if event == "connection.closed":
+                raise OpenClawGatewayError("Ravn OpenClaw shim connection closed")
+            if event == _NOTIFICATIONS_CHANGED_EVENT:
+                # Coalesce a burst: one pull reads everything that is pending.
+                while not self._connection.events.empty():
+                    queued = self._connection.events.get_nowait()
+                    if str(queued.get("event") or "") == "connection.closed":
+                        raise OpenClawGatewayError("Ravn OpenClaw shim connection closed")
+                return
+
+    def resident_session_id(self, channel: str | None) -> UUID | None:
+        # Forge's own session keys name a resident session; any other key (the shim's
+        # seeded main conversation, or no channel at all) is the resident's main room.
+        return _session_uuid(channel) if channel else None
+
+    async def close(self) -> None:
+        with suppress(Exception):
+            await self._connection.close()
+
+
+class RavnResidentSessionController(OpenClawResidentSessionController, ResidentNotificationSource):
     """Ravn implementation of resident sessions, over the Ravn OpenClaw shim."""
 
     def __init__(
@@ -180,3 +246,21 @@ class RavnResidentSessionController(OpenClawResidentSessionController):
     async def _prepare_chat(self, connection: _GatewayConnection, session_key: str) -> None:
         # The shim relays a session's chat events only to connections subscribed to it.
         await connection.request("sessions.subscribe", {"sessionKey": session_key})
+
+    async def open_notifications(self, runtime: ResidentRuntime) -> ResidentNotificationStream:
+        """Subscribe to the resident's notification outbox over its own shim token."""
+        connection = await self._connect(runtime)
+        try:
+            await connection.request("notifications.subscribe", {})
+        except OpenClawGatewayError as exc:
+            await connection.close()
+            if exc.details.get("code") == _UNSUPPORTED:
+                raise ResidentNotificationsUnavailableError(
+                    f"Resident {runtime.name} serves no notification outbox (its Ravn predates "
+                    "it, or gateway.channels.openclaw.notifications_enabled is false)"
+                ) from exc
+            raise
+        except BaseException:
+            await connection.close()
+            raise
+        return _ShimNotificationStream(connection)

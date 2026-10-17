@@ -82,6 +82,20 @@ class NotificationResponse(BaseModel):
             "Resolve its position with GET /sessions/{id}/conversation/turns/{turn_id}."
         ),
     )
+    resident_id: UUID | None = Field(
+        default=None,
+        description=(
+            "The resident (resident runtime id) this notification is about; set instead "
+            "of session_id for a resident's notification."
+        ),
+    )
+    resident_session_id: UUID | None = Field(
+        default=None,
+        description=(
+            "The resident session (channel) it came from; null with a resident_id means "
+            "the resident's main room."
+        ),
+    )
     created_at: datetime
     read: bool
 

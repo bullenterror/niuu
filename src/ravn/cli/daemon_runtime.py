@@ -98,6 +98,19 @@ async def _run_daemon(
             inbox=resident_inbox,
         )
 
+    # What the resident wants its owner to hear about (questions it waits on, its
+    # agent's own notifications). Forge drains it through the OpenClaw shim.
+    from ravn.cli.resident_runtime_wiring import (  # noqa: PLC0415
+        build_resident_notification_outbox,
+    )
+
+    resident_notification_outbox = build_resident_notification_outbox(settings)
+    if resident_runtime is not None and resident_notification_outbox is not None:
+        resident_runtime.bind_notification_outbox(resident_notification_outbox)
+        raised = await resident_runtime.raise_pending_attention()
+        if raised:
+            logger.info("Raised %d waiting operator question(s) for the owner", raised)
+
     # Populated by _wire_cron after drive_loop is created; captured by _agent_factory.
     cron_tools: list[Any] = []
 
@@ -280,6 +293,15 @@ async def _run_daemon(
         if cron_tools:
             tools.extend(_filter_tools(cron_tools, settings, resolved_persona))
 
+        # Like a Forge session's notify, offered to every persona wherever the outbox
+        # exists; only an explicit disable or a persona's forbidden_tools drops it.
+        if resident_notification_outbox is not None and _notify_tool_allowed(
+            settings, resolved_persona
+        ):
+            from ravn.adapters.tools.notify import ResidentNotifyTool  # noqa: PLC0415
+
+            tools.append(ResidentNotifyTool(resident_notification_outbox))
+
         # NIU-571: Apply trust gradient constraints for thread-triggered tasks
         tools = _apply_trust_filter(tools, settings, triggered_by)
 
@@ -404,7 +426,9 @@ async def _run_daemon(
             tasks.append(asyncio.create_task(http_gateway.run(), name="http"))
             gw_tasks.append("http")
 
-        for task, name in _make_channel_tasks(channels_cfg, gw):
+        for task, name in _make_channel_tasks(
+            channels_cfg, gw, notifications=resident_notification_outbox
+        ):
             tasks.append(task)
             gw_tasks.append(name)
 
@@ -804,3 +828,13 @@ async def _run_daemon(
         if sleipnir_catalog_publisher is not None:
             await sleipnir_catalog_publisher.stop()
         shutdown_observability()
+
+
+def _notify_tool_allowed(settings: Any, persona: Any | None) -> bool:
+    """Whether the resident's ``notify`` tool is offered (see ``ResidentNotifyTool``)."""
+    from ravn.adapters.tools.notify import NOTIFY_TOOL_NAME  # noqa: PLC0415
+
+    if NOTIFY_TOOL_NAME in set(settings.tools.disabled):
+        return False
+    forbidden = set(getattr(persona, "forbidden_tools", None) or [])
+    return NOTIFY_TOOL_NAME not in forbidden

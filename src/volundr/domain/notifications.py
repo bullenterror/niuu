@@ -43,6 +43,17 @@ SINK_NAME_PATTERN = r"^[a-z0-9][a-z0-9_.-]*$"
 
 _CLOCK_PATTERN = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 
+#: Metadata keys that anchor a notification to a resident and one of its channels.
+#: A resident's notification has no Forge session (``session_id`` is null); a null
+#: ``resident_session_id`` is the resident's main room.
+RESIDENT_ID_KEY = "resident_id"
+RESIDENT_SESSION_ID_KEY = "resident_session_id"
+
+
+def _metadata_text(metadata: dict[str, Any], key: str) -> str | None:
+    value = metadata.get(key)
+    return value if isinstance(value, str) and value else None
+
 
 class Notification(BaseModel):
     """One stored notification: a durable, cursor-ordered feed entry."""
@@ -77,8 +88,17 @@ class Notification(BaseModel):
         Agent notifications anchor to their own notification turn and ``reply_ready`` to the
         final reply turn; attention and directly submitted notifications have no turn.
         """
-        value = self.metadata.get("turn_id")
-        return value if isinstance(value, str) and value else None
+        return _metadata_text(self.metadata, "turn_id")
+
+    @property
+    def resident_id(self) -> str | None:
+        """The resident this notification is about, or ``None`` for a session's."""
+        return _metadata_text(self.metadata, RESIDENT_ID_KEY)
+
+    @property
+    def resident_session_id(self) -> str | None:
+        """The resident channel it is about; ``None`` is the main room (or no resident)."""
+        return _metadata_text(self.metadata, RESIDENT_SESSION_ID_KEY)
 
     def wire(self) -> dict[str, Any]:
         """The ``NotificationResponse`` JSON without the per-reader ``read`` flag.
@@ -87,6 +107,8 @@ class Notification(BaseModel):
         """
         data = self.model_dump(mode="json", exclude={"dedupe_key", "metadata"})
         data["turn_id"] = self.turn_id
+        data["resident_id"] = self.resident_id
+        data["resident_session_id"] = self.resident_session_id
         return data
 
 

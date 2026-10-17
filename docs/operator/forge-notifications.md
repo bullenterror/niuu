@@ -19,6 +19,8 @@ This page covers how to operate the feature.
 | `system` | attention | A session starts waiting for its owner (a question, confirmation or permission request). | `attention:{session}:{state_since}[:{request_id}]` |
 | `operator` | any except reply_ready | `POST /api/v1/forge/sessions/{id}/notifications` | `submit:{session}:{principal}:{idempotency_key}` |
 | `agent` (direct) | milestone, decision, attention, error, info | The same direct submit made by the session itself with its own session credential, for example through the Forge-hosted MCP endpoint | `submit:{session}:agent:{owner}:{idempotency_key}` |
+| `system` | attention | A resident is waiting for its owner (an operator question). Read from the resident's notification outbox; see [Residents](#residents). | `resident-attention:{resident}:{channel or room}:{request_id}` |
+| `agent` | milestone, decision, attention, error, info | A resident's agent calls its `notify` tool. Read from the resident's notification outbox. | `resident-notify:{resident}:{channel or room}:{idempotency_key}` |
 
 The notification id is a uuid5 of the dedupe key, so every retry maps to the same
 notification. A retried log append, activity report or submit never creates a second
@@ -83,6 +85,48 @@ Every notification carries `turn_id` (null when it has no turn). Resolve it with
 `total_turns`, so a client opens the conversation window at that turn with
 `?after=<index-1>`. The raw log read (`/sessions/{id}/log`) never returns
 `conversation.turn` rows by design, so do not anchor on log sequence numbers.
+
+## Residents
+
+A resident (a long-lived Ravn) is not a Forge session, so it has no session log or
+activity reports to project from. It keeps a small durable notification outbox
+instead (in its OpenClaw shim's state database): the operator questions it waits on,
+their answers, and what its agent sends with its `notify` tool. Forge follows the
+outbox of every active resident that serves sessions, over the same connection it
+drives the resident's channels with, authenticated by the resident's own shim token
+from the credential store. So it works on every resident backend (helmrelease and
+OpenShell) with nothing to configure, and the resident holds no Forge credential.
+
+- **Attention.** When the resident asks its owner a question (`ask_operator`), Forge
+  records an `attention` item from `source: system`, the same item a waiting session
+  raises, so the owner's **Needs-input pushes** rule delivers it. When the owner
+  answers (in the room, through Telegram or the API), the item is marked read.
+  Questions still waiting when the resident starts are raised once.
+- **Notify.** The resident's agent has a `notify` tool, the counterpart of the Forge
+  MCP `notify`. Its notifications are recorded as `source: agent`.
+- **Anchor.** `session_id` is null. The item carries `resident_id` and
+  `resident_session_id` (the channel it came from; null for the main room) in the
+  feed, the live event, webhook payloads and push payloads. Deliveries link to
+  `notifications.resident_link_path` / `resident_session_link_path`.
+- **Delivery.** The same rules, outbox, dispatcher and sinks as for sessions.
+
+Forge acknowledges what it recorded, and the resident then drops it. Every recording
+is idempotent, so a reconnect or several Forge replicas never produce a duplicate.
+
+```yaml
+resident_runtimes:
+  notifications:
+    enabled: true              # needs notifications.enabled
+    batch_size: 100
+    idle_resync_seconds: 60    # pull again without a change event
+    reconnect_initial_seconds: 5
+    reconnect_max_seconds: 300 # also how often a resident without an outbox is rechecked
+```
+
+On the resident, `gateway.channels.openclaw.notifications_enabled` (default true)
+serves the outbox and offers `notify`; `notifications_max_pending` (default 1000)
+bounds what is kept while Forge does not drain it. A resident whose shim is off
+(`resident.openclaw.enabled: false`) has no outbox.
 
 ## Live events
 
@@ -264,7 +308,7 @@ Each delivery is a `POST` with `Content-Type: application/json`:
 {"type": "forge.notification", "version": 1, "delivery_id": "…", "attempt": 1,
  "notification": {"id": "…", "kind": "decision", "severity": "warning", "source": "agent",
    "title": "…", "body": "…", "owner_id": "…", "session_id": "…", "session_name": "…",
-   "host": "…", "project_id": null, "url": "https://forge…/volundr/session/…",
+   "resident_id": null, "resident_session_id": null, "host": "…", "project_id": null, "url": "https://forge…/volundr/session/…",
    "links": [{"label": "PR", "url": "…", "kind": "pr"}], "engine": "claude",
    "model": "…", "correlation_id": null, "created_at": "ISO-8601"}}
 ```
@@ -401,6 +445,8 @@ notifications:
   host_label: ""             # host name shown in messages; empty = the URL's hostname
   session_link_path: /volundr/session/{session_id}#notification-{notification_id}
   feed_link_path: /volundr/notifications
+  resident_link_path: /ravn?ravn={resident_id}&tab=chat
+  resident_session_link_path: /ravn?ravn={resident_id}&tab=chat&session={resident_session_id}
   dispatcher:
     enabled: true            # run the outbox dispatcher on this host
     poll_interval_seconds: 2.0

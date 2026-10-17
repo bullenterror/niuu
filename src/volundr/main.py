@@ -124,6 +124,10 @@ from volundr.adapters.outbound.postgres_tokens import PostgresTokenTracker
 from volundr.adapters.outbound.postgres_users import PostgresUserRepository
 from volundr.adapters.outbound.pricing import HardcodedPricingProvider
 from volundr.adapters.outbound.resident_flock import ResidentFlockAdapter
+from volundr.adapters.outbound.resident_notification_relay import (
+    RelaySettings,
+    ResidentNotificationRelay,
+)
 from volundr.adapters.outbound.skuld_room import SkuldRoomAdapter
 from volundr.app_shell import build_app_shell
 from volundr.catalog import build_catalog
@@ -227,6 +231,32 @@ async def _refresh_bifrost_catalog(
     while True:
         await _load_bifrost_catalog(pricing_provider, bifrost_catalog)
         await asyncio.sleep(interval_seconds)
+
+
+def _create_resident_notification_relay(
+    settings: Settings,
+    repository: Any,
+    session_controllers: list[Any],
+    notification_service: NotificationService | None,
+) -> ResidentNotificationRelay | None:
+    """Follow residents' notification outboxes into the feed (``resident_runtimes.notifications``).
+
+    Off with the feed itself: there is nowhere to record them without it.
+    """
+    config = settings.resident_runtimes.notifications
+    if notification_service is None or not config.enabled:
+        return None
+    return ResidentNotificationRelay(
+        repository,
+        session_controllers,
+        notification_service,
+        RelaySettings(
+            batch_size=config.batch_size,
+            idle_resync_seconds=config.idle_resync_seconds,
+            reconnect_initial_seconds=config.reconnect_initial_seconds,
+            reconnect_max_seconds=config.reconnect_max_seconds,
+        ),
+    )
 
 
 def _create_notification_service(
@@ -441,6 +471,7 @@ async def _reconcile_resident_runtimes_loop(
     *,
     interval_seconds: float,
     flock_adapter: ResidentFlockAdapter | None = None,
+    notification_relay: ResidentNotificationRelay | None = None,
 ) -> None:
     """Periodically converge durable resident records with backend state."""
     logger.info(
@@ -453,6 +484,8 @@ async def _reconcile_resident_runtimes_loop(
             await service.reconcile_all()
             if flock_adapter is not None:
                 await flock_adapter.sync()
+            if notification_relay is not None:
+                await notification_relay.sync()
         except asyncio.CancelledError:
             logger.info("Resident runtime reconcile loop cancelled")
             break
@@ -1025,6 +1058,13 @@ def create_app(
                 settings, pool, broadcaster=broadcaster, integration_repository=integration_repo
             )
             app.state.notification_service = notification_service
+            resident_notification_relay = _create_resident_notification_relay(
+                settings,
+                resident_runtime_repository,
+                resident_session_controllers,
+                notification_service,
+            )
+            app.state.resident_notification_relay = resident_notification_relay
             notification_delivery = _create_notification_delivery(
                 settings,
                 pool,
@@ -1848,6 +1888,7 @@ def create_app(
                     resident_runtime_service,
                     interval_seconds=settings.resident_runtimes.reconciliation_interval_seconds,
                     flock_adapter=resident_flock_adapter,
+                    notification_relay=resident_notification_relay,
                 )
             )
             if notification_delivery is not None:
@@ -1868,6 +1909,8 @@ def create_app(
             await resident_runtime_service.reconcile_all()
             if resident_flock_adapter is not None:
                 await resident_flock_adapter.sync()
+            if resident_notification_relay is not None:
+                await resident_notification_relay.sync()
 
             if compute_pool is not None:
                 compute_pool_task = asyncio.create_task(compute_pool.run())
@@ -1915,6 +1958,8 @@ def create_app(
                     pass
                 if resident_flock_adapter is not None:
                     await resident_flock_adapter.stop()
+                if resident_notification_relay is not None:
+                    await resident_notification_relay.stop()
                 await resident_runtime_service.close()
                 await event_ingestion.close_all()
                 if settings.compute is None and hasattr(pod_manager, "close"):

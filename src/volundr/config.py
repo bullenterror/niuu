@@ -414,6 +414,43 @@ class ResidentSessionControllerConfig(BaseModel):
     secret_kwargs_env: dict[str, str] = Field(default_factory=dict)
 
 
+class ResidentNotificationRelayConfig(BaseModel):
+    """Residents' notifications into the Forge feed (``ResidentNotificationRelay``).
+
+    Forge follows each active resident's notification outbox over the resident's
+    OpenClaw shim, with the per-resident token it drives the resident's channels
+    with, and records what the resident queued (questions it waits on, their
+    answers, its agent's own notifications). Needs ``notifications.enabled``.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description="Follow residents' notification outboxes into the notification feed.",
+    )
+    batch_size: int = Field(
+        default=100, ge=1, le=200, description="Most outbox entries read per pull."
+    )
+    idle_resync_seconds: float = Field(
+        default=60.0,
+        gt=0,
+        description=(
+            "Pull again after this long without a change event, so a missed event "
+            "delays an entry by at most this much."
+        ),
+    )
+    reconnect_initial_seconds: float = Field(
+        default=5.0, gt=0, description="First wait before reconnecting to a resident."
+    )
+    reconnect_max_seconds: float = Field(
+        default=300.0,
+        gt=0,
+        description=(
+            "Longest wait between reconnects (doubling from reconnect_initial_seconds), "
+            "and how often a resident that serves no outbox is checked again."
+        ),
+    )
+
+
 class ResidentRuntimesConfig(BaseModel):
     """Configured resident deployment profiles for this Volundr target."""
 
@@ -451,6 +488,9 @@ class ResidentRuntimesConfig(BaseModel):
         default=10.0,
         gt=0,
         description="Interval between resident backend reconciliation passes.",
+    )
+    notifications: ResidentNotificationRelayConfig = Field(
+        default_factory=ResidentNotificationRelayConfig
     )
     a2a_public_base_url: str = Field(
         default="",
@@ -1013,6 +1053,20 @@ class NotificationsConfig(BaseModel):
         default="/volundr/notifications",
         description="Deep-link path for a notification without a session.",
     )
+    resident_link_path: str = Field(
+        default="/ravn?ravn={resident_id}&tab=chat",
+        description=(
+            "Deep-link path for a resident's notification from its main room "
+            "({resident_id}, {notification_id})."
+        ),
+    )
+    resident_session_link_path: str = Field(
+        default="/ravn?ravn={resident_id}&tab=chat&session={resident_session_id}",
+        description=(
+            "Deep-link path for a resident's notification from one of its channels "
+            "({resident_id}, {resident_session_id}, {notification_id})."
+        ),
+    )
 
     @model_validator(mode="after")
     def _valid(self) -> "NotificationsConfig":
@@ -1051,9 +1105,14 @@ class NotificationsConfig(BaseModel):
         try:
             self.session_link_path.format(session_id="s", notification_id="n")
             self.feed_link_path.format()
+            self.resident_link_path.format(resident_id="r", notification_id="n")
+            self.resident_session_link_path.format(
+                resident_id="r", resident_session_id="c", notification_id="n"
+            )
         except (KeyError, IndexError, ValueError) as exc:
             raise ValueError(
-                "notifications link paths may only use {session_id} and {notification_id}"
+                "notifications link paths may only use {session_id}, {resident_id}, "
+                "{resident_session_id} (where they apply) and {notification_id}"
             ) from exc
         return self
 

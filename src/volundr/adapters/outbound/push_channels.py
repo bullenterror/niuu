@@ -103,6 +103,7 @@ class WebhookNotificationChannel(NotificationChannel):
             payload["notification_id"] = message.notification_id
         if message.url:
             payload["url"] = message.url
+        payload.update(_resident_fields(message))
         headers = {"content-type": "application/json"}
         if self._secret:
             body = httpx.Request("POST", self._url, json=payload).content
@@ -209,6 +210,7 @@ class ApnsNotificationChannel(NotificationChannel):
             payload["notification_id"] = message.notification_id
         if message.url:
             payload["url"] = message.url
+        payload.update(_resident_fields(message))
         accepted = 0
         failures: list[NotificationDeliveryError] = []
         for device in ios_devices:
@@ -271,3 +273,16 @@ class ApnsNotificationChannel(NotificationChannel):
                 status_code=resp.status_code,
             )
         return None
+
+
+def _resident_fields(message: PushMessage) -> dict[str, str]:
+    """A resident's push names the resident and its channel, so a tap can open it.
+
+    Absent for a session's push; ``resident_session_id`` is absent for the main room.
+    """
+    fields: dict[str, str] = {}
+    if message.resident_id:
+        fields["resident_id"] = message.resident_id
+        if message.resident_session_id:
+            fields["resident_session_id"] = message.resident_session_id
+    return fields

@@ -88,6 +88,7 @@ async def running_shim(
     agent_id: str = "travis",
     max_live_sessions: int = 8,
     token: str = TOKEN,
+    notifications=None,
 ):
     """Boot the shim on an ephemeral port and yield its URL."""
     from ravn.adapters.channels import gateway_openclaw as mod
@@ -114,7 +115,7 @@ async def running_shim(
         mod.TICK_EMIT_SECONDS = tick_seconds
 
     store = OpenClawStore(Cfg.store_path)
-    gw = OpenClawGateway(Cfg(), stub, store=store)
+    gw = OpenClawGateway(Cfg(), stub, store=store, notifications=notifications)
     config = uvicorn.Config(
         gw._app,
         host="127.0.0.1",
