@@ -1363,6 +1363,17 @@ class TestPreviewCacheStorage:
         volume = next(v for v in volumes if v["name"] == "preview-cache")
         assert volume["emptyDir"]["sizeLimit"] == "1Gi"
 
+    def test_deployment_mounts_scratch_emptydir_at_tmp(self):
+        """The root filesystem is read-only, so /tmp is an emptyDir (tempfile needs it)."""
+        _, deployment = self._render()
+        pod = deployment["spec"]["template"]["spec"]
+        volundr_container = next(c for c in pod["containers"] if c["name"] == "volundr")
+        assert volundr_container["securityContext"]["readOnlyRootFilesystem"] is True
+        mount = next(m for m in volundr_container["volumeMounts"] if m["name"] == "scratch")
+        assert mount["mountPath"] == "/tmp"
+        volume = next(v for v in pod["volumes"] if v["name"] == "scratch")
+        assert volume["emptyDir"]["sizeLimit"] == "4Gi"
+
     def test_deployment_preview_cache_mount_path_follows_override(self):
         _, deployment = self._render("--set", "previewCache.mountPath=/custom/preview")
         containers = deployment["spec"]["template"]["spec"]["containers"]

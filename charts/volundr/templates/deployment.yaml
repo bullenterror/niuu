@@ -326,6 +326,8 @@ spec:
             {{- end }}
             - name: preview-cache
               mountPath: {{ .Values.previewCache.mountPath | default "/volundr/preview-cache" }}
+            - name: scratch
+              mountPath: /tmp
             {{- with .Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -501,6 +503,15 @@ spec:
           {{- if .Values.previewCache.sizeLimit }}
           emptyDir:
             sizeLimit: {{ .Values.previewCache.sizeLimit }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        # The root filesystem is read-only; /tmp is Völundr's scratch space (Python's
+        # tempfile), e.g. the archive spools of a resident's workspace migration.
+        - name: scratch
+          {{- if .Values.scratch.sizeLimit }}
+          emptyDir:
+            sizeLimit: {{ .Values.scratch.sizeLimit }}
           {{- else }}
           emptyDir: {}
           {{- end }}
