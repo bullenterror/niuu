@@ -388,7 +388,11 @@ class HostProcessResidentRuntimeController(
             await self._stop(runtime)
             return self._idle_observation(runtime, ResidentObservedState.SUSPENDED, "Suspended")
 
-    async def resume(self, runtime: ResidentRuntime) -> ResidentRuntimeObservation:
+    async def resume(
+        self,
+        runtime: ResidentRuntime,
+        profile: ResidentDeploymentProfile | None = None,
+    ) -> ResidentRuntimeObservation:
         async with self._lock(runtime.id):
             profile = self._profiles.get(runtime.id)
             if profile is None:

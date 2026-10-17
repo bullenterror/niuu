@@ -148,6 +148,40 @@ path and its returned `instance_id` as the query parameter. Guild resolves that
 visible target and forwards the authenticated command without probing another
 cluster.
 
+### Upgrades follow the platform
+
+A resident runs the version its Volundr deploys now, not the one it was created
+with. When Volundr is deployed with a newer Skuld chart or image (the
+`podManager` `chart_version`, the profile's `deployment.values` images, or
+OpenShell's sandbox image), reconciliation moves each running resident to it
+once and logs `Upgrading resident <name> from <old> to <new>`. The running
+version is in the resident's `backendRef` (`platformVersion` on Flux, `image` on
+OpenShell).
+
+- **Flux:** the HelmRelease is replaced with the chart version and values the
+  profile renders now, keeping the storage it mounts (its own
+  `resident-<id>-home`/`-workspace` PVCs) and its shim token Secret, so it is a
+  rolling update with its disks and channels intact. The release records the
+  version in `niuu.world/platform-version` and the one it replaced in
+  `niuu.world/replaced-platform-version`; neither is applied again by
+  reconciliation, so an edited release is left alone and an old Volundr replica
+  does not move a resident back during Volundr's own rollout.
+- **OpenShell:** a sandbox's image is fixed at creation, so the sandbox is
+  recreated on the new image and the resident keeps its record, credentials and
+  shim token. This happens only when the profile keeps the workspace on a claim
+  (`persistence.existingClaim` with a `mountPath` at or above the sandbox
+  workspace). Without one, nothing ever recreates the sandbox: the upgrade is
+  held with a `PlatformUpgrade` / `UpgradeHeld` condition ("No persistent
+  workspace; the sandbox image can't change without losing /sandbox"), shown
+  in the resident's conditions, and Restart restarts its processes in place as
+  before.
+- **Restart** re-renders the resident on the current version, where that keeps
+  its state. **Resume** starts a suspended Flux resident on the current
+  version; suspended residents are not woken to upgrade.
+- A failed upgrade marks the resident failed with a `PlatformUpgrade` /
+  `UpgradeFailed` condition and is not retried until the version changes again,
+  the resident is restarted, or Volundr restarts.
+
 Key chart values:
 
 | Value | Meaning |

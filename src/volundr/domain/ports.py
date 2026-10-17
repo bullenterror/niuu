@@ -871,8 +871,12 @@ class ResidentRuntimeController(ABC):
         """Suspend a resident while retaining its durable storage."""
 
     @abstractmethod
-    async def resume(self, runtime: ResidentRuntime) -> ResidentRuntimeObservation:
-        """Resume a suspended resident."""
+    async def resume(
+        self,
+        runtime: ResidentRuntime,
+        profile: ResidentDeploymentProfile | None = None,
+    ) -> ResidentRuntimeObservation:
+        """Resume a suspended resident; with its profile, on the version it renders now."""
 
     @abstractmethod
     async def delete(self, runtime: ResidentRuntime) -> bool:

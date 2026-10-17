@@ -218,11 +218,19 @@ class _FakeOpenShellGatewayClient:
         self.closed = False
         self.sandbox_exists = True
         self.sandbox_labels: dict[str, str] = {"volundr.niuu.io/storage": "forge"}
+        # The sandbox template's image and annotations, as the gateway keeps them.
+        self.sandbox_image = ""
+        self.sandbox_annotations: dict[str, str] = {}
+        # Deleted sandboxes created again under the same name.
+        self.recreated: set[str] = set()
 
     def create_sandbox(self, **kwargs):
         self.created = kwargs
         self.sandbox_exists = True
         self.sandbox_labels = dict(kwargs.get("labels") or {})
+        self.sandbox_image = kwargs.get("image") or ""
+        self.sandbox_annotations = dict(kwargs.get("annotations") or {})
+        self.recreated.add(kwargs["name"])
         return self._adapter.OpenShellSandbox(
             id="sandbox-id",
             name=kwargs["name"],
@@ -230,7 +238,7 @@ class _FakeOpenShellGatewayClient:
         )
 
     def get_sandbox(self, name: str):
-        if name in self.deleted:
+        if name in self.deleted and name not in self.recreated:
             if self.delete_polls_remaining:
                 self.delete_polls_remaining -= 1
                 self.cleanup_events.append("sandbox-present")
@@ -246,6 +254,8 @@ class _FakeOpenShellGatewayClient:
             ready=True,
             labels=self.sandbox_labels,
             providers=tuple(self.created.get("providers", ())) if self.created else (),
+            image=self.sandbox_image,
+            annotations=self.sandbox_annotations,
         )
 
     def exec_detached(self, **kwargs) -> int:
@@ -275,6 +285,7 @@ class _FakeOpenShellGatewayClient:
 
     def delete_sandbox(self, name: str) -> bool:
         self.deleted.append(name)
+        self.recreated.discard(name)
         return True
 
     def delete_service(self, **kwargs) -> bool:
@@ -3843,3 +3854,268 @@ async def test_ravn_sessions_reach_the_shim_over_the_native_tcp_tunnel(
 
     await manager.delete(redeployed)
     assert {"sandbox_id": "sandbox-2", "target_port": 18790} in client.closed_forwarders
+
+
+_CURRENT_SANDBOX_IMAGE = "ghcr.io/niuulabs/openshell:niu-1099-openshell-resident"
+_OLD_SANDBOX_IMAGE = "ghcr.io/niuulabs/openshell:dev-6d5a0ce"
+
+
+def _persisted_profile(tag: str = "niu-1099-openshell-resident") -> ResidentDeploymentProfile:
+    """The resident profile with its workspace on a persistent claim."""
+    profile = _resident_profile()
+    values = profile.deployment["values"]
+    values["image"]["tag"] = tag
+    values["persistence"] = {
+        "enabled": True,
+        "existingClaim": "noatun-residents",
+        "mountPath": "/sandbox/workspace",
+    }
+    return profile
+
+
+async def _resident_on_old_image(monkeypatch: pytest.MonkeyPatch):
+    """A deployed Ravn resident whose sandbox an older Völundr created, with its token."""
+    adapter = _import_adapter(monkeypatch)
+    runtime = _deployed_resident(_resident_runtime())
+    client = _FakeOpenShellGatewayClient(adapter)
+    client.sandbox_image = _OLD_SANDBOX_IMAGE
+    client.exec_script = lambda **_kwargs: (0, "")
+    manager = _deployed_resident_manager(adapter, client, runtime)
+    store = _bind_ravn_sessions(manager)
+    await store.store("resident", str(runtime.id), "ravn-openclaw", "generic", {"token": "kept"})
+    return adapter, runtime, client, manager, store
+
+
+def _redeploying(runtime: ResidentRuntime, state=ResidentObservedState.PENDING) -> ResidentRuntime:
+    """The resident as the service records a reconcile that reported no backend."""
+    return runtime.model_copy(update={"observed_state": state, "backend_ref": {}})
+
+
+@pytest.mark.asyncio
+async def test_reconcile_recreates_a_persisted_residents_sandbox_on_the_current_image(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    adapter, runtime, client, manager, store = await _resident_on_old_image(monkeypatch)
+    profile = _persisted_profile()
+    sandbox_name = runtime.backend_ref["name"]
+
+    with caplog.at_level("INFO", logger=adapter.__name__):
+        observation = await manager.reconcile(runtime, profile)
+
+    # Reported as owning no backend: the service redeploys it (the #1122 path).
+    assert observation.observed_state is ResidentObservedState.PENDING
+    assert observation.backend_ref == {}
+    assert observation.conditions[0].reason == "Upgrading"
+    assert client.deleted == [sandbox_name]
+    assert client.created is None
+    assert (
+        f"Upgrading resident OpenShell Muninn from {_OLD_SANDBOX_IMAGE} to "
+        f"{_CURRENT_SANDBOX_IMAGE}" in caplog.messages
+    )
+
+    deployed = await manager.deploy(_redeploying(runtime), profile)
+
+    assert client.created["image"] == _CURRENT_SANDBOX_IMAGE
+    assert client.created["annotations"]["volundr.niuu.io/image"] == _CURRENT_SANDBOX_IMAGE
+    assert client.created["annotations"]["volundr.niuu.io/replaced-image"] == _OLD_SANDBOX_IMAGE
+    assert client.created["driver_config"]["volumes"][0]["persistent_volume_claim"] == {
+        "claim_name": "noatun-residents",
+        "read_only": False,
+    }
+    assert deployed.observed_state is ResidentObservedState.ACTIVE
+    assert deployed.backend_ref["image"] == _CURRENT_SANDBOX_IMAGE
+    # Same resident, same shim token: its channels keep working.
+    assert await _kept_shim_token(store, runtime) == "kept"
+    assert {process["env"]["RAVN_OPENCLAW_TOKEN"] for process in client.execs} == {"kept"}
+
+    # Once: the new sandbox runs the current image.
+    upgraded = runtime.model_copy(update={"backend_ref": deployed.backend_ref})
+    again = await manager.reconcile(upgraded, profile)
+    assert client.deleted == [sandbox_name]
+    assert again.observed_state is ResidentObservedState.ACTIVE
+
+
+@pytest.mark.asyncio
+async def test_an_upgrade_that_would_drop_unpersisted_state_is_held(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, runtime, client, manager, _ = await _resident_on_old_image(monkeypatch)
+
+    observation = await manager.reconcile(runtime, _resident_profile())
+
+    assert client.deleted == []
+    assert client.created is None
+    assert observation.observed_state is ResidentObservedState.ACTIVE
+    _assert_held(observation.conditions[-1])
+    assert observation.backend_ref["image"] == _OLD_SANDBOX_IMAGE
+
+
+def _assert_held(condition) -> None:
+    assert (condition.type, condition.status.value, condition.reason) == (
+        "PlatformUpgrade",
+        "false",
+        "UpgradeHeld",
+    )
+    assert condition.message.startswith(
+        "No persistent workspace; the sandbox image can't change without losing /sandbox."
+    )
+    assert _OLD_SANDBOX_IMAGE in condition.message
+    assert _CURRENT_SANDBOX_IMAGE in condition.message
+
+
+@pytest.mark.asyncio
+async def test_restart_of_an_unpersisted_resident_restarts_in_place_and_never_recreates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Its state lives only in its sandbox: a Restart from Lexi must not wipe it."""
+    _, runtime, client, manager, store = await _resident_on_old_image(monkeypatch)
+
+    observation = await manager.restart(runtime, _resident_profile())
+    again = await manager.restart(runtime, _resident_profile())
+
+    assert client.deleted == []
+    assert client.deleted_services == []
+    assert client.created is None
+    # The processes restarted in the existing sandbox, as before.
+    assert [process["pid_path"] for process in client.execs] == [
+        "/sandbox/.volundr/skuld.pid",
+        "/sandbox/.volundr/ravn.pid",
+    ] * 2
+    assert {process["sandbox_id"] for process in client.execs} == {"sandbox-id"}
+    for restarted in (observation, again):
+        assert restarted.observed_state is ResidentObservedState.ACTIVE
+        assert restarted.backend_ref["image"] == _OLD_SANDBOX_IMAGE
+        _assert_held(restarted.conditions[-1])
+    assert await _kept_shim_token(store, runtime) == "kept"
+
+
+@pytest.mark.asyncio
+async def test_restart_moves_a_persisted_resident_onto_the_current_image(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, runtime, client, manager, store = await _resident_on_old_image(monkeypatch)
+
+    observation = await manager.restart(runtime, _persisted_profile())
+
+    assert client.deleted == [runtime.backend_ref["name"]]
+    assert client.created["image"] == _CURRENT_SANDBOX_IMAGE
+    assert observation.backend_ref["image"] == _CURRENT_SANDBOX_IMAGE
+    assert all(condition.type != "PlatformUpgrade" for condition in observation.conditions)
+    assert await _kept_shim_token(store, runtime) == "kept"
+
+
+@pytest.mark.asyncio
+async def test_restart_on_the_current_image_restarts_processes_in_place(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, runtime, client, manager, _ = await _resident_on_old_image(monkeypatch)
+    client.sandbox_image = _CURRENT_SANDBOX_IMAGE
+
+    await manager.restart(runtime, _resident_profile())
+
+    assert client.deleted == []
+    assert client.created is None
+    assert [process["pid_path"] for process in client.execs] == [
+        "/sandbox/.volundr/skuld.pid",
+        "/sandbox/.volundr/ravn.pid",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_upgrade_is_reported_without_redeploying_in_a_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, runtime, client, manager, store = await _resident_on_old_image(monkeypatch)
+    profile = _persisted_profile()
+    await manager.reconcile(runtime, profile)
+    client.create_sandbox = Mock(side_effect=RuntimeError("image pull failed"))
+
+    with pytest.raises(RuntimeError, match="image pull failed"):
+        await manager.deploy(_redeploying(runtime), profile)
+
+    # A failed upgrade keeps the resident's identity: its token is still kept.
+    assert await _kept_shim_token(store, runtime) == "kept"
+    failed = _redeploying(runtime, ResidentObservedState.FAILED)
+    for _ in range(2):
+        observation = await manager.reconcile(failed, profile)
+        assert observation.observed_state is ResidentObservedState.FAILED
+        condition = observation.conditions[0]
+        assert (condition.type, condition.reason) == ("PlatformUpgrade", "UpgradeFailed")
+        assert "image pull failed" in condition.message
+        assert "Restart the resident to retry" in condition.message
+    assert client.create_sandbox.call_count == 1
+
+    # An explicit restart tries again.
+    del client.create_sandbox
+    restarted = await manager.restart(failed, profile)
+    assert client.created["image"] == _CURRENT_SANDBOX_IMAGE
+    assert restarted.observed_state is ResidentObservedState.ACTIVE
+
+
+@pytest.mark.asyncio
+async def test_an_older_volundr_does_not_move_the_resident_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """While Völundr itself rolls out, its old replica still deploys the image replaced."""
+    _, runtime, client, manager, _ = await _resident_on_old_image(monkeypatch)
+    client.sandbox_image = _CURRENT_SANDBOX_IMAGE
+    client.sandbox_annotations = {
+        "volundr.niuu.io/image": _CURRENT_SANDBOX_IMAGE,
+        "volundr.niuu.io/replaced-image": _OLD_SANDBOX_IMAGE,
+    }
+
+    observation = await manager.reconcile(runtime, _persisted_profile(tag="dev-6d5a0ce"))
+
+    assert client.deleted == []
+    assert all(condition.type != "PlatformUpgrade" for condition in observation.conditions)
+
+
+@pytest.mark.asyncio
+async def test_the_held_reason_reaches_the_resident_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lexi and the web read why a resident is not upgrading from its conditions."""
+    from fastapi import FastAPI
+    from httpx import ASGITransport, AsyncClient
+
+    from niuu.domain.models import Principal as NiuuPrincipal
+    from volundr.adapters.inbound.auth import extract_principal
+    from volundr.adapters.inbound.rest_resident_runtimes import create_resident_runtimes_router
+    from volundr.domain.services.resident_runtime import ResidentRuntimeService
+
+    _, runtime, client, manager, _ = await _resident_on_old_image(monkeypatch)
+    records = {runtime.id: runtime}
+
+    class _Repository:
+        async def get(self, runtime_id):
+            return records.get(runtime_id)
+
+        async def update(self, updated):
+            records[updated.id] = updated
+            return updated
+
+    profiles = Mock()
+    profiles.get.return_value = _resident_profile()
+    service = ResidentRuntimeService(_Repository(), profiles, [manager])
+    principal = NiuuPrincipal(
+        user_id="owner-1", email="", tenant_id="tenant-1", roles=["volundr:developer"]
+    )
+    app = FastAPI()
+    app.include_router(create_resident_runtimes_router(service))
+    app.dependency_overrides[extract_principal] = lambda: principal
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as api:
+        restarted = await api.post(f"/api/v1/forge/resident-runtimes/{runtime.id}/restart")
+        fetched = await api.get(f"/api/v1/forge/resident-runtimes/{runtime.id}")
+
+    assert restarted.status_code == fetched.status_code == 200
+    assert client.deleted == []
+    for body in (restarted.json(), fetched.json()):
+        [held] = [c for c in body["conditions"] if c["type"] == "PlatformUpgrade"]
+        assert held["status"] == "false"
+        assert held["reason"] == "UpgradeHeld"
+        assert held["message"].startswith(
+            "No persistent workspace; the sandbox image can't change without losing /sandbox."
+        )
+        assert body["backendRef"]["image"] == _OLD_SANDBOX_IMAGE

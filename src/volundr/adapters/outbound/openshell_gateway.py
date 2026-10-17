@@ -128,6 +128,11 @@ DEFAULT_SERVICE_PORT = 9200
 READY_POLL_INTERVAL = 1.0
 DEFAULT_RESOURCE_DELETE_TIMEOUT_SECONDS = 30.0
 TCP_FORWARD_BUFFER_BYTES = 64 * 1024
+#: The image Völundr created a resident's sandbox with (sandbox template annotation).
+SANDBOX_IMAGE_ANNOTATION = "volundr.niuu.io/image"
+#: The image of the sandbox this one replaced on an upgrade. A Völundr that still
+#: renders it (the old replica while Völundr itself rolls out) must not move back.
+SANDBOX_REPLACED_IMAGE_ANNOTATION = "volundr.niuu.io/replaced-image"
 # Backoff for calls the gateway rejected because its SQLite store was locked by
 # a concurrent write (SQLITE_BUSY); several resident deployments at once hit it.
 GATEWAY_BUSY_RETRY_DELAYS = (0.25, 0.5, 1.0, 2.0, 4.0)
@@ -189,6 +194,20 @@ class OpenShellSandbox:
     ready: bool = False
     labels: dict[str, str] | None = None
     providers: tuple[str, ...] = ()
+    #: The image and annotations of the sandbox's template, as the gateway keeps them.
+    image: str = ""
+    annotations: dict[str, str] | None = None
+
+
+@dataclass(frozen=True)
+class OpenShellPlatformFollow:
+    """What following the platform's version means for one resident this pass."""
+
+    #: The sandbox is being recreated on the current image: report this.
+    redeploy: ResidentRuntimeObservation | None = None
+    #: Reported with the resident's observation: a held or failed upgrade.
+    condition: ResidentCondition | None = None
+    failed: bool = False
 
 
 @dataclass(frozen=True)
@@ -977,6 +996,14 @@ class OpenShellGatewayPodManager(
         self._resident_openclaw_tokens: ResidentOpenClawTokens | None = None
         # Ravn residents whose shim this Volundr has seen up, or restarted once to start.
         self._resident_openclaw_checked: set[str] = set()
+        # Residents whose sandbox is being recreated on the current image: resident
+        # id -> the image it replaces, until the new sandbox is deployed.
+        self._resident_upgrades: dict[str, str] = {}
+        # Residents whose upgrade failed in this Völundr: id -> (target image, reason).
+        # Not retried until the target changes, an explicit restart, or Völundr restarts.
+        self._failed_resident_upgrades: dict[str, tuple[str, str]] = {}
+        # (resident id, target image) upgrades held, logged once; "" when the image is unknown.
+        self._held_resident_upgrades: set[tuple[str, str]] = set()
 
     def set_resident_openclaw_tokens(self, tokens: ResidentOpenClawTokens) -> None:
         """Where each Ravn resident's own shim token is kept (RavnResidentSessionController)."""
@@ -1064,7 +1091,10 @@ class OpenShellGatewayPodManager(
             return
         logger.info("Restarting resident %s to start its Ravn sessions shim", runtime.id)
         try:
-            await self.restart(runtime, profile)
+            # Its processes only, in place: moving it to another image is
+            # _follow_platform's decision, not this one's.
+            async with self._resident_process_lock(runtime):
+                await self._restart(runtime, profile, follow_platform=False)
         except Exception:
             logger.warning(
                 "Could not restart resident %s to start its Ravn sessions shim",
@@ -1793,6 +1823,10 @@ class OpenShellGatewayPodManager(
                 await self._wait_for_sandbox_deleted(sandbox_name)
                 sandbox = None
         resumed_deployment = sandbox is not None
+        image = _image_from_values(values, default=self._sandbox_image)
+        # A resident whose sandbox an upgrade recreates keeps its identity: its
+        # credentials survive a failed attempt, as they did the old sandbox.
+        replaced_image = self._resident_upgrades.get(str(runtime.id))
         try:
             if runtime.engine is ResidentEngine.OPENCLAW:
                 from volundr.adapters.outbound.openclaw_gateway import (
@@ -1828,7 +1862,7 @@ class OpenShellGatewayPodManager(
                 sandbox = await asyncio.to_thread(
                     self._client.create_sandbox,
                     name=sandbox_name,
-                    image=_image_from_values(values, default=self._sandbox_image),
+                    image=image,
                     env=env,
                     labels={
                         "app.kubernetes.io/managed-by": "volundr",
@@ -1837,7 +1871,15 @@ class OpenShellGatewayPodManager(
                         **resident_flock_labels(runtime, prefix="volundr.niuu.io"),
                         **mesh_labels,
                     },
-                    annotations=mesh_annotations,
+                    annotations={
+                        **mesh_annotations,
+                        SANDBOX_IMAGE_ANNOTATION: image,
+                        **(
+                            {SANDBOX_REPLACED_IMAGE_ANNOTATION: replaced_image}
+                            if replaced_image and replaced_image != image
+                            else {}
+                        ),
+                    },
                     resources=_resources_from_values(values, cpu=self._cpu, memory=self._memory),
                     driver_config=_driver_config_from_values(values),
                     providers=provider_names,
@@ -1884,11 +1926,19 @@ class OpenShellGatewayPodManager(
                 )
                 if not service_url and not self._gateway_public_url:
                     raise RuntimeError("OpenShell did not return a resident service URL")
-        except Exception:
+        except Exception as exc:
             try:
                 await self._cleanup_resources(sandbox_name, grants, service_name=service_name)
             except Exception:
                 logger.exception("OpenShell resident rollback failed for %s", runtime.id)
+            if replaced_image is not None:
+                reason = (
+                    f"Upgrading resident {runtime.name} from {replaced_image} to {image} "
+                    f"failed: {exc}. Restart the resident to retry."
+                )
+                logger.warning(reason)
+                self._failed_resident_upgrades[str(runtime.id)] = (image, reason)
+                raise
             if runtime.engine is ResidentEngine.OPENCLAW and self._credential_store is not None:
                 await self._credential_store.delete("resident", str(runtime.id), "openclaw-gateway")
             if runtime.engine is ResidentEngine.HERMES and self._credential_store is not None:
@@ -1903,6 +1953,8 @@ class OpenShellGatewayPodManager(
         resolved_service_url = (service_url or self._gateway_public_url).rstrip("/")
         self._service_urls[str(runtime.id)] = resolved_service_url
         self._provider_grants[str(runtime.id)] = grants
+        self._resident_upgrades.pop(str(runtime.id), None)
+        self._failed_resident_upgrades.pop(str(runtime.id), None)
         return self._resident_observation(
             runtime,
             ready,
@@ -1925,6 +1977,14 @@ class OpenShellGatewayPodManager(
             self._resident_sandbox_name(runtime),
         )
         if sandbox is None:
+            failed_upgrade = self._failed_resident_upgrade(runtime, profile)
+            if failed_upgrade is not None and runtime.desired_state is ResidentDesiredState.RUNNING:
+                # Its upgrade's redeploy failed and rolled back: report that rather
+                # than redeploying it on every pass.
+                return ResidentRuntimeObservation(
+                    observed_state=ResidentObservedState.FAILED,
+                    conditions=[_upgrade_failed_condition(failed_upgrade)],
+                )
             if runtime.desired_state is ResidentDesiredState.RUNNING:
                 # The gateway no longer knows this sandbox (for example after a
                 # gateway upgrade orphaned it). Report the resident as owning no
@@ -1973,6 +2033,15 @@ class OpenShellGatewayPodManager(
             )
         processes_ready = False
         values = self._with_brokered_credential_values(_resident_profile_values(profile))
+        follow = OpenShellPlatformFollow()
+        if (
+            sandbox.ready
+            and runtime.backend_ref
+            and runtime.desired_state is ResidentDesiredState.RUNNING
+        ):
+            follow = await self._follow_platform(runtime, values, sandbox)
+            if follow.redeploy is not None:
+                return follow.redeploy
         processes = self._resident_processes(runtime, values)
         service_name, service_port = _resident_service(
             values, self._service_name, self._service_port
@@ -2014,7 +2083,7 @@ class OpenShellGatewayPodManager(
             service_url = (service_url or self._gateway_public_url).rstrip("/")
             if service_url:
                 self._service_urls[str(runtime.id)] = service_url
-        return self._resident_observation(
+        observation = self._resident_observation(
             runtime,
             sandbox,
             service_url=service_url,
@@ -2023,6 +2092,156 @@ class OpenShellGatewayPodManager(
             service_port=service_port,
             process_names=tuple(process.name for process in processes),
         )
+        if follow.condition is None:
+            return observation
+        return replace(
+            observation,
+            observed_state=(
+                ResidentObservedState.FAILED if follow.failed else observation.observed_state
+            ),
+            conditions=[*observation.conditions, follow.condition],
+        )
+
+    def _target_image(self, values: dict[str, Any]) -> str:
+        """The image this Völundr deploys a resident's sandbox with."""
+        return _image_from_values(values, default=self._sandbox_image)
+
+    def _failed_resident_upgrade(
+        self,
+        runtime: ResidentRuntime,
+        profile: ResidentDeploymentProfile,
+    ) -> str | None:
+        """The reason the resident's upgrade to the current image failed, if it did."""
+        failed = self._failed_resident_upgrades.get(str(runtime.id))
+        if failed is None:
+            return None
+        values = _resident_profile_values(profile)
+        return failed[1] if failed[0] == self._target_image(values) else None
+
+    async def _follow_platform(
+        self,
+        runtime: ResidentRuntime,
+        values: dict[str, Any],
+        sandbox: OpenShellSandbox,
+    ) -> OpenShellPlatformFollow:
+        """Move a running resident onto the image this Völundr deploys, once.
+
+        A sandbox's image is fixed when it is created, so moving a resident onto a
+        new image (a new Ravn or Skuld) recreates its sandbox: the existing
+        sandbox and service are removed and the resident is reported as owning no
+        backend, so the service redeploys it in the background like a resident
+        whose sandbox is gone. Its credentials, shim token and record are kept.
+
+        Only a resident whose workspace is on a persistent claim is moved; any
+        other would lose its state under ``/sandbox``, so its upgrade is held and
+        reported (UpgradeHeld), and neither reconcile nor restart recreates it. An image
+        the sandbox replaced is never deployed again by reconcile (an older
+        Völundr replica during Völundr's own rollout), and a failed upgrade is
+        reported, not retried, until the target changes or the resident restarts.
+        """
+        runtime_id = str(runtime.id)
+        target = self._target_image(values)
+        running = _sandbox_image(sandbox)
+        if not running:
+            if (runtime_id, "") not in self._held_resident_upgrades:
+                self._held_resident_upgrades.add((runtime_id, ""))
+                logger.info(
+                    "Resident %s's sandbox reports no image; not following the platform",
+                    runtime.name,
+                )
+            return OpenShellPlatformFollow()
+        if running == target:
+            self._failed_resident_upgrades.pop(runtime_id, None)
+            return OpenShellPlatformFollow()
+        if target == (sandbox.annotations or {}).get(SANDBOX_REPLACED_IMAGE_ANNOTATION):
+            return OpenShellPlatformFollow()
+        failed = self._failed_resident_upgrades.get(runtime_id)
+        if failed is not None and failed[0] == target:
+            return OpenShellPlatformFollow(
+                condition=_upgrade_failed_condition(failed[1]), failed=True
+            )
+        if not _workspace_persisted(values, self._sandbox_workspace):
+            return OpenShellPlatformFollow(condition=self._hold_upgrade(runtime, running, target))
+        lock = self._resident_process_lock(runtime)
+        if lock.locked():
+            return OpenShellPlatformFollow()
+        async with lock:
+            logger.info("Upgrading resident %s from %s to %s", runtime.name, running, target)
+            try:
+                await self._retire_resident_sandbox(runtime, running)
+            except Exception as exc:
+                reason = (
+                    f"Upgrading resident {runtime.name} from {running} to {target} failed: "
+                    f"{exc}. Restart the resident to retry."
+                )
+                logger.warning(reason)
+                self._failed_resident_upgrades[runtime_id] = (target, reason)
+                return OpenShellPlatformFollow(
+                    condition=_upgrade_failed_condition(reason), failed=True
+                )
+        return OpenShellPlatformFollow(
+            redeploy=ResidentRuntimeObservation(
+                observed_state=ResidentObservedState.PENDING,
+                conditions=[
+                    ResidentCondition(
+                        type="SandboxReady",
+                        status=ResidentConditionStatus.FALSE,
+                        reason="Upgrading",
+                        message=f"Recreating the OpenShell sandbox on {target}",
+                    )
+                ],
+            )
+        )
+
+    def _hold_upgrade(
+        self, runtime: ResidentRuntime, running: str, target: str
+    ) -> ResidentCondition:
+        """Why a resident without a persistent workspace stays on its image.
+
+        Its state lives only in its sandbox's ``/sandbox``, and a sandbox's image
+        cannot change without creating a new sandbox, so no path recreates it:
+        neither reconcile nor an explicit restart.
+        """
+        runtime_id = str(runtime.id)
+        reason = (
+            "No persistent workspace; the sandbox image can't change without losing "
+            f"/sandbox. The resident runs {running}; the platform deploys {target}. "
+            "Give its profile a persistent workspace (persistence.existingClaim) to upgrade it."
+        )
+        if (runtime_id, target) not in self._held_resident_upgrades:
+            self._held_resident_upgrades.add((runtime_id, target))
+            logger.info("Not upgrading resident %s: %s", runtime.name, reason)
+        return ResidentCondition(
+            type="PlatformUpgrade",
+            status=ResidentConditionStatus.FALSE,
+            reason="UpgradeHeld",
+            message=reason,
+        )
+
+    async def _retire_resident_sandbox(self, runtime: ResidentRuntime, image: str) -> None:
+        """Remove a resident's sandbox and service so it is deployed anew; keep the rest.
+
+        Its provider grants are named for the resident and re-applied by the
+        deployment; its credentials and shim token stay where they are kept.
+        """
+        runtime_id = str(runtime.id)
+        self._resident_upgrades[runtime_id] = image
+        await self._close_resident_forwarders(runtime)
+        self._service_urls.pop(runtime_id, None)
+        await self._cleanup_resources(
+            self._resident_sandbox_name(runtime),
+            (),
+            service_name=str(runtime.backend_ref.get("service_name") or self._service_name),
+        )
+
+    async def _close_resident_forwarders(self, runtime: ResidentRuntime) -> None:
+        runtime_id = str(runtime.id)
+        for key in [
+            key
+            for key in self._resident_forwarders
+            if key == runtime_id or _is_openclaw_key(key, runtime)
+        ]:
+            await asyncio.to_thread(self._resident_forwarders.pop(key).close)
 
     async def _start_missing_resident_processes(
         self,
@@ -2107,6 +2326,8 @@ class OpenShellGatewayPodManager(
         self,
         runtime: ResidentRuntime,
         profile: ResidentDeploymentProfile,
+        *,
+        follow_platform: bool = True,
     ) -> ResidentRuntimeObservation:
         if not self.supports(profile):
             raise RuntimeError(f"OpenShell does not support resident profile {profile.id!r}")
@@ -2115,8 +2336,27 @@ class OpenShellGatewayPodManager(
             self._client.get_sandbox,
             self._resident_sandbox_name(runtime),
         )
+        runtime_id = str(runtime.id)
+        if follow_platform and sandbox is None and runtime_id in self._failed_resident_upgrades:
+            # Its upgrade's redeploy failed and rolled back: try it again.
+            self._failed_resident_upgrades.pop(runtime_id, None)
+            return await self._deploy(runtime, profile)
         if sandbox is None or not sandbox.ready:
             raise RuntimeError("OpenShell resident sandbox is not ready")
+        running = _sandbox_image(sandbox)
+        target = self._target_image(values)
+        held: ResidentCondition | None = None
+        if follow_platform and running and running != target:
+            if _workspace_persisted(values, self._sandbox_workspace):
+                # A restart runs the resident on the platform's current version: a
+                # new image needs a new sandbox, and its workspace survives that.
+                logger.info("Upgrading resident %s from %s to %s", runtime.name, running, target)
+                self._failed_resident_upgrades.pop(runtime_id, None)
+                await self._retire_resident_sandbox(runtime, running)
+                return await self._deploy(runtime, profile)
+            # Its state is only in this sandbox: restart its processes in place,
+            # as always, and keep reporting why it stays on its image.
+            held = self._hold_upgrade(runtime, running, target)
         processes = self._resident_processes(runtime, values)
         files, env = await self._resident_launch_inputs(runtime, values, processes)
         exit_code, output = await asyncio.to_thread(
@@ -2141,7 +2381,7 @@ class OpenShellGatewayPodManager(
             processes,
             service_port=service_port,
         )
-        return self._resident_observation(
+        observation = self._resident_observation(
             runtime,
             sandbox,
             service_url=str(runtime.backend_ref.get("service_url") or ""),
@@ -2150,11 +2390,18 @@ class OpenShellGatewayPodManager(
             service_port=service_port,
             process_names=tuple(process.name for process in processes),
         )
+        if held is None:
+            return observation
+        return replace(observation, conditions=[*observation.conditions, held])
 
     async def suspend(self, runtime: ResidentRuntime) -> ResidentRuntimeObservation:
         raise RuntimeError("OpenShell resident suspension is unsupported")
 
-    async def resume(self, runtime: ResidentRuntime) -> ResidentRuntimeObservation:
+    async def resume(
+        self,
+        runtime: ResidentRuntime,
+        profile: ResidentDeploymentProfile | None = None,
+    ) -> ResidentRuntimeObservation:
         raise RuntimeError("OpenShell resident suspension is unsupported")
 
     async def delete(self, runtime: ResidentRuntime) -> bool:
@@ -2162,12 +2409,9 @@ class OpenShellGatewayPodManager(
         self._service_urls.pop(runtime_id, None)
         self._resident_process_locks.pop(runtime_id, None)
         self._resident_openclaw_checked.discard(runtime_id)
-        for key in [
-            key
-            for key in self._resident_forwarders
-            if key == runtime_id or _is_openclaw_key(key, runtime)
-        ]:
-            await asyncio.to_thread(self._resident_forwarders.pop(key).close)
+        self._resident_upgrades.pop(runtime_id, None)
+        self._failed_resident_upgrades.pop(runtime_id, None)
+        await self._close_resident_forwarders(runtime)
         sandbox_name = self._resident_sandbox_name(runtime)
         grants = self._provider_grants.pop(runtime_id, ())
         if not grants:
@@ -2520,6 +2764,7 @@ class OpenShellGatewayPodManager(
                 "service_name": service_name,
                 "service_port": service_port,
                 "process_names": list(process_names),
+                "image": _sandbox_image(sandbox),
             },
             endpoints=endpoints,
             conditions=conditions,
@@ -3738,6 +3983,31 @@ def _driver_config_from_values(
     return config
 
 
+def _sandbox_image(sandbox: OpenShellSandbox) -> str:
+    """The image a resident's sandbox runs: as Völundr recorded it, else the gateway's."""
+    return (sandbox.annotations or {}).get(SANDBOX_IMAGE_ANNOTATION) or sandbox.image
+
+
+def _workspace_persisted(values: dict[str, Any], workspace: str) -> bool:
+    """Whether the profile mounts a persistent claim at or above the sandbox workspace."""
+    storage = values.get("persistence")
+    if not isinstance(storage, dict) or not storage.get("existingClaim"):
+        return False
+    mount_path = str(storage.get("mountPath") or "")
+    if not mount_path.startswith("/sandbox/"):
+        return False
+    return PurePosixPath(workspace).is_relative_to(PurePosixPath(mount_path))
+
+
+def _upgrade_failed_condition(message: str) -> ResidentCondition:
+    return ResidentCondition(
+        type="PlatformUpgrade",
+        status=ResidentConditionStatus.FALSE,
+        reason="UpgradeFailed",
+        message=message,
+    )
+
+
 def _resident_state_from_sandbox(
     sandbox: OpenShellSandbox,
     processes_ready: bool,
@@ -4377,6 +4647,7 @@ def _sandbox_policy_from_config(config: dict[str, Any]) -> Any:
 def _sandbox_from_proto(raw: Any) -> OpenShellSandbox:
     metadata = raw.metadata
     status = raw.status
+    template = getattr(raw.spec, "template", None)
     return OpenShellSandbox(
         id=str(metadata.id or ""),
         name=str(metadata.name or status.sandbox_name or ""),
@@ -4387,6 +4658,11 @@ def _sandbox_from_proto(raw: Any) -> OpenShellSandbox:
         ),
         labels={str(key): str(value) for key, value in metadata.labels.items()},
         providers=tuple(str(name) for name in raw.spec.providers),
+        image=str(getattr(template, "image", "") or ""),
+        annotations={
+            str(key): str(value)
+            for key, value in (getattr(template, "annotations", None) or {}).items()
+        },
     )
 
 
