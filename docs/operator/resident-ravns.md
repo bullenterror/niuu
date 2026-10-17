@@ -168,14 +168,16 @@ OpenShell).
   does not move a resident back during Volundr's own rollout.
 - **OpenShell:** a sandbox's image is fixed at creation, so the sandbox is
   recreated on the new image and the resident keeps its record, credentials and
-  shim token. This happens automatically only when the profile keeps the
-  workspace on a claim (`persistence.existingClaim` with a `mountPath` at or above
-  the sandbox workspace); otherwise the upgrade is held with a `PlatformUpgrade`
-  / `UpgradeHeld` condition, because a new sandbox starts with an empty
-  `/sandbox`.
-- **Restart** re-renders the resident on the current version (on OpenShell,
-  also when its upgrade was held). **Resume** starts a suspended resident on the
-  current version; suspended residents are not woken to upgrade.
+  shim token. This happens only when the profile keeps the workspace on a claim
+  (`persistence.existingClaim` with a `mountPath` at or above the sandbox
+  workspace). Without one, nothing ever recreates the sandbox: the upgrade is
+  held with a `PlatformUpgrade` / `UpgradeHeld` condition ("No persistent
+  workspace; the sandbox image can't change without losing /sandbox"), shown
+  in the resident's conditions, and Restart restarts its processes in place as
+  before.
+- **Restart** re-renders the resident on the current version, where that keeps
+  its state. **Resume** starts a suspended Flux resident on the current
+  version; suspended residents are not woken to upgrade.
 - A failed upgrade marks the resident failed with a `PlatformUpgrade` /
   `UpgradeFailed` condition and is not retried until the version changes again,
   the resident is restarted, or Volundr restarts.

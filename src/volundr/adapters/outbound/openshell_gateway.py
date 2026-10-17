@@ -2132,9 +2132,9 @@ class OpenShellGatewayPodManager(
         backend, so the service redeploys it in the background like a resident
         whose sandbox is gone. Its credentials, shim token and record are kept.
 
-        Only a resident whose workspace is on a persistent claim is moved
-        automatically; any other would lose its state under ``/sandbox``, so the
-        upgrade is held and reported until the resident is restarted. An image
+        Only a resident whose workspace is on a persistent claim is moved; any
+        other would lose its state under ``/sandbox``, so its upgrade is held and
+        reported (UpgradeHeld), and neither reconcile nor restart recreates it. An image
         the sandbox replaced is never deployed again by reconcile (an older
         Völundr replica during Völundr's own rollout), and a failed upgrade is
         reported, not retried, until the target changes or the resident restarts.
@@ -2161,29 +2161,7 @@ class OpenShellGatewayPodManager(
                 condition=_upgrade_failed_condition(failed[1]), failed=True
             )
         if not _workspace_persisted(values, self._sandbox_workspace):
-            if (runtime_id, target) not in self._held_resident_upgrades:
-                self._held_resident_upgrades.add((runtime_id, target))
-                logger.info(
-                    "Not upgrading resident %s from %s to %s: its workspace %s is on no "
-                    "persistent claim; restart it to upgrade",
-                    runtime.name,
-                    running,
-                    target,
-                    self._sandbox_workspace,
-                )
-            return OpenShellPlatformFollow(
-                condition=ResidentCondition(
-                    type="PlatformUpgrade",
-                    status=ResidentConditionStatus.FALSE,
-                    reason="UpgradeHeld",
-                    message=(
-                        f"The resident runs {running}; the platform deploys {target}. Its "
-                        f"workspace {self._sandbox_workspace} is on no persistent claim, so "
-                        "recreating its sandbox on the new image drops the resident's state. "
-                        "Restart the resident to upgrade it anyway."
-                    ),
-                )
-            )
+            return OpenShellPlatformFollow(condition=self._hold_upgrade(runtime, running, target))
         lock = self._resident_process_lock(runtime)
         if lock.locked():
             return OpenShellPlatformFollow()
@@ -2213,6 +2191,31 @@ class OpenShellGatewayPodManager(
                     )
                 ],
             )
+        )
+
+    def _hold_upgrade(
+        self, runtime: ResidentRuntime, running: str, target: str
+    ) -> ResidentCondition:
+        """Why a resident without a persistent workspace stays on its image.
+
+        Its state lives only in its sandbox's ``/sandbox``, and a sandbox's image
+        cannot change without creating a new sandbox, so no path recreates it:
+        neither reconcile nor an explicit restart.
+        """
+        runtime_id = str(runtime.id)
+        reason = (
+            "No persistent workspace; the sandbox image can't change without losing "
+            f"/sandbox. The resident runs {running}; the platform deploys {target}. "
+            "Give its profile a persistent workspace (persistence.existingClaim) to upgrade it."
+        )
+        if (runtime_id, target) not in self._held_resident_upgrades:
+            self._held_resident_upgrades.add((runtime_id, target))
+            logger.info("Not upgrading resident %s: %s", runtime.name, reason)
+        return ResidentCondition(
+            type="PlatformUpgrade",
+            status=ResidentConditionStatus.FALSE,
+            reason="UpgradeHeld",
+            message=reason,
         )
 
     async def _retire_resident_sandbox(self, runtime: ResidentRuntime, image: str) -> None:
@@ -2342,13 +2345,18 @@ class OpenShellGatewayPodManager(
             raise RuntimeError("OpenShell resident sandbox is not ready")
         running = _sandbox_image(sandbox)
         target = self._target_image(values)
+        held: ResidentCondition | None = None
         if follow_platform and running and running != target:
-            # A restart runs the resident on the platform's current version: a new
-            # image needs a new sandbox.
-            logger.info("Upgrading resident %s from %s to %s", runtime.name, running, target)
-            self._failed_resident_upgrades.pop(runtime_id, None)
-            await self._retire_resident_sandbox(runtime, running)
-            return await self._deploy(runtime, profile)
+            if _workspace_persisted(values, self._sandbox_workspace):
+                # A restart runs the resident on the platform's current version: a
+                # new image needs a new sandbox, and its workspace survives that.
+                logger.info("Upgrading resident %s from %s to %s", runtime.name, running, target)
+                self._failed_resident_upgrades.pop(runtime_id, None)
+                await self._retire_resident_sandbox(runtime, running)
+                return await self._deploy(runtime, profile)
+            # Its state is only in this sandbox: restart its processes in place,
+            # as always, and keep reporting why it stays on its image.
+            held = self._hold_upgrade(runtime, running, target)
         processes = self._resident_processes(runtime, values)
         files, env = await self._resident_launch_inputs(runtime, values, processes)
         exit_code, output = await asyncio.to_thread(
@@ -2373,7 +2381,7 @@ class OpenShellGatewayPodManager(
             processes,
             service_port=service_port,
         )
-        return self._resident_observation(
+        observation = self._resident_observation(
             runtime,
             sandbox,
             service_url=str(runtime.backend_ref.get("service_url") or ""),
@@ -2382,6 +2390,9 @@ class OpenShellGatewayPodManager(
             service_port=service_port,
             process_names=tuple(process.name for process in processes),
         )
+        if held is None:
+            return observation
+        return replace(observation, conditions=[*observation.conditions, held])
 
     async def suspend(self, runtime: ResidentRuntime) -> ResidentRuntimeObservation:
         raise RuntimeError("OpenShell resident suspension is unsupported")
