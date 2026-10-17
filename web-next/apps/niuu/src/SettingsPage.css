@@ -638,6 +638,18 @@
   line-height: 1.45;
 }
 
+.settings-resource__row-note--error {
+  color: #ff9797;
+}
+
+.settings-resource__account {
+  display: flex;
+  flex-basis: 100%;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.9rem;
+}
+
 .settings-resource__row-actions {
   display: inline-flex;
   align-items: center;
@@ -853,7 +865,8 @@
 [data-theme='light'] .settings-resource__row-note {
   color: var(--status-healthy);
 }
-[data-theme='light'] .settings-shell__status--error {
+[data-theme='light'] .settings-shell__status--error,
+[data-theme='light'] .settings-resource__row-note--error {
   color: var(--color-critical);
 }
 [data-theme='light'] .settings-resource,
