@@ -1724,3 +1724,68 @@ class TestWorkloadIdentityTenantResolver:
         env = {item["name"]: item for item in container["env"]}
         secret_ref = env["WORKLOAD_TENANT_RESOLVER_SK_DSN"]["valueFrom"]["secretKeyRef"]
         assert secret_ref == {"name": "volundr-postgres-app", "key": "dsn"}
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is required")
+class TestGuildMembership:
+    """``guild:`` names the Guild this Forge belongs to (GET /api/v1/forge/guild)."""
+
+    @staticmethod
+    def _config(chart: str, *overrides: str) -> dict:
+        result = subprocess.run(
+            ["helm", "template", "test", str(CHART_DIR.parent / chart), *overrides],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        for doc in yaml.safe_load_all(result.stdout):
+            if doc and doc.get("kind") == "ConfigMap" and "config.yaml" in doc.get("data", {}):
+                return yaml.safe_load(doc["data"]["config.yaml"])
+        raise AssertionError(f"{chart} rendered no config.yaml")
+
+    def test_a_forge_belongs_to_no_guild_by_default(self):
+        assert "guild" not in self._config("volundr")
+
+    def test_renders_the_guild_and_this_forges_instance_in_it(self):
+        from niuu.config_models import GuildMembershipConfig
+
+        config = self._config(
+            "volundr",
+            "--set",
+            "guild.url=https://yggdrasil.niuu.world",
+            "--set",
+            "guild.instanceId=ae40cfda-426a-46b4-a080-1ad668000859",
+            "--set",
+            "guild.instanceName=Valhalla",
+            "--set",
+            "guild.instanceSlug=valhalla",
+        )
+
+        assert config["guild"] == {
+            "url": "https://yggdrasil.niuu.world",
+            "instance_id": "ae40cfda-426a-46b4-a080-1ad668000859",
+            "instance_name": "Valhalla",
+            "instance_slug": "valhalla",
+        }
+        assert GuildMembershipConfig(**config["guild"]).membership() is not None
+
+    def test_a_guild_url_without_this_forges_instance_fails_to_render(self):
+        result = subprocess.run(
+            [
+                "helm",
+                "template",
+                "test",
+                str(CHART_DIR),
+                "--set",
+                "guild.url=https://yggdrasil.niuu.world",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode != 0
+        assert "guild.instanceId" in result.stderr
+
+    def test_the_guild_chart_renders_its_own_public_origin(self):
+        assert "guild" not in self._config("guild")
+        config = self._config("guild", "--set", "guild.url=https://yggdrasil.niuu.world")
+        assert config["guild"] == {"url": "https://yggdrasil.niuu.world"}

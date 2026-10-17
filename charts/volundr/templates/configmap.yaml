@@ -468,6 +468,17 @@ data:
       {{- toYaml $pat | nindent 6 }}
     {{- end }}
 
+    {{- with .Values.guild }}
+    {{- if .url }}
+
+    guild:
+      url: {{ .url | quote }}
+      instance_id: {{ required "guild.instanceId must name this Forge in its Guild's registry (GET /api/v1/niuu/targets/volundr)" .instanceId | quote }}
+      instance_name: {{ required "guild.instanceName must be this Forge's name in its Guild's registry" .instanceName | quote }}
+      instance_slug: {{ required "guild.instanceSlug must be this Forge's slug in its Guild's registry" .instanceSlug | quote }}
+    {{- end }}
+    {{- end }}
+
     workload_identity:
       enabled: {{ .Values.workloadIdentity.enabled | default false }}
       issuer: {{ .Values.workloadIdentity.issuer | default "" | quote }}

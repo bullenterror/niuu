@@ -269,6 +269,7 @@ def create_app(
                             loaded_settings.forge_stream_keepalive_seconds
                         ),
                         forge_stream_queue_maxsize=loaded_settings.forge_stream_queue_maxsize,
+                        guild_membership=loaded_settings.guild.membership(),
                     )
                 )
                 app.include_router(

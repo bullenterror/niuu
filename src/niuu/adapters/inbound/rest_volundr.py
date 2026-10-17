@@ -61,6 +61,7 @@ from niuu.adapters.outbound.guild_transport import (
     GuildTransportError,
     build_guild_httpx_client,
 )
+from niuu.domain.guild_membership import GuildInstance, GuildMembership
 from niuu.domain.models import InstanceKind, Principal, RegisteredInstance
 from niuu.domain.notifications import notification_visible_to
 from niuu.domain.services.forge_session_policy import policy_refusal
@@ -893,8 +894,13 @@ def create_volundr_router(
     forge_stream_retry_seconds: float = 5.0,
     forge_stream_keepalive_seconds: float = 15.0,
     forge_stream_queue_maxsize: int = 256,
+    guild_membership: GuildMembership | None = None,
 ) -> APIRouter:
-    """Create a registry-aware Forge runtime router."""
+    """Create a registry-aware Forge runtime router.
+
+    ``guild_membership`` is this host's ``guild:`` configuration: on a Guild, its
+    own public origin, served at ``GET /guild`` with the node it fronts.
+    """
     router = APIRouter(
         prefix="/api/v1/forge",
         tags=["Forge"],
@@ -2178,6 +2184,37 @@ def create_volundr_router(
             "notifications": True,
         }
         return flags
+
+    # -- Guild discovery -------------------------------------------------------
+
+    @router.get("/guild")
+    async def get_guild(
+        principal: Principal = Depends(extract_principal),
+    ) -> dict[str, Any]:
+        """The Guild a client reached through this facade.
+
+        Same shape as a Forge node's ``GET /api/v1/forge/guild``. The instance is the
+        one this host's own ``guild:`` names (a joined host), else the node the facade
+        targets by default here (its embedded Forge, else the registry default), else
+        null.
+        """
+        if guild_membership is None:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, "This host is not configured as part of a Guild"
+            )
+        if guild_membership.instance is not None:
+            return guild_membership.wire()
+        visible = await _visible_instances(service, principal)
+        default = next(
+            (instance for instance in visible if _uses_embedded_transport(instance)),
+            next((instance for instance in visible if instance.is_default), None),
+        )
+        if default is None:
+            return guild_membership.wire()
+        return GuildMembership(
+            guild_url=guild_membership.guild_url,
+            instance=GuildInstance(id=default.id, name=default.name, slug=default.slug),
+        ).wire()
 
     # -- Notifications (contract §6) -------------------------------------------
 

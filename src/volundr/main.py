@@ -24,6 +24,7 @@ from niuu.adapters.postgres_credential_refresh_lock import PostgresCredentialRef
 from niuu.adapters.postgres_realms import PostgresRealmRepository
 from niuu.build_identity import build_identity
 from niuu.cors import apply_cors_middleware
+from niuu.domain.guild_membership import GuildInstance, GuildMembership
 from niuu.domain.services.realm import RealmService
 from niuu.service_integrations import (
     has_seeded_linear_integration as _has_seeded_linear_integration,
@@ -56,6 +57,7 @@ from volundr.adapters.inbound.rest_credentials import create_canonical_credentia
 from volundr.adapters.inbound.rest_events import create_events_router
 from volundr.adapters.inbound.rest_forge_mcp import create_forge_mcp_router
 from volundr.adapters.inbound.rest_git import create_git_router
+from volundr.adapters.inbound.rest_guild import create_guild_router
 from volundr.adapters.inbound.rest_integrations import create_canonical_integrations_router
 from volundr.adapters.inbound.rest_issues import create_canonical_issues_router
 from volundr.adapters.inbound.rest_message_delivery import create_message_delivery_router
@@ -259,12 +261,31 @@ def _create_resident_notification_relay(
     )
 
 
+def _node_guild_membership(settings: Settings) -> GuildMembership | None:
+    """This node's Guild membership, which must name its own instance there.
+
+    ``guild.url`` alone is what the Guild itself configures (its own origin); a
+    Forge node also needs the instance id its Guild keys its items by.
+    """
+    membership = settings.guild.membership()
+    if membership is not None and membership.instance is None:
+        raise ValueError(
+            f"guild.url is {membership.guild_url!r} but this Forge node's instance in that "
+            "Guild is not configured. Set guild.instance_id, guild.instance_name and "
+            "guild.instance_slug from the Guild's registry (GET /api/v1/niuu/targets/volundr), "
+            "or on a host joined with `niuu join` run `niuu guild heartbeat --once` to "
+            "record them; clear guild.url if this node belongs to no Guild."
+        )
+    return membership
+
+
 def _create_notification_service(
     settings: Settings,
     pool: Any,
     *,
     broadcaster: InMemoryEventBroadcaster,
     integration_repository: PostgresIntegrationRepository,
+    guild_instance: GuildInstance | None = None,
 ) -> NotificationService | None:
     """Compose the notification feed, rules and outbox (``notifications.enabled``)."""
     config = settings.notifications
@@ -295,6 +316,7 @@ def _create_notification_service(
         ],
         engine_resolver=engine_resolver_for(cli_types, settings.default_definition),
         integration_repository=integration_repository,
+        guild_instance=guild_instance,
     )
 
 
@@ -1054,8 +1076,13 @@ def create_app(
                 )
                 logger.info("Push devices: integration connections (credential store)")
             mapping_repository = PostgresMappingRepository(pool)
+            guild_membership = _node_guild_membership(settings)
             notification_service = _create_notification_service(
-                settings, pool, broadcaster=broadcaster, integration_repository=integration_repo
+                settings,
+                pool,
+                broadcaster=broadcaster,
+                integration_repository=integration_repo,
+                guild_instance=guild_membership.instance if guild_membership else None,
             )
             app.state.notification_service = notification_service
             resident_notification_relay = _create_resident_notification_relay(
@@ -1772,6 +1799,7 @@ def create_app(
                 notification_service=notification_service,
             )
             app.include_router(session_log_router)
+            app.include_router(create_guild_router(guild_membership, prefix="/api/v1/forge"))
             if notification_service is not None:
                 app.include_router(
                     create_notifications_router(

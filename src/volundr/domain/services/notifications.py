@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
+from niuu.domain.guild_membership import GuildInstance
 from niuu.domain.models import IntegrationType, Principal
 from niuu.domain.notifications import (
     AGENT_KINDS,
@@ -184,6 +185,7 @@ class NotificationService(NotificationRecorder):
         engine_resolver: EngineResolver | None = None,
         integration_repository: IntegrationRepository | None = None,
         attention_retire_page_size: int = 200,
+        guild_instance: GuildInstance | None = None,
     ) -> None:
         if attention_retire_page_size < 1:
             raise ValueError("attention_retire_page_size must be positive")
@@ -198,6 +200,7 @@ class NotificationService(NotificationRecorder):
         self._sinks = list(sinks)
         self._engine_resolver = engine_resolver
         self._integrations = integration_repository
+        self._instance_fields = guild_instance.fields() if guild_instance else {}
 
     # -- Projection --------------------------------------------------------
 
@@ -541,13 +544,20 @@ class NotificationService(NotificationRecorder):
             await self._broadcast(notification)
         return created
 
+    @property
+    def instance_fields(self) -> dict[str, str]:
+        """This node's Guild instance (``instance_id``/``_name``/``_slug``) for every
+        notification it serves, so a client reading the node directly gets the same
+        item shape as the Guild feed. Empty when the node belongs to no Guild."""
+        return dict(self._instance_fields)
+
     async def _broadcast(self, notification: Notification) -> None:
         if self._broadcaster is None:
             return
         await self._broadcaster.publish(
             RealtimeEvent(
                 type=EventType.SESSION_NOTIFICATION,
-                data=notification.wire(),
+                data={**notification.wire(), **self._instance_fields},
                 timestamp=notification.created_at,
             )
         )
