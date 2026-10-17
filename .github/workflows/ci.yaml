@@ -639,8 +639,11 @@ jobs:
           kubectl get events --sort-by=.lastTimestamp | tail -30 || true
 
   # ---------------------------------------------------------------------------
-  # Containers — full tier only. PR builds are amd64-only to keep the
-  # critical path short; arm64 is built on push-to-dev/main (see dev.yaml).
+  # Containers — full tier only. Built for amd64 and arm64 with dev's labels,
+  # from the PR's test-merge commit, so that dev.yaml can promote the exact
+  # images this PR tested when the merged tree is the tested tree (ci-gate
+  # tags them pr-tested-<tree>). APP_VERSION stays at its default: nothing
+  # reads the VITE_APP_VERSION it sets.
   # ---------------------------------------------------------------------------
   containers:
     name: Containers
@@ -652,14 +655,16 @@ jobs:
     uses: ./.github/workflows/reusable-container-build.yaml
     with:
       containers: ${{ needs.changes.outputs.container-names }}
-      platforms: '["amd64"]'
+      platforms: '["amd64","arm64"]'
       push: ${{ needs.changes.outputs.publish == 'true' }}
       cache-scope: pr-${{ github.event.number }}
       tag-prefix: pr-${{ github.event.number }}
       manifest-tags: "pr-${{ github.event.number }} pr-${{ github.event.number }}-${{ github.sha }}"
       labels: |
-        dev.volundr.pr=${{ github.event.number }}
-        dev.volundr.ephemeral=true
+        org.opencontainers.image.title=niuu
+        org.opencontainers.image.licenses=Apache-2.0
+        org.opencontainers.image.vendor=Niuu Labs
+        org.opencontainers.image.source=https://github.com/${{ github.repository }}
 
   # ---------------------------------------------------------------------------
   # Helm charts — PR versions — full tier only
@@ -783,6 +788,12 @@ jobs:
   # the charts; a fork PR skips scan and the smoke test; the path filter
   # skips the Python and web-next jobs on light-tier PRs that do not touch
   # them. `changes` itself must succeed, or every skip would look legitimate.
+  #
+  # When the gate is green on a full-tier PR that could publish, it also tags
+  # each image's exact pr-<N>-<sha> index pr-tested-<tree>, the tree of the
+  # test-merge commit. dev.yaml promotes those digests instead of rebuilding
+  # when a push to dev lands that same tree. Tagging is best effort: if it
+  # fails, the gate stays green and dev simply rebuilds.
   # ---------------------------------------------------------------------------
   ci-gate:
     name: ci-gate
@@ -802,7 +813,9 @@ jobs:
       - dependency-review
     if: always()
     runs-on: ubuntu-latest
-    permissions: {}
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Harden runner
         uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
@@ -866,3 +879,53 @@ jobs:
               raise SystemExit(1)
           print("All required jobs passed.")
           PY
+
+      - name: Check out the tested merge commit
+        if: needs.changes.outputs.tier == 'full' && needs.changes.outputs.publish == 'true' && needs.changes.outputs.has_containers == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up crane
+        id: crane
+        if: needs.changes.outputs.tier == 'full' && needs.changes.outputs.publish == 'true' && needs.changes.outputs.has_containers == 'true'
+        continue-on-error: true
+        uses: ./.github/actions/setup-crane
+
+      - name: Log in to Container Registry
+        id: login
+        if: steps.crane.outcome == 'success'
+        continue-on-error: true
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag the tested images pr-tested-<tree>
+        if: steps.login.outcome == 'success'
+        continue-on-error: true
+        env:
+          IMAGE_BASE: ghcr.io/${{ github.repository_owner }}
+          CONTAINERS: ${{ needs.changes.outputs.container-names }}
+          TESTED_TAG: pr-${{ github.event.number }}-${{ github.sha }}
+          MERGE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # github.sha is the test-merge commit every job above built and tested.
+          [ "$(git rev-parse HEAD)" = "${MERGE_SHA}" ]
+          TREE="$(git rev-parse "${MERGE_SHA}^{tree}")"
+          echo "Tested tree: ${TREE}"
+          for container in $(echo "${CONTAINERS}" | jq -r '.[]'); do
+            IMAGE="${IMAGE_BASE}/${container}"
+            # The exact per-commit tag, never the moving pr-<N>.
+            DIGEST="$(crane digest "${IMAGE}:${TESTED_TAG}")"
+            platforms="$(crane manifest "${IMAGE}@${DIGEST}" \
+              | jq -r '[.manifests[]?.platform | select(.os == "linux") | .architecture] | sort | unique | join(",")')"
+            if [ "${platforms}" != "amd64,arm64" ]; then
+              echo "::warning title=pr-tested::${IMAGE}:${TESTED_TAG} lists '${platforms}', not amd64 and arm64; not tagging, dev will rebuild"
+              exit 1
+            fi
+            crane tag "${IMAGE}@${DIGEST}" "pr-tested-${TREE}"
+            echo "${IMAGE}@${DIGEST} -> pr-tested-${TREE}"
+          done
