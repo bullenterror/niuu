@@ -221,32 +221,9 @@ jobs:
           name: sbom-${{ matrix.container }}.spdx.json
           path: sbom-${{ matrix.container }}.spdx.json
 
-      - name: Install Grype
-        env:
-          GRYPE_VERSION: "0.118.0"
-        run: |
-          set -euo pipefail
-
-          install_grype() {
-            curl --retry 5 --retry-all-errors --retry-delay 2 -sSfL \
-              https://raw.githubusercontent.com/anchore/grype/247f5d72abf2131aa37f3164a98495c121b29029/install.sh \
-              | sh -s -- -b /usr/local/bin "v${GRYPE_VERSION}"
-          }
-
-          for attempt in 1 2 3; do
-            if install_grype; then
-              grype version
-              exit 0
-            fi
-
-            if [ "$attempt" -eq 3 ]; then
-              exit 1
-            fi
-
-            sleep $((attempt * 5))
-          done
-
-          grype version
+      # scan.sh needs the pinned Syft that matches Grype, not the SBOM step's Syft above.
+      - name: Install Syft and Grype for the scan
+        run: bash containers/python-security/install-scanners.sh
 
       - name: Scan container with Grype
         env:
@@ -262,6 +239,7 @@ jobs:
           path: |
             grype-${{ matrix.container }}-*.json
             python-security-${{ matrix.container }}*.json
+            sbom-${{ matrix.container }}.syft.json
           retention-days: 30
 
       - name: Detect Grype results
