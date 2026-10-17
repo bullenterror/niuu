@@ -278,8 +278,10 @@ jobs:
       manifest-tags: "dev dev-${{ github.sha }}"
       publish-manifests: false
       cache-write: true
-      build-args: |
-        APP_VERSION=dev-${{ github.sha }}
+      # No APP_VERSION: nothing reads the VITE_APP_VERSION it sets, and a
+      # per-commit value made the web bundle layer in this cache unusable for
+      # every PR build (ci.yaml builds with the default), so each one rebuilt
+      # it (~100 s on niuu).
       labels: |
         org.opencontainers.image.title=niuu
         org.opencontainers.image.licenses=Apache-2.0
@@ -450,6 +452,29 @@ jobs:
 
           for container in $(echo "${CONTAINERS}" | jq -r '.[]'); do
             crane tag "${IMAGE_BASE}/${container}@$(field "${container}" index)" dev
+          done
+
+      # A promoted push builds nothing, so it would leave the registry cache
+      # every build reads (buildcache-<arch>) at the last tree dev built.
+      # ci.yaml's ci-gate tagged the tested PR's cache of this tree
+      # pr-tested-<tree>-buildcache-<arch>; point the cache there. Best
+      # effort: a cache only ever yields hits for matching layers.
+      - name: Point buildcache-<arch> at the tested build's cache
+        continue-on-error: true
+        env:
+          IMAGE_BASE: ${{ env.REGISTRY }}/${{ github.repository_owner }}
+          CONTAINERS: '["agent","skuld","openshell","devrunner","niuu-web","niuu","gbrain"]'
+        run: |
+          set -euo pipefail
+          TREE="$(git rev-parse 'HEAD^{tree}')"
+          for container in $(echo "${CONTAINERS}" | jq -r '.[]'); do
+            for arch in amd64 arm64; do
+              if crane tag "${IMAGE_BASE}/${container}:pr-tested-${TREE}-buildcache-${arch}" "buildcache-${arch}"; then
+                echo "${IMAGE_BASE}/${container}:buildcache-${arch} = pr-tested-${TREE}-buildcache-${arch}"
+              else
+                echo "::warning title=buildcache::${IMAGE_BASE}/${container}:pr-tested-${TREE}-buildcache-${arch} not found; buildcache-${arch} stays"
+              fi
+            done
           done
 
   # ---------------------------------------------------------------------------
