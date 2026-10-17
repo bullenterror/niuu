@@ -8,6 +8,7 @@ import io
 import logging
 import re
 import tarfile
+import time
 import types
 
 import pytest
@@ -141,6 +142,11 @@ class _SandboxFleetClient(_FakeOpenShellGatewayClient):
         self.events = events
         self.corrupt_restore = False
         self.fail_restore_with: BaseException | None = None
+        #: Deletions the gateway accepts and finishes this many seconds later.
+        self.delete_seconds = 0.0
+        self.deleting: dict[str, float] = {}
+        #: name -> how many delete calls the gateway rejects first.
+        self.fail_deletes: dict[str, int] = {}
 
     # -- sandboxes ---------------------------------------------------------------
     def add(self, sandbox: _Sandbox) -> _Sandbox:
@@ -168,17 +174,24 @@ class _SandboxFleetClient(_FakeOpenShellGatewayClient):
         return self._proto(sandbox, ready=False)
 
     def get_sandbox(self, name: str):
+        due = self.deleting.get(name)
+        if due is not None and time.monotonic() >= due:
+            del self.deleting[name]
+            self.sandboxes.pop(name, None)
         sandbox = self.sandboxes.get(name)
         return None if sandbox is None else self._proto(sandbox, ready=True)
 
     def _proto(self, sandbox: _Sandbox, *, ready: bool):
+        phases = self._adapter.openshell_pb2
         return self._adapter.OpenShellSandbox(
             id=sandbox.id,
             name=sandbox.name,
             phase=(
-                self._adapter.openshell_pb2.SANDBOX_PHASE_READY
+                phases.SANDBOX_PHASE_DELETING
+                if sandbox.name in self.deleting
+                else phases.SANDBOX_PHASE_READY
                 if ready
-                else self._adapter.openshell_pb2.SANDBOX_PHASE_PROVISIONING
+                else phases.SANDBOX_PHASE_PROVISIONING
             ),
             ready=ready,
             labels=sandbox.labels,
@@ -188,8 +201,14 @@ class _SandboxFleetClient(_FakeOpenShellGatewayClient):
         )
 
     def delete_sandbox(self, name: str) -> bool:
+        if self.fail_deletes.get(name):
+            self.fail_deletes[name] -= 1
+            raise RuntimeError(f"gateway could not delete {name} now")
         self.deleted.append(name)
         self.events.append(f"deleted:{name}")
+        if name in self.sandboxes and self.delete_seconds:
+            self.deleting.setdefault(name, time.monotonic() + self.delete_seconds)
+            return True
         return self.sandboxes.pop(name, None) is not None
 
     # -- files and processes ---------------------------------------------------------
@@ -1144,6 +1163,120 @@ async def test_a_relay_failure_while_restoring_keeps_the_old_sandbox(monkeypatch
     assert harness.core.phase(_claim_name(runtime)) == "complete"
     files = harness.client.claim_files[_claim_name(runtime)]
     assert files[".ravn-home/memory.db"] == b"episodes"
+
+
+def _relay_error(harness):
+    error = harness.adapter.grpc.RpcError(RELAY_CLOSED)
+    error.code = lambda: types.SimpleNamespace(name="UNAVAILABLE")
+    error.details = lambda: RELAY_CLOSED
+    return error
+
+
+async def _failed_migration(harness, runtime, profile):
+    """Deploy a resident whose migration fails while restoring; return its observation."""
+    harness.client.fail_restore_with = _relay_error(harness)
+    observation = await harness.manager.deploy(_awaiting_deployment(runtime), profile)
+    harness.client.fail_restore_with = None
+    assert _condition(observation, "WorkspaceMigration").reason == "MigrationFailed"
+    return observation
+
+
+@pytest.mark.asyncio
+async def test_rollback_waits_for_a_slow_sandbox_deletion(monkeypatch, caplog):
+    # Sessions keep the short delete wait; a resident's rollback has its own, longer one.
+    harness = _Harness(monkeypatch, resource_delete_timeout=0.05)
+    monkeypatch.setattr(harness.adapter, "READY_POLL_INTERVAL", 0.01)
+    runtime = _resident_runtime()
+    old = harness.old_sandbox(runtime)
+    runtime = _running(runtime, old.name)
+    new_name = f"m-{runtime.id.hex[:17]}"
+    harness.client.delete_seconds = 0.3  # Noatun took over 30s
+
+    await _failed_migration(harness, runtime, _resident_profile())
+
+    assert new_name not in harness.client.sandboxes
+    assert not any("rollback failed" in record.getMessage() for record in caplog.records)
+    assert harness.manager._abandoned_migration_sandboxes == {}
+    assert old.name in harness.client.sandboxes
+    assert old.running
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("left_by", ["rejected delete", "slow delete"])
+async def test_reconcile_removes_the_sandbox_a_failed_migration_left(monkeypatch, left_by):
+    harness = _Harness(monkeypatch, resident_sandbox_delete_timeout_seconds=0.05)
+    monkeypatch.setattr(harness.adapter, "READY_POLL_INTERVAL", 0.01)
+    runtime = _resident_runtime()
+    old = harness.old_sandbox(runtime)
+    runtime = _running(runtime, old.name)
+    profile = _resident_profile()
+    new_name = f"m-{runtime.id.hex[:17]}"
+    if left_by == "rejected delete":
+        harness.client.fail_deletes[new_name] = 1
+    else:
+        harness.client.delete_seconds = 0.3  # longer than this Völundr waits
+
+    observation = await _failed_migration(harness, runtime, profile)
+
+    # The rollback gave up on the new sandbox; the old one runs the resident again.
+    assert new_name in harness.client.sandboxes
+    assert harness.manager._abandoned_migration_sandboxes == {str(runtime.id): new_name}
+    assert old.running
+    events_before = list(harness.events)
+    running = runtime.model_copy(update={"backend_ref": observation.backend_ref})
+
+    reconciled = await harness.manager.reconcile(running, profile)
+    if left_by == "slow delete":
+        await asyncio.sleep(0.35)
+    settled = await harness.manager.reconcile(running, profile)
+
+    assert new_name not in harness.client.sandboxes
+    assert harness.events.count(f"deleted:{new_name}") == 1
+    assert harness.manager._abandoned_migration_sandboxes == {}
+    # The old sandbox and its processes are left exactly as they were.
+    later = harness.events[len(events_before) :]
+    assert not any(old.name in event for event in later)
+    assert old.name in harness.client.sandboxes
+    assert old.running
+    for observed in (reconciled, settled):
+        assert observed.backend_ref["name"] == old.name
+        assert _condition(observed, "WorkspaceMigration").reason == "MigrationFailed"
+    # The claim still records the unfinished copy, and nobody holds its lease.
+    claim = harness.core.pvcs[_claim_name(runtime)]
+    assert harness.core.phase(_claim_name(runtime)) == "copying"
+    assert workspace_module.ANNOTATION_MIGRATION_HOLDER not in claim.metadata.annotations
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("why", ["another resident's", "not on the claim", "another Völundr's"])
+async def test_reconcile_never_removes_a_sandbox_it_did_not_leave(monkeypatch, why):
+    harness = _Harness(monkeypatch)
+    runtime = _resident_runtime()
+    old = harness.old_sandbox(runtime)
+    runtime = _running(runtime, old.name)
+    profile = _resident_profile()
+    new_name = f"m-{runtime.id.hex[:17]}"
+    harness.client.fail_deletes[new_name] = 1
+    observation = await _failed_migration(harness, runtime, profile)
+    leftover = harness.client.sandboxes[new_name]
+    if why == "another resident's":
+        leftover.labels["volundr.niuu.io/resident"] = "00000000-0000-0000-0000-000000000001"
+    elif why == "not on the claim":
+        leftover.annotations.pop("volundr.niuu.io/workspace-claim")
+    else:
+        # Another Völundr is migrating the resident now: the sandbox is its copy.
+        annotations = harness.core.pvcs[_claim_name(runtime)].metadata.annotations
+        annotations[workspace_module.ANNOTATION_MIGRATION_HOLDER] = "volundr-b"
+        annotations[workspace_module.ANNOTATION_MIGRATION_EXPIRES] = f"{time.time() + 600:.0f}"
+
+    await harness.manager.reconcile(
+        runtime.model_copy(update={"backend_ref": observation.backend_ref}), profile
+    )
+
+    assert new_name in harness.client.sandboxes
+    assert f"deleted:{new_name}" not in harness.events
+    assert old.name in harness.client.sandboxes
+    assert old.running
 
 
 @pytest.mark.parametrize(
