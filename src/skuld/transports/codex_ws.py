@@ -590,6 +590,9 @@ class CodexWebSocketTransport(CLITransport):
         if self._codex_socket_dir:
             shutil.rmtree(self._codex_socket_dir, ignore_errors=True)
         self._codex_socket_dir = tempfile.mkdtemp(prefix="skuld-codex-")
+        # Codex requires exactly 0700. Under a setgid /tmp (the shared session
+        # volume) mkdtemp inherits S_ISGID and yields 02700, which Codex rejects.
+        os.chmod(self._codex_socket_dir, 0o700)
         self._codex_socket_path = os.path.join(self._codex_socket_dir, "app-server.sock")
         listen_url = f"unix://{self._codex_socket_path}"
         codex_cli = resolve_codex_cli()

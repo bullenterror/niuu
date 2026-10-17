@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -602,10 +603,39 @@ class TestSpawnAppServer:
                 "--listen",
             )
             assert call_args[3] == f"unix://{t._codex_socket_path}"
-            assert Path(t._codex_socket_dir).stat().st_mode & 0o777 == 0o700
+            assert Path(t._codex_socket_dir).stat().st_mode & 0o7777 == 0o700
             assert "-c" in call_args
             assert any(arg == 'mcp_servers.mimir-local.command="python3"' for arg in call_args)
             assert mock_exec.call_args.kwargs["env"]["PATH"] == "/tmp/shims:/usr/bin"
+
+    @pytest.mark.asyncio
+    async def test_spawn_app_server_socket_dir_drops_inherited_setgid(self, tmp_path):
+        t = _make_transport(tmp_path)
+        inherited = tmp_path / "skuld-codex-setgid"
+        inherited.mkdir()
+        os.chmod(inherited, 0o2700)
+
+        mock_process = MagicMock()
+        mock_process.stdout = None
+        mock_process.stderr = None
+        mock_process.pid = 12345
+
+        with (
+            patch(
+                "skuld.transports.codex_ws.asyncio.create_subprocess_exec",
+                new_callable=AsyncMock,
+                return_value=mock_process,
+            ),
+            patch("skuld.transports.codex_ws.resolve_codex_cli", return_value="codex"),
+            patch(
+                "skuld.transports.codex_ws.ensure_codex_tool_shims",
+                return_value=(tmp_path / ".skuld-tools" / "bin", {"PATH": "/usr/bin"}),
+            ),
+            patch("skuld.transports.codex_ws.tempfile.mkdtemp", return_value=str(inherited)),
+        ):
+            await t._spawn_app_server()
+
+        assert inherited.stat().st_mode & 0o7777 == 0o700
 
     @pytest.mark.asyncio
     async def test_spawn_app_server_defaults_codex_home_from_home(self, tmp_path, monkeypatch):
