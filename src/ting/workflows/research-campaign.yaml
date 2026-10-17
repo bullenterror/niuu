@@ -3,7 +3,7 @@ id: 1bfc01b1-4d01-5d20-86e1-2956dff11464
 name: Research Campaign
 description: Flexible deep-research workflow that frames a question, explores the evidence deeply through parallel
   threads, challenges the thesis, and distills durable memory into Mimir.
-version: 2.0.1
+version: 2.0.2
 persona_dependencies:
   research-analyst:
     id: research-analyst
@@ -43,23 +43,23 @@ persona_dependencies:
 workflow_dependencies:
   general:
     id: 4e7ebec4-0cfa-4567-98dd-2ee4ce0bc308
-    revision: sha256:1d064616fc0bc1bab7ec0c43fc256c6f82cd043be4692d6beace911608ed8185
-    digest: sha256:1d064616fc0bc1bab7ec0c43fc256c6f82cd043be4692d6beace911608ed8185
+    revision: sha256:bd2409c9dd45f899e27806087e0983980782c82803cc835743292c4130efbae0
+    digest: sha256:bd2409c9dd45f899e27806087e0983980782c82803cc835743292c4130efbae0
     path: workflows/research-thread.yaml
   breadth:
     id: 42951d75-dd82-4596-92ea-1c0a6ef4b965
-    revision: sha256:dda13e340eec005b73787693368d0d5f2f8dd234affa3064e3714af53ae861f3
-    digest: sha256:dda13e340eec005b73787693368d0d5f2f8dd234affa3064e3714af53ae861f3
+    revision: sha256:c6154c644f7ef04836fd6f77faea26b58d8e9a486289c0560913ac97ae91b175
+    digest: sha256:c6154c644f7ef04836fd6f77faea26b58d8e9a486289c0560913ac97ae91b175
     path: workflows/research-thread-breadth.yaml
   depth:
     id: bf5f97dd-d89b-4f3e-a8fc-ea61a42685a5
-    revision: sha256:a6be9dbdc6a3a5583a6ad0ae8d6f0413984b9937b930e73ba767f48fada8c89f
-    digest: sha256:a6be9dbdc6a3a5583a6ad0ae8d6f0413984b9937b930e73ba767f48fada8c89f
+    revision: sha256:84f719d785fa68f73220a49161663bd2533635c50099226d6fdbd1f7382dfcfb
+    digest: sha256:84f719d785fa68f73220a49161663bd2533635c50099226d6fdbd1f7382dfcfb
     path: workflows/research-thread-depth.yaml
   contrarian:
     id: 5777251e-7ff1-47f7-b182-d040ed9a7a2f
-    revision: sha256:12fc9efde95c6d00d4221d1bc2cc9e7b57020eae746229772e5f3e2b36639366
-    digest: sha256:12fc9efde95c6d00d4221d1bc2cc9e7b57020eae746229772e5f3e2b36639366
+    revision: sha256:7541f7781fc231cf8d9980d41e83118860950a5ed0d1356f8d39ffea725f427b
+    digest: sha256:7541f7781fc231cf8d9980d41e83118860950a5ed0d1356f8d39ffea725f427b
     path: workflows/research-thread-contrarian.yaml
 graph:
   tags:
@@ -98,7 +98,7 @@ graph:
     stageMembers:
     - personaId: research-framer
       budget: 16
-      model: gpt-5.5
+      model: gpt-5.6-terra
       consumesEventTypes:
       - research.requested
     position:
@@ -112,7 +112,7 @@ graph:
     stageMembers:
     - personaId: research-coordinator
       budget: 20
-      model: gpt-5.5
+      model: gpt-5.6-terra
       consumesEventTypes:
       - research.framed
       - research.threads.blocked
@@ -181,7 +181,7 @@ graph:
     stageMembers:
     - personaId: research-analyst
       budget: 28
-      model: gpt-5.5
+      model: gpt-5.6-terra
       consumesEventTypes:
       - research.threads.joined
     position:
@@ -195,7 +195,7 @@ graph:
     stageMembers:
     - personaId: research-skeptic
       budget: 14
-      model: gpt-5.5
+      model: gpt-5.6-terra
       consumesEventTypes:
       - research.analyzed
     position:
@@ -209,7 +209,7 @@ graph:
     stageMembers:
     - personaId: research-synthesist
       budget: 16
-      model: gpt-5.5
+      model: gpt-5.6-terra
       consumesEventTypes:
       - research.challenged
     position:
@@ -223,7 +223,7 @@ graph:
     stageMembers:
     - personaId: research-curator
       budget: 12
-      model: gpt-5.5
+      model: gpt-5.6-terra
       consumesEventTypes:
       - research.synthesized
     position:
@@ -237,7 +237,7 @@ graph:
     stageMembers:
     - personaId: research-publisher
       budget: 10
-      model: gpt-5.5
+      model: gpt-5.6-terra
       consumesEventTypes:
       - research.curated
     position:

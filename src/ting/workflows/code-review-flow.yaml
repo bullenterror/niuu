@@ -3,7 +3,7 @@ id: 03dba0d8-4f29-560a-a4e1-1fc7e5f9ee23
 name: Code & Review Flow
 description: Tracker-driven developer workflow that implements a ticket, iterates through code review,
   and merges the branch without publishing a delivery record.
-version: 1.0.1
+version: 1.0.2
 persona_dependencies:
   closer:
     id: closer
@@ -54,7 +54,7 @@ graph:
     stageMembers:
     - personaId: coder
       budget: 40
-      model: gpt-5.5
+      model: gpt-5.6-terra
       consumesEventTypes:
       - delivery.requested
       - review.changes_requested
@@ -69,7 +69,7 @@ graph:
     stageMembers:
     - personaId: reviewer
       budget: 24
-      model: gpt-5.5
+      model: gpt-5.6-terra
       consumesEventTypes:
       - code.changed
     position:
@@ -83,7 +83,7 @@ graph:
     stageMembers:
     - personaId: closer
       budget: 20
-      model: gpt-5.5
+      model: gpt-5.6-terra
       consumesEventTypes:
       - review.passed
     position:

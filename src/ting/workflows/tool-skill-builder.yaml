@@ -3,7 +3,7 @@ id: 3c217e0a-1ff0-56d6-ba27-54cd43bff8e6
 name: Tool & Skill Builder
 description: Resident capability workflow that designs, implements, reviews, canaries, and publishes a
   missing Valkyrie/Ravn tool or skill.
-version: 1.0.1
+version: 1.0.2
 persona_dependencies:
   capability-publisher:
     id: capability-publisher
@@ -71,7 +71,7 @@ graph:
     stageMembers:
     - personaId: specification-framer
       budget: 16
-      model: gpt-5.5
+      model: gpt-5.6-terra
       consumesEventTypes:
       - capability.requested
     position:
@@ -91,7 +91,7 @@ graph:
     stageMembers:
     - personaId: coder
       budget: 48
-      model: gpt-5.5
+      model: gpt-5.6-terra
       consumesEventTypes:
       - spec.framed
       - review.changes_requested
@@ -114,7 +114,7 @@ graph:
     stageMembers:
     - personaId: reviewer
       budget: 24
-      model: gpt-5.5
+      model: gpt-5.6-terra
       consumesEventTypes:
       - code.changed
       systemPromptExtra: In a capability workspace with no supplied source repository, review learned_tool.json
@@ -122,7 +122,7 @@ graph:
         was supplied, retain the normal committed-diff requirement.
     - personaId: security-auditor
       budget: 24
-      model: gpt-5.5
+      model: gpt-5.6-terra
       consumesEventTypes:
       - code.changed
       systemPromptExtra: In a capability workspace with no supplied source repository, audit learned_tool.json
@@ -142,7 +142,7 @@ graph:
     stageMembers:
     - personaId: capability-publisher
       budget: 16
-      model: gpt-5.5
+      model: gpt-5.6-terra
       consumesEventTypes:
       - review.passed
       - security.passed

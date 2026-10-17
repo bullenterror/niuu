@@ -3,7 +3,7 @@ id: 29393e53-5a29-5f37-aa87-1171aaf20726
 name: Ting Run Flow + Security + Memory Curation
 description: Ting to Volundr ravn_flock workflow with parallel review, security, post-mortem ingest, and
   visible Mimir curation.
-version: 1.0.0
+version: 1.0.1
 persona_dependencies:
   coder:
     id: coder
@@ -48,7 +48,7 @@ graph:
     stageMembers:
     - personaId: coder
       budget: 40
-      model: gpt-5.5
+      model: gpt-5.6-terra
     position:
       x: 320
       y: 264
@@ -60,7 +60,7 @@ graph:
     stageMembers:
     - personaId: reviewer
       budget: 25
-      model: gpt-5.5
+      model: gpt-5.6-terra
     position:
       x: 560
       y: 160
@@ -72,7 +72,7 @@ graph:
     stageMembers:
     - personaId: security-auditor
       budget: 25
-      model: gpt-5.5
+      model: gpt-5.6-terra
     position:
       x: 560
       y: 352
@@ -98,7 +98,7 @@ graph:
     stageMembers:
     - personaId: postmortem-analyst
       budget: 18
-      model: gpt-5.5
+      model: gpt-5.6-terra
     position:
       x: 816
       y: 232
@@ -110,7 +110,7 @@ graph:
     stageMembers:
     - personaId: mimir-memory-curator
       budget: 20
-      model: gpt-5.5
+      model: gpt-5.6-terra
       consumesEventTypes:
       - mimir.source.ingested
       eventFilters:

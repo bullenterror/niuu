@@ -1569,7 +1569,7 @@ class TestBuildSpawnRequestPersonaOverrides:
                     "delivery.requested",
                     "review.changes_requested",
                 ],
-                "llm": {"model": "gpt-5.5"},
+                "llm": {"model": "gpt-5.6-terra"},
                 "executor": {
                     "adapter": "ravn.adapters.executors.cli.CliTransportExecutor",
                     "kwargs": {
@@ -1582,7 +1582,7 @@ class TestBuildSpawnRequestPersonaOverrides:
                 "name": "reviewer",
                 "iteration_budget": 24,
                 "consumes_event_types": ["code.changed"],
-                "llm": {"model": "gpt-5.5"},
+                "llm": {"model": "gpt-5.6-terra"},
                 "executor": {
                     "adapter": "ravn.adapters.executors.cli.CliTransportExecutor",
                     "kwargs": {
@@ -1595,7 +1595,7 @@ class TestBuildSpawnRequestPersonaOverrides:
                 "name": "closer",
                 "iteration_budget": 20,
                 "consumes_event_types": ["review.passed"],
-                "llm": {"model": "gpt-5.5"},
+                "llm": {"model": "gpt-5.6-terra"},
                 "executor": {
                     "adapter": "ravn.adapters.executors.cli.CliTransportExecutor",
                     "kwargs": {
