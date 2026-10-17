@@ -29,7 +29,6 @@ jobs:
       web_next: ${{ steps.filter.outputs.web_next }}
       helm: ${{ steps.filter.outputs.helm }}
       container-names: ${{ steps.filter.outputs.names }}
-      other-container-names: ${{ steps.filter.outputs.other_names }}
       has_containers: ${{ steps.filter.outputs.any }}
       tier: ${{ steps.tier.outputs.level }}
       publish: ${{ steps.registry.outputs.publish }}
@@ -112,14 +111,6 @@ jobs:
                   "names": json.dumps(container_names),
                   "any": "true" if container_names else "false",
               }
-
-          # niuu and skuld are what the Helm smoke test deploys; the
-          # containers-smoke job builds their amd64 images straight away
-          # (keep this list in step with it), the rest come after `changes`.
-          smoke_images = ("niuu", "skuld")
-          outputs["other_names"] = json.dumps(
-              [name for name in json.loads(outputs["names"]) if name not in smoke_images]
-          )
 
           print("Computed outputs:")
           for key, value in outputs.items():
@@ -719,12 +710,13 @@ jobs:
   # every workflow (arm64 runners included), so the order comes from the
   # dependency graph, in three calls:
   #   1. containers-smoke: the amd64 images the Helm smoke test deploys (niuu,
-  #      skuld). No `needs`, so it is queued at t=0 with `changes`, ahead of
-  #      the ~25 test jobs `changes` releases. Its `if` restates the full-tier
-  #      and same-repository checks `changes` makes (keep them in step); a
-  #      full-tier PR always builds all seven images.
-  #   2. containers-amd64: the other five amd64 images, after `changes`.
-  #      The scans start once both amd64 calls finish.
+  #      skuld), which it waits for alone.
+  #   2. containers-amd64: the other five amd64 images, which the scans wait
+  #      for as well.
+  #   Neither has `needs`, so both are queued at t=0 with `changes`, ahead of
+  #   the ~25 test jobs `changes` releases. Their `if` and `push` restate the
+  #   full-tier and same-repository checks `changes` makes (keep them in
+  #   step); a full-tier PR always builds all seven images.
   #   3. containers-arm64: all seven arm64 images once the amd64 builds are
   #      done, so they take runners after the critical path has its own; it
   #      then publishes the multi-arch pr-<N> and pr-<N>-<sha> manifests from
@@ -756,17 +748,18 @@ jobs:
 
   containers-amd64:
     name: Containers (amd64)
-    needs: changes
-    if: needs.changes.outputs.tier == 'full' && needs.changes.outputs.has_containers == 'true'
+    if: >-
+      !startsWith(github.base_ref, 'feat/') && !startsWith(github.base_ref, 'codex/')
+      && !startsWith(github.base_ref, 'claude/')
     permissions:
       contents: read
       packages: write
     uses: ./.github/workflows/reusable-container-build.yaml
     with:
-      containers: ${{ needs.changes.outputs.other-container-names }}
+      containers: '["agent","openshell","devrunner","niuu-web","gbrain"]'
       platforms: '["amd64"]'
       publish-manifests: false
-      push: ${{ needs.changes.outputs.publish == 'true' }}
+      push: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
       cache-scope: pr-${{ github.event.number }}
       tag-prefix: pr-${{ github.event.number }}
       manifest-tags: ""
@@ -990,10 +983,10 @@ jobs:
               "web-next-consumer-e2e": on("WEB_NEXT"),
               "helm-lint": True,
               "helm-smoke-test": full and on("HELM") and publish,
-              # containers-smoke checks the tier itself; a full-tier PR
+              # The two amd64 calls check the tier themselves; a full-tier PR
               # always has containers.
               "containers-smoke": full,
-              "containers-amd64": full and on("HAS_CONTAINERS"),
+              "containers-amd64": full,
               "containers-arm64": full and on("HAS_CONTAINERS"),
               "build-charts": full and on("HELM"),
               "scan": full and on("HAS_CONTAINERS") and publish,
