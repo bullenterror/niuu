@@ -334,7 +334,11 @@ class ResidentRuntimeService:
             if desired_state is ResidentDesiredState.SUSPENDED:
                 observation = await controller.suspend(updated)
             else:
-                observation = await controller.resume(updated)
+                # With its profile, a resident resumes on the platform's current
+                # version: it was not upgraded while suspended.
+                observation = await controller.resume(
+                    updated, profile=self._resumable_profile(updated, controller)
+                )
         except Exception as exc:
             await self._record_backend_failure(updated, "LifecycleFailed", str(exc))
             raise ResidentRuntimeDeploymentError(
@@ -719,6 +723,18 @@ class ResidentRuntimeService:
         return ResidentCapability.LOGS not in profile.capabilities or isinstance(
             controller, ResidentRuntimeLogReader
         )
+
+    def _resumable_profile(
+        self,
+        runtime: ResidentRuntime,
+        controller: ResidentRuntimeController,
+    ) -> ResidentDeploymentProfile | None:
+        """The resident's profile when its controller can still deploy it, else None."""
+        profile = self._profiles.get(runtime.profile_id)
+        if profile is None or profile.backend is not runtime.backend:
+            return None
+        profile = self._with_wired_capabilities(profile)
+        return profile if controller.supports(profile) else None
 
     def _require_controller_for_runtime(
         self,

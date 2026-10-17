@@ -1,5 +1,6 @@
 """Tests for Flux HelmRelease pod manager adapter."""
 
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
@@ -1115,7 +1116,10 @@ class TestFluxResidentRuntimeController:
     ) -> None:
         runtime = _resident_runtime()
         helmrelease = {
-            "spec": {"values": {"replicaCount": 1}},
+            "spec": {
+                "chart": {"spec": {"chart": "skuld", "version": "0.38.0"}},
+                "values": {"replicaCount": 1},
+            },
             "status": {
                 "conditions": [
                     {
@@ -1152,6 +1156,7 @@ class TestFluxResidentRuntimeController:
 
         assert observation.observed_state is ResidentObservedState.ACTIVE
         assert observation.backend_ref["deploymentName"] == "resident-muninn"
+        assert observation.backend_ref["platformVersion"] == "skuld 0.38.0"
         assert {condition.type for condition in observation.conditions} == {
             "HelmReleaseReady",
             "DeploymentAvailable",
@@ -1212,6 +1217,12 @@ class TestFluxResidentRuntimeController:
             patch.object(pod_manager, "_patch_helmrelease", AsyncMock()) as patch_release,
             patch.object(
                 pod_manager,
+                "_get_helmrelease",
+                AsyncMock(return_value={"metadata": {}, "spec": {"values": {}}}),
+            ),
+            patch.object(pod_manager, "_replace_helmrelease", AsyncMock()) as replace_release,
+            patch.object(
+                pod_manager,
                 "_observe_after_lifecycle",
                 AsyncMock(return_value=observation),
             ),
@@ -1223,7 +1234,10 @@ class TestFluxResidentRuntimeController:
         ):
             await pod_manager.suspend(runtime)
             await pod_manager.resume(runtime)
-            await pod_manager.restart(runtime, _resident_profile())
+            await pod_manager.restart(
+                runtime.model_copy(update={"desired_state": ResidentDesiredState.RUNNING}),
+                _resident_profile(),
+            )
             deleted = await pod_manager.delete(runtime)
             assert deleted
 
@@ -1236,7 +1250,7 @@ class TestFluxResidentRuntimeController:
             release_name,
             {"spec": {"values": {"replicaCount": 1}}},
         )
-        restart_body = patch_release.await_args_list[2].args[1]
+        restart_body = replace_release.await_args.args[1]
         assert "niuu.world/restarted-at" in restart_body["spec"]["values"]["podAnnotations"]
         delete_release.assert_awaited_once_with(release_name)
 
@@ -1592,8 +1606,31 @@ class TestFluxResidentOwnVolumes:
     ) -> None:
         runtime = _resident_runtime()
         observation = ResidentRuntimeObservation(observed_state=ResidentObservedState.ACTIVE)
+        release = {
+            "metadata": {},
+            "spec": {
+                "values": {
+                    "homeVolume": {"enabled": True, "existingClaim": f"resident-{runtime.id}-home"},
+                    "persistence": {
+                        "enabled": True,
+                        "existingClaim": f"resident-{runtime.id}-workspace",
+                    },
+                }
+            },
+        }
+        core_api.create_namespaced_persistent_volume_claim.side_effect = _ApiError(409)
+        core_api.read_namespaced_persistent_volume_claim.return_value = SimpleNamespace(
+            metadata=SimpleNamespace(
+                labels={
+                    "app.kubernetes.io/managed-by": "volundr",
+                    "niuu.world/resident-id": str(runtime.id),
+                }
+            )
+        )
         with (
             patch.object(pod_manager, "_patch_helmrelease", AsyncMock()),
+            patch.object(pod_manager, "_get_helmrelease", AsyncMock(return_value=release)),
+            patch.object(pod_manager, "_replace_helmrelease", AsyncMock()) as replace_release,
             patch.object(
                 pod_manager,
                 "_observe_after_lifecycle",
@@ -1605,7 +1642,9 @@ class TestFluxResidentOwnVolumes:
             await pod_manager.resume(runtime)
 
         core_api.delete_namespaced_persistent_volume_claim.assert_not_awaited()
-        core_api.create_namespaced_persistent_volume_claim.assert_not_awaited()
+        restarted = replace_release.await_args.args[1]["spec"]["values"]
+        assert restarted["homeVolume"] == release["spec"]["values"]["homeVolume"]
+        assert restarted["persistence"] == release["spec"]["values"]["persistence"]
 
     async def test_core_api_shares_the_flux_api_client(self, pod_manager: FluxPodManager) -> None:
         shared_client = MagicMock()
@@ -2404,3 +2443,334 @@ class TestParsePodLogs:
             ("warning", "low disk"),
             ("critical", "FATAL out of memory"),
         ]
+
+
+_OLD_IMAGE = {"repository": "ghcr.io/niuulabs/skuld", "tag": "dev-6d5a0ce"}
+_NEW_IMAGE = {"repository": "ghcr.io/niuulabs/skuld", "tag": "dev-b765a3f"}
+_OLD_VERSION = "skuld 2.0.0-dev.258, ghcr.io/niuulabs/skuld:dev-6d5a0ce"
+_NEW_VERSION = "skuld 2.0.0-dev.264, ghcr.io/niuulabs/skuld:dev-b765a3f"
+
+
+def _platform_manager() -> FluxPodManager:
+    """A Völundr deployed with a newer Skuld chart than its residents run."""
+    return FluxPodManager(namespace="test-ns", chart_name="skuld", chart_version="2.0.0-dev.264")
+
+
+def _platform_profile() -> ResidentDeploymentProfile:
+    """The resident's profile as this Völundr renders it: its own PVCs, the new image."""
+    profile = _own_volume_profile()
+    profile.deployment["values"]["image"] = dict(_NEW_IMAGE)
+    return profile
+
+
+def _running_release(runtime: ResidentRuntime, **annotations: str) -> dict:
+    """resident-<id> as an older Völundr created it."""
+    return {
+        "apiVersion": f"{HELMRELEASE_GROUP}/{HELMRELEASE_VERSION}",
+        "kind": "HelmRelease",
+        "metadata": {
+            "name": f"resident-{runtime.id}",
+            "namespace": "test-ns",
+            "resourceVersion": "4711",
+            "finalizers": ["finalizers.fluxcd.io"],
+            "labels": {"app.kubernetes.io/managed-by": "volundr"},
+            "annotations": {"niuu.world/profile-id": "ravn-helm", **annotations},
+        },
+        "spec": {
+            "interval": "5m",
+            "chart": {"spec": {"chart": "skuld", "version": "2.0.0-dev.258"}},
+            "values": {
+                "replicaCount": 1,
+                "image": dict(_OLD_IMAGE),
+                "homeVolume": {"enabled": True, "existingClaim": f"resident-{runtime.id}-home"},
+                "persistence": {
+                    "enabled": True,
+                    "existingClaim": f"resident-{runtime.id}-workspace",
+                },
+                "resident": {"openclaw": {"enabled": False}},
+                "podAnnotations": {"niuu.world/restarted-at": "2026-10-01T00:00:00+00:00"},
+            },
+        },
+        "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+    }
+
+
+def _own_claims_exist(core_api: AsyncMock, runtime: ResidentRuntime) -> None:
+    core_api.create_namespaced_persistent_volume_claim.side_effect = _ApiError(409)
+    core_api.read_namespaced_persistent_volume_claim.return_value = SimpleNamespace(
+        metadata=SimpleNamespace(
+            labels={
+                "app.kubernetes.io/managed-by": "volundr",
+                "niuu.world/resident-id": str(runtime.id),
+            }
+        )
+    )
+
+
+class _Cluster:
+    """The resident's HelmRelease as the Kubernetes API keeps it."""
+
+    def __init__(self, release: dict | None) -> None:
+        self.release = release
+        self.api = AsyncMock()
+        self.api.get_namespaced_custom_object.side_effect = self._get
+        self.api.replace_namespaced_custom_object.side_effect = self._replace
+
+    async def _get(self, **_kwargs):
+        if self.release is None:
+            raise _ApiError(404)
+        return self.release
+
+    async def _replace(self, **kwargs):
+        self.release = {**kwargs["body"], "status": {}}
+        return self.release
+
+    @property
+    def replaces(self) -> list[dict]:
+        calls = self.api.replace_namespaced_custom_object.await_args_list
+        return [call.kwargs["body"] for call in calls]
+
+
+def _on_cluster(pod_manager, cluster):
+    stack = ExitStack()
+    stack.enter_context(patch.object(pod_manager, "_get_api", return_value=cluster.api))
+    stack.enter_context(
+        patch.object(pod_manager, "_get_resident_deployment", AsyncMock(return_value=None))
+    )
+    return stack
+
+
+async def _reconcile(pod_manager, cluster, runtime, profile):
+    with _on_cluster(pod_manager, cluster):
+        return await pod_manager.reconcile(runtime, profile)
+
+
+def test_platform_version_names_the_chart_and_every_image() -> None:
+    from volundr.adapters.outbound.flux import resident_platform_version
+
+    values = {
+        "nginx": {"image": {"repository": "nginx", "tag": "alpine"}},
+        "image": {"repository": "ghcr.io/niuulabs/skuld", "tag": "dev-1", "digest": "sha256:ab"},
+        "extraContainers": [{"name": "ravn", "image": "ghcr.io/niuulabs/ravn:dev-1"}],
+        "global": {"image": {"repository": ""}},
+    }
+
+    assert resident_platform_version("skuld", "2.0.0-dev.264", values) == (
+        "skuld 2.0.0-dev.264, ghcr.io/niuulabs/skuld:dev-1@sha256:ab, "
+        "extraContainers[0] ghcr.io/niuulabs/ravn:dev-1, nginx nginx:alpine"
+    )
+
+
+class TestFluxResidentFollowsPlatform:
+    """A running resident moves to the chart and image Völundr renders now, once."""
+
+    async def test_reconcile_upgrades_chart_and_image_and_keeps_disks_and_token_secret(
+        self,
+        core_api: AsyncMock,
+        caplog,
+    ) -> None:
+        pod_manager = _platform_manager()
+        store = _bind_ravn_sessions(pod_manager)
+        runtime = _resident_runtime()
+        await store.store(
+            "resident", str(runtime.id), "ravn-openclaw", "generic", {"token": "kept-token"}
+        )
+        _own_claims_exist(core_api, runtime)
+        core_api.create_namespaced_secret.side_effect = _ApiError(409)
+        core_api.read_namespaced_secret.return_value = _volundr_shim_secret(runtime, "kept-token")
+        cluster = _Cluster(_running_release(runtime))
+        profile = _platform_profile()
+        profile.deployment["values"]["resident"]["openclaw"] = {"enabled": True}
+
+        with caplog.at_level("INFO", logger="volundr.adapters.outbound.flux"):
+            observation = await _reconcile(pod_manager, cluster, runtime, profile)
+
+        [rolled] = cluster.replaces
+        assert rolled["spec"]["chart"]["spec"]["version"] == "2.0.0-dev.264"
+        assert rolled["spec"]["values"]["image"] == _NEW_IMAGE
+        # The same release, guarded by its resourceVersion; Flux's finalizer stays.
+        assert rolled["metadata"]["resourceVersion"] == "4711"
+        assert rolled["metadata"]["finalizers"] == ["finalizers.fluxcd.io"]
+        assert "status" not in rolled
+        annotations = rolled["metadata"]["annotations"]
+        assert annotations["niuu.world/platform-version"] == _NEW_VERSION
+        assert annotations["niuu.world/replaced-platform-version"] == _OLD_VERSION
+        # Its own disks, and its own shim token Secret with the token it had.
+        values = rolled["spec"]["values"]
+        assert values["homeVolume"]["existingClaim"] == f"resident-{runtime.id}-home"
+        assert values["persistence"]["existingClaim"] == f"resident-{runtime.id}-workspace"
+        assert values["resident"]["openclaw"]["tokenSecret"]["name"] == (
+            f"resident-{runtime.id}-openclaw"
+        )
+        core_api.delete_namespaced_persistent_volume_claim.assert_not_awaited()
+        core_api.delete_namespaced_secret.assert_not_awaited()
+        assert core_api.patch_namespaced_secret.await_args.kwargs["body"] == {
+            "stringData": {"token": "kept-token"}
+        }
+        cluster.api.delete_namespaced_custom_object.assert_not_awaited()
+        assert observation.backend_ref["platformVersion"] == _NEW_VERSION
+        assert f"Upgrading resident Muninn from {_OLD_VERSION} to {_NEW_VERSION}" in caplog.messages
+
+    async def test_a_resident_older_than_its_own_pvcs_keeps_the_claim_it_runs_on(
+        self,
+        core_api: AsyncMock,
+    ) -> None:
+        pod_manager = _platform_manager()
+        runtime = _resident_runtime()
+        release = _running_release(runtime)
+        del release["spec"]["values"]["homeVolume"]
+        release["spec"]["values"]["persistence"] = {
+            "enabled": True,
+            "existingClaim": "volundr-sessions",
+        }
+        cluster = _Cluster(release)
+
+        await _reconcile(pod_manager, cluster, runtime, _platform_profile())
+
+        [rolled] = cluster.replaces
+        assert rolled["spec"]["values"]["persistence"]["existingClaim"] == "volundr-sessions"
+        assert "homeVolume" not in rolled["spec"]["values"]
+        core_api.create_namespaced_persistent_volume_claim.assert_not_awaited()
+
+    async def test_reconcile_rolls_once_per_version(self, core_api: AsyncMock) -> None:
+        pod_manager = _platform_manager()
+        runtime = _resident_runtime()
+        _own_claims_exist(core_api, runtime)
+        cluster = _Cluster(_running_release(runtime))
+
+        await _reconcile(pod_manager, cluster, runtime, _platform_profile())
+        await _reconcile(pod_manager, cluster, runtime, _platform_profile())
+        # A Völundr that restarted (or another replica) finds it on the version.
+        await _reconcile(_platform_manager(), cluster, runtime, _platform_profile())
+
+        assert len(cluster.replaces) == 1
+
+    async def test_an_edited_release_is_not_rolled_again_for_the_same_version(
+        self,
+        core_api: AsyncMock,
+    ) -> None:
+        pod_manager = _platform_manager()
+        runtime = _resident_runtime()
+        release = _running_release(runtime, **{"niuu.world/platform-version": _NEW_VERSION})
+        cluster = _Cluster(release)
+
+        await _reconcile(pod_manager, cluster, runtime, _platform_profile())
+
+        assert cluster.replaces == []
+
+    async def test_an_older_volundr_does_not_move_the_resident_back(
+        self,
+        core_api: AsyncMock,
+    ) -> None:
+        """While Völundr itself rolls out, its old replica still renders the old version."""
+        runtime = _resident_runtime()
+        _own_claims_exist(core_api, runtime)
+        cluster = _Cluster(_running_release(runtime))
+        await _reconcile(_platform_manager(), cluster, runtime, _platform_profile())
+
+        old_volundr = FluxPodManager(
+            namespace="test-ns", chart_name="skuld", chart_version="2.0.0-dev.258"
+        )
+        old_profile = _own_volume_profile()
+        old_profile.deployment["values"]["image"] = dict(_OLD_IMAGE)
+        await _reconcile(old_volundr, cluster, runtime, old_profile)
+
+        assert len(cluster.replaces) == 1
+        assert cluster.release["spec"]["chart"]["spec"]["version"] == "2.0.0-dev.264"
+
+    async def test_restart_rerenders_on_the_current_version(self, core_api: AsyncMock) -> None:
+        pod_manager = _platform_manager()
+        runtime = _resident_runtime()
+        _own_claims_exist(core_api, runtime)
+        cluster = _Cluster(_running_release(runtime))
+
+        with _on_cluster(pod_manager, cluster):
+            await pod_manager.restart(runtime, _platform_profile())
+
+        [restarted] = cluster.replaces
+        assert restarted["spec"]["chart"]["spec"]["version"] == "2.0.0-dev.264"
+        assert restarted["spec"]["values"]["image"] == _NEW_IMAGE
+        restarted_at = restarted["spec"]["values"]["podAnnotations"]["niuu.world/restarted-at"]
+        assert restarted_at != "2026-10-01T00:00:00+00:00"
+        assert restarted["metadata"]["annotations"]["niuu.world/platform-version"] == (_NEW_VERSION)
+
+    async def test_a_suspended_resident_is_left_alone_until_resumed(
+        self,
+        core_api: AsyncMock,
+    ) -> None:
+        pod_manager = _platform_manager()
+        runtime = _resident_runtime(desired_state=ResidentDesiredState.SUSPENDED)
+        _own_claims_exist(core_api, runtime)
+        release = _running_release(runtime)
+        release["spec"]["values"]["replicaCount"] = 0
+        cluster = _Cluster(release)
+
+        await _reconcile(pod_manager, cluster, runtime, _platform_profile())
+
+        assert cluster.replaces == []
+        cluster.api.patch_namespaced_custom_object.assert_not_awaited()
+
+        resumed = runtime.model_copy(update={"desired_state": ResidentDesiredState.RUNNING})
+        with _on_cluster(pod_manager, cluster):
+            await pod_manager.resume(resumed, _platform_profile())
+
+        # One start, on the new version: no scale-up of the old pod spec first.
+        [rolled] = cluster.replaces
+        assert rolled["spec"]["values"]["replicaCount"] == 1
+        assert rolled["spec"]["chart"]["spec"]["version"] == "2.0.0-dev.264"
+        assert rolled["spec"]["values"]["image"] == _NEW_IMAGE
+        cluster.api.patch_namespaced_custom_object.assert_not_awaited()
+
+    async def test_a_failed_roll_marks_the_resident_failed_without_retrying(
+        self,
+        core_api: AsyncMock,
+    ) -> None:
+        pod_manager = _platform_manager()
+        runtime = _resident_runtime()
+        _own_claims_exist(core_api, runtime)
+        cluster = _Cluster(_running_release(runtime))
+        cluster.api.replace_namespaced_custom_object.side_effect = _ApiError(422)
+
+        first = await _reconcile(pod_manager, cluster, runtime, _platform_profile())
+        second = await _reconcile(pod_manager, cluster, runtime, _platform_profile())
+
+        assert cluster.api.replace_namespaced_custom_object.await_count == 1
+        for observation in (first, second):
+            assert observation.observed_state is ResidentObservedState.FAILED
+            condition = observation.conditions[0]
+            assert condition.type == "PlatformUpgrade"
+            assert condition.reason == "UpgradeFailed"
+            assert _OLD_VERSION in condition.message and _NEW_VERSION in condition.message
+            assert "Restart the resident to retry" in condition.message
+            # It still runs, and says what it runs.
+            assert observation.backend_ref["platformVersion"] == _OLD_VERSION
+
+        # An explicit restart tries again.
+        cluster.api.replace_namespaced_custom_object.side_effect = cluster._replace
+        with _on_cluster(pod_manager, cluster):
+            await pod_manager.restart(runtime, _platform_profile())
+        third = await _reconcile(pod_manager, cluster, runtime, _platform_profile())
+        assert third.observed_state is not ResidentObservedState.FAILED
+        assert third.backend_ref["platformVersion"] == _NEW_VERSION
+
+    async def test_a_concurrent_upgrade_is_not_a_failure(self, core_api: AsyncMock) -> None:
+        pod_manager = _platform_manager()
+        runtime = _resident_runtime()
+        _own_claims_exist(core_api, runtime)
+        cluster = _Cluster(_running_release(runtime))
+        cluster.api.replace_namespaced_custom_object.side_effect = _ApiError(409)
+
+        observation = await _reconcile(pod_manager, cluster, runtime, _platform_profile())
+
+        assert observation.observed_state is not ResidentObservedState.FAILED
+        assert all(condition.type != "PlatformUpgrade" for condition in observation.conditions)
+
+    async def test_deploy_records_the_version_it_renders(self, mock_api, core_api) -> None:
+        pod_manager = _platform_manager()
+        runtime = _resident_runtime()
+        with patch.object(pod_manager, "_get_api", return_value=mock_api):
+            observation = await pod_manager.deploy(runtime, _platform_profile())
+
+        body = mock_api.create_namespaced_custom_object.call_args.kwargs["body"]
+        assert body["metadata"]["annotations"]["niuu.world/platform-version"] == _NEW_VERSION
+        assert observation.backend_ref["platformVersion"] == _NEW_VERSION

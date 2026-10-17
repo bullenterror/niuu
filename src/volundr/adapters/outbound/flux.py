@@ -10,7 +10,7 @@ import copy
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -78,6 +78,11 @@ _HTTP_NOT_FOUND = 404
 _HTTP_CONFLICT = 409
 #: Key of a Ravn resident's own OpenClaw shim token Secret (resident.openclaw.tokenSecret).
 RESIDENT_OPENCLAW_TOKEN_KEY = "token"
+#: The platform version (chart and images) Völundr last rendered into a resident's release.
+ANNOTATION_PLATFORM_VERSION = "niuu.world/platform-version"
+#: The version that release replaced. A Völundr that still renders it (the old replica
+#: while Völundr itself rolls out) must not move the resident back to it.
+ANNOTATION_REPLACED_PLATFORM_VERSION = "niuu.world/replaced-platform-version"
 
 
 @dataclass(frozen=True)
@@ -202,6 +207,10 @@ class FluxPodManager(
         )
         self._api_client = None
         self._realm_repository = None
+        # Residents whose move to a platform version failed in this Völundr:
+        # resident id -> (target version, reason). Not retried until the target
+        # changes, an explicit restart or resume, or Völundr restarts.
+        self._failed_platform_upgrades: dict[str, tuple[str, str]] = {}
 
     def set_realm_repository(self, repository) -> None:
         """Enable resolving a resident's realm slug for its Helm values.
@@ -963,28 +972,23 @@ class FluxPodManager(
         profile: ResidentDeploymentProfile,
     ) -> ResidentRuntimeObservation:
         release_name = self._resident_release_name(runtime)
-        realm_slug = await self._resolve_realm_slug(runtime)
+        values = await self._render_resident_values(runtime, profile)
+        version = self._platform_version(values)
         await self._ensure_resident_claims(runtime, self._resident_claims(runtime, profile))
         await self._ensure_resident_openclaw_secret(runtime, profile)
         await self._apply_helmrelease(
             release_name,
-            self._resident_values(runtime, profile, realm_slug),
-            labels={
-                "niuu.world/kind": "resident",
-                "niuu.world/resident-id": str(runtime.id),
-                "niuu.world/backend": runtime.backend.value,
-                **resident_flock_labels(runtime, prefix="niuu.world"),
-            },
+            values,
+            labels=self._resident_release_labels(runtime),
             annotations={
-                "niuu.world/owner-id": runtime.owner_id,
-                "niuu.world/tenant-id": runtime.tenant_id,
-                "niuu.world/profile-id": runtime.profile_id,
-                **resident_flock_labels(runtime, prefix="niuu.world"),
+                **self._resident_release_annotations(runtime),
+                ANNOTATION_PLATFORM_VERSION: version,
             },
         )
+        self._failed_platform_upgrades.pop(str(runtime.id), None)
         return ResidentRuntimeObservation(
             observed_state=ResidentObservedState.DEPLOYING,
-            backend_ref=self._backend_ref(runtime),
+            backend_ref={**self._backend_ref(runtime), "platformVersion": version},
             endpoints=self._endpoints(runtime),
             conditions=[
                 ResidentCondition(
@@ -1006,13 +1010,205 @@ class FluxPodManager(
         if helmrelease is None:
             return await self.deploy(runtime, profile)
 
+        upgrade_failure: ResidentCondition | None = None
+        if runtime.desired_state is ResidentDesiredState.RUNNING:
+            # A suspended resident is not woken for this: resume renders it anew.
+            helmrelease, upgrade_failure = await self._follow_platform(
+                runtime, profile, helmrelease
+            )
+
         desired_replicas = 0 if runtime.desired_state is ResidentDesiredState.SUSPENDED else 1
         values = (helmrelease.get("spec") or {}).get("values") or {}
         if values.get("replicaCount", 1) != desired_replicas:
             await self._set_replica_count(runtime, desired_replicas)
 
         deployment = await self._get_resident_deployment(release_name)
-        return self._resident_observation(runtime, helmrelease, deployment)
+        observation = self._resident_observation(runtime, helmrelease, deployment)
+        if upgrade_failure is None:
+            return observation
+        return replace(
+            observation,
+            observed_state=ResidentObservedState.FAILED,
+            conditions=[upgrade_failure, *observation.conditions],
+        )
+
+    async def _follow_platform(
+        self,
+        runtime: ResidentRuntime,
+        profile: ResidentDeploymentProfile,
+        helmrelease: dict[str, Any],
+    ) -> tuple[dict[str, Any], ResidentCondition | None]:
+        """Move a running resident's release to the version this Völundr renders, once.
+
+        The version is the chart and the images the profile renders now, compared
+        with the release's own spec, so it holds across Völundr restarts and
+        replicas. The release keeps the resident's own PVCs and shim token Secret,
+        so a version change is a rolling update with its disks and channels intact.
+        A version this release was already moved to, or moved away from, is never
+        applied again: an edited release is left alone, and an older Völundr still
+        rendering the replaced version (during Völundr's own rollout) does not move
+        the resident back. A failed move marks the resident failed and is not
+        retried until the target changes or the resident is restarted.
+
+        Returns the release as it now is and the failure condition, if any.
+        """
+        runtime_id = str(runtime.id)
+        try:
+            values = await self._render_resident_values(runtime, profile)
+        except Exception:
+            # Deploy reports a profile or realm that does not render; reconcile
+            # keeps observing the release as it runs.
+            logger.debug("Resident %s does not render; not following the platform", runtime_id)
+            return helmrelease, None
+        target = self._platform_version(values)
+        current = self._release_platform_version(helmrelease)
+        if current == target:
+            self._failed_platform_upgrades.pop(runtime_id, None)
+            return helmrelease, None
+        annotations = (helmrelease.get("metadata") or {}).get("annotations") or {}
+        if target in (
+            annotations.get(ANNOTATION_PLATFORM_VERSION),
+            annotations.get(ANNOTATION_REPLACED_PLATFORM_VERSION),
+        ):
+            return helmrelease, None
+        failed = self._failed_platform_upgrades.get(runtime_id)
+        if failed is not None and failed[0] == target:
+            return helmrelease, self._upgrade_failed_condition(failed[1])
+
+        logger.info("Upgrading resident %s from %s to %s", runtime.name, current, target)
+        try:
+            upgraded = await self._roll_resident_release(runtime, profile, helmrelease, values)
+        except Exception as exc:
+            if getattr(exc, "status", None) == _HTTP_CONFLICT:
+                # Another Völundr replica moved it first; the next pass observes that.
+                logger.info("Resident %s was upgraded concurrently", runtime.name)
+                return helmrelease, None
+            reason = (
+                f"Upgrading resident {runtime.name} from {current} to {target} failed: {exc}. "
+                "Restart the resident to retry."
+            )
+            logger.warning(reason)
+            self._failed_platform_upgrades[runtime_id] = (target, reason)
+            return helmrelease, self._upgrade_failed_condition(reason)
+        return upgraded, None
+
+    @staticmethod
+    def _upgrade_failed_condition(message: str) -> ResidentCondition:
+        return ResidentCondition(
+            type="PlatformUpgrade",
+            status=ResidentConditionStatus.FALSE,
+            reason="UpgradeFailed",
+            message=message,
+        )
+
+    async def _render_resident_values(
+        self,
+        runtime: ResidentRuntime,
+        profile: ResidentDeploymentProfile,
+    ) -> dict[str, Any]:
+        return self._resident_values(runtime, profile, await self._resolve_realm_slug(runtime))
+
+    def _platform_version(self, values: dict[str, Any]) -> str:
+        """The version this Völundr renders for a resident: its chart and images."""
+        return resident_platform_version(self._chart_name, self._chart_version, values)
+
+    @staticmethod
+    def _release_platform_version(helmrelease: dict[str, Any]) -> str:
+        """The version a resident's release runs, read from its spec."""
+        spec = helmrelease.get("spec") or {}
+        chart = (spec.get("chart") or {}).get("spec") or {}
+        return resident_platform_version(
+            str(chart.get("chart") or ""),
+            str(chart.get("version") or ""),
+            spec.get("values") or {},
+        )
+
+    def _resident_release_labels(self, runtime: ResidentRuntime) -> dict[str, str]:
+        return {
+            "niuu.world/kind": "resident",
+            "niuu.world/resident-id": str(runtime.id),
+            "niuu.world/backend": runtime.backend.value,
+            **resident_flock_labels(runtime, prefix="niuu.world"),
+        }
+
+    @staticmethod
+    def _resident_release_annotations(runtime: ResidentRuntime) -> dict[str, str]:
+        return {
+            "niuu.world/owner-id": runtime.owner_id,
+            "niuu.world/tenant-id": runtime.tenant_id,
+            "niuu.world/profile-id": runtime.profile_id,
+            **resident_flock_labels(runtime, prefix="niuu.world"),
+        }
+
+    async def _roll_resident_release(
+        self,
+        runtime: ResidentRuntime,
+        profile: ResidentDeploymentProfile,
+        helmrelease: dict[str, Any],
+        values: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Replace the release's chart and values with ``values``, keeping its metadata.
+
+        The resident keeps the storage its release mounts (its own PVCs, or the
+        claim a resident older than those runs on): the rolled pod mounts the same
+        disks, never a new empty one. Its shim token Secret is ensured first. The
+        replace carries the release's resourceVersion: a concurrent writer makes it
+        fail with a conflict rather than be overwritten.
+        """
+        values = _with_release_storage(values, helmrelease)
+        claims = [
+            claim
+            for claim in self._resident_claims(runtime, profile)
+            if claim.name in _claim_names(values)
+        ]
+        await self._ensure_resident_claims(runtime, claims)
+        await self._ensure_resident_openclaw_secret(runtime, profile)
+        release_name = self._resident_release_name(runtime)
+        current = self._release_platform_version(helmrelease)
+        target = self._platform_version(values)
+        manifest = self._build_helmrelease(
+            release_name,
+            values,
+            labels=self._resident_release_labels(runtime),
+            annotations=self._resident_release_annotations(runtime),
+        )
+        body = copy.deepcopy(helmrelease)
+        body.pop("status", None)
+        metadata = body.setdefault("metadata", {})
+        metadata["labels"] = {**(metadata.get("labels") or {}), **manifest["metadata"]["labels"]}
+        annotations = {
+            **(metadata.get("annotations") or {}),
+            **manifest["metadata"]["annotations"],
+            ANNOTATION_PLATFORM_VERSION: target,
+        }
+        if current != target:
+            annotations[ANNOTATION_REPLACED_PLATFORM_VERSION] = current
+        metadata["annotations"] = annotations
+        body["spec"] = {**(body.get("spec") or {}), **manifest["spec"]}
+        replaced = await self._replace_helmrelease(release_name, body)
+        self._failed_platform_upgrades.pop(str(runtime.id), None)
+        return replaced if isinstance(replaced, dict) and replaced.get("spec") else body
+
+    async def _rerender_resident_release(
+        self,
+        runtime: ResidentRuntime,
+        profile: ResidentDeploymentProfile,
+        *,
+        pod_annotations: dict[str, str] | None = None,
+    ) -> ResidentRuntimeObservation:
+        """Render the resident anew on this Völundr's version, as restart and resume do."""
+        helmrelease = await self._get_helmrelease(self._resident_release_name(runtime))
+        if helmrelease is None:
+            return await self.deploy(runtime, profile)
+        values = await self._render_resident_values(runtime, profile)
+        if pod_annotations:
+            values.setdefault("podAnnotations", {}).update(pod_annotations)
+        current = self._release_platform_version(helmrelease)
+        target = self._platform_version(values)
+        if current != target:
+            logger.info("Upgrading resident %s from %s to %s", runtime.name, current, target)
+        await self._roll_resident_release(runtime, profile, helmrelease, values)
+        return await self._observe_after_lifecycle(runtime)
 
     def _resident_observation(
         self,
@@ -1021,6 +1217,7 @@ class FluxPodManager(
         deployment: dict[str, Any] | None,
     ) -> ResidentRuntimeObservation:
         backend_ref = self._backend_ref(runtime)
+        backend_ref["platformVersion"] = self._release_platform_version(helmrelease)
         deployment_name = self._deployment_name(deployment)
         if deployment_name:
             backend_ref["deploymentName"] = deployment_name
@@ -1036,24 +1233,29 @@ class FluxPodManager(
         runtime: ResidentRuntime,
         profile: ResidentDeploymentProfile,
     ) -> ResidentRuntimeObservation:
-        restarted_at = datetime.now(UTC).isoformat()
-        await self._patch_helmrelease(
-            self._resident_release_name(runtime),
-            {
-                "spec": {
-                    "values": {
-                        "podAnnotations": {"niuu.world/restarted-at": restarted_at},
-                    }
-                }
-            },
+        """Roll the resident's pod, rendered anew on this Völundr's version."""
+        return await self._rerender_resident_release(
+            runtime,
+            profile,
+            pod_annotations={"niuu.world/restarted-at": datetime.now(UTC).isoformat()},
         )
-        return await self._observe_after_lifecycle(runtime)
 
     async def suspend(self, runtime: ResidentRuntime) -> ResidentRuntimeObservation:
         await self._set_replica_count(runtime, 0)
         return await self._observe_after_lifecycle(runtime)
 
-    async def resume(self, runtime: ResidentRuntime) -> ResidentRuntimeObservation:
+    async def resume(
+        self,
+        runtime: ResidentRuntime,
+        profile: ResidentDeploymentProfile | None = None,
+    ) -> ResidentRuntimeObservation:
+        """Scale the resident back up; with its profile, on this Völundr's version.
+
+        A suspended resident is not upgraded while it sleeps, so resuming it is
+        where it moves to the current version: one start, on the new pod spec.
+        """
+        if profile is not None:
+            return await self._rerender_resident_release(runtime, profile)
         await self._set_replica_count(runtime, 1)
         return await self._observe_after_lifecycle(runtime)
 
@@ -1392,6 +1594,75 @@ def _pod_log_level_and_message(message: str) -> tuple[str, str]:
         word = match.group(1).lower()
         return _POD_LOG_LEVEL_ALIASES.get(word, word), message
     return resident_log_level(message), message
+
+
+def resident_platform_version(chart: str, chart_version: str, values: dict[str, Any]) -> str:
+    """A resident release's platform version: its chart and every image its values name.
+
+    Readable and deterministic, e.g. ``skuld 2.0.0-dev.264, ghcr.io/niuulabs/skuld:dev-1``;
+    an image below the top level carries its values path (``nginx ...``). Völundr's
+    rendered values and a release's stored spec give the same string for the same
+    version, so comparing the two tells whether a resident runs this Völundr's version.
+    """
+    refs = sorted(_image_refs(values, ""), key=lambda item: (item[0] != "", item[0]))
+    parts = [f"{chart} {chart_version}".strip()]
+    parts.extend(ref if not path else f"{path} {ref}" for path, ref in refs)
+    return ", ".join(part for part in parts if part)
+
+
+#: The values that name a resident's volumes: an upgrade keeps them as the release has them.
+_RESIDENT_STORAGE_VALUES = ("homeVolume", "persistence")
+
+
+def _with_release_storage(values: dict[str, Any], helmrelease: dict[str, Any]) -> dict[str, Any]:
+    """``values`` with the volumes the running release mounts, exactly as it mounts them."""
+    current = (helmrelease.get("spec") or {}).get("values") or {}
+    kept = copy.deepcopy(values)
+    for key in _RESIDENT_STORAGE_VALUES:
+        if key in current:
+            kept[key] = copy.deepcopy(current[key])
+        else:
+            kept.pop(key, None)
+    return kept
+
+
+def _claim_names(values: dict[str, Any]) -> set[str]:
+    names = set()
+    for key in _RESIDENT_STORAGE_VALUES:
+        storage = values.get(key)
+        if isinstance(storage, dict) and storage.get("existingClaim"):
+            names.add(str(storage["existingClaim"]))
+    return names
+
+
+def _image_refs(value: Any, path: str) -> list[tuple[str, str]]:
+    refs: list[tuple[str, str]] = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key == "image":
+                ref = _image_ref(child)
+                if ref:
+                    refs.append((path, ref))
+                continue
+            refs.extend(_image_refs(child, f"{path}.{key}" if path else str(key)))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            refs.extend(_image_refs(item, f"{path}[{index}]"))
+    return refs
+
+
+def _image_ref(image: Any) -> str:
+    if isinstance(image, str):
+        return image.strip()
+    if not isinstance(image, dict):
+        return ""
+    repository = str(image.get("repository") or "").strip()
+    if not repository:
+        return ""
+    tag = str(image.get("tag") or "").strip()
+    digest = str(image.get("digest") or "").strip()
+    ref = f"{repository}:{tag}" if tag else repository
+    return f"{ref}@{digest}" if digest else ref
 
 
 def _resident_platform_exchange_url(values: dict) -> str:

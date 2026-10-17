@@ -112,6 +112,7 @@ class LifecycleResidentRuntimeController:
 
     def __init__(self) -> None:
         self.actions: list[str] = []
+        self.resumed_with = None
 
     def supports(self, profile) -> bool:
         return profile.backend is self.backend
@@ -143,8 +144,9 @@ class LifecycleResidentRuntimeController:
         self.actions.append("suspend")
         return self._observation(runtime)
 
-    async def resume(self, runtime):
+    async def resume(self, runtime, profile=None):
         self.actions.append("resume")
+        self.resumed_with = profile
         return self._observation(runtime)
 
     async def delete(self, runtime):
@@ -744,6 +746,28 @@ async def test_lifecycle_observation_and_delete_use_one_record(runtime_service) 
     deleted = await service.delete(principal, runtime.id)
     assert deleted
     assert runtime.id not in repository.items
+
+
+async def test_resume_hands_the_controller_the_profile_to_render_it_on() -> None:
+    """A suspended resident is not upgraded asleep; it resumes on the current version."""
+    repository = MemoryResidentRuntimeRepository()
+    controller = MemoryResidentRuntimeController()
+    service = ResidentRuntimeService(repository, _profiles(), [controller])
+    principal = _principal()
+    runtime = await service.create_record(principal, name="Muninn", profile_id="ravn-openshell")
+    await service.update_observation(
+        runtime.id,
+        observed_state=ResidentObservedState.SUSPENDED,
+        capabilities=[ResidentCapability.CHAT, ResidentCapability.RUNTIME_SUSPEND],
+    )
+
+    await service.set_desired_state(principal, runtime.id, ResidentDesiredState.SUSPENDED)
+    assert controller.resumed_with is None
+    await service.set_desired_state(principal, runtime.id, ResidentDesiredState.RUNNING)
+
+    assert controller.actions[-1] == "resume"
+    assert controller.resumed_with is not None
+    assert controller.resumed_with.id == "ravn-openshell"
 
 
 async def test_delete_record_removes_resident_trace_spans() -> None:
