@@ -213,7 +213,10 @@ The values come from the node's `guild:` config section:
   the Volundr chart's `guild.url`, `guild.instanceId`, `guild.instanceName` and
   `guild.instanceSlug` from the Guild's registry (`GET /api/v1/niuu/targets/volundr`).
 
-A Forge node with `guild.url` but no instance refuses to start. Through the Guild facade
+A Forge node with `guild.url` but no instance keeps running: its items carry `null`
+instance fields and only `GET /api/v1/forge/guild` reports it, with `503` and the remedy
+(`niuu guild heartbeat --once` on a joined host, the chart's `guild.instance*` values on a
+cluster). Through the Guild facade
 the same route describes the Guild itself: `guild_url` is the Guild chart's `guild.url`
 (its own public origin), and the instance is its embedded node, else its default node,
 else `null`.

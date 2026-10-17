@@ -24,7 +24,7 @@ from niuu.adapters.postgres_credential_refresh_lock import PostgresCredentialRef
 from niuu.adapters.postgres_realms import PostgresRealmRepository
 from niuu.build_identity import build_identity
 from niuu.cors import apply_cors_middleware
-from niuu.domain.guild_membership import GuildInstance, GuildMembership
+from niuu.domain.guild_membership import GuildInstance
 from niuu.domain.services.realm import RealmService
 from niuu.service_integrations import (
     has_seeded_linear_integration as _has_seeded_linear_integration,
@@ -259,24 +259,6 @@ def _create_resident_notification_relay(
             reconnect_max_seconds=config.reconnect_max_seconds,
         ),
     )
-
-
-def _node_guild_membership(settings: Settings) -> GuildMembership | None:
-    """This node's Guild membership, which must name its own instance there.
-
-    ``guild.url`` alone is what the Guild itself configures (its own origin); a
-    Forge node also needs the instance id its Guild keys its items by.
-    """
-    membership = settings.guild.membership()
-    if membership is not None and membership.instance is None:
-        raise ValueError(
-            f"guild.url is {membership.guild_url!r} but this Forge node's instance in that "
-            "Guild is not configured. Set guild.instance_id, guild.instance_name and "
-            "guild.instance_slug from the Guild's registry (GET /api/v1/niuu/targets/volundr), "
-            "or on a host joined with `niuu join` run `niuu guild heartbeat --once` to "
-            "record them; clear guild.url if this node belongs to no Guild."
-        )
-    return membership
 
 
 def _create_notification_service(
@@ -1076,7 +1058,9 @@ def create_app(
                 )
                 logger.info("Push devices: integration connections (credential store)")
             mapping_repository = PostgresMappingRepository(pool)
-            guild_membership = _node_guild_membership(settings)
+            # A node whose instance is not recorded yet keeps running: only
+            # GET /guild reports it (503), and its items carry null instance fields.
+            guild_membership = settings.guild.membership()
             notification_service = _create_notification_service(
                 settings,
                 pool,

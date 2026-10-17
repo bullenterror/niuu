@@ -21,7 +21,6 @@ from volundr.domain.models import EventType, Session, SessionLogEntry
 from volundr.domain.notifications import NotificationSinkInfo
 from volundr.domain.services.notifications import NotificationService
 from volundr.domain.services.session import SessionService
-from volundr.main import _node_guild_membership
 
 PREFIX = "/api/v1/forge"
 GUILD_URL = "https://yggdrasil.niuu.world"
@@ -62,6 +61,17 @@ class TestGuildRoute:
         assert response.status_code == 404
         assert response.json()["detail"] == "This Forge node is not joined to a Guild"
 
+    def test_a_node_that_knows_its_guild_but_not_its_instance_answers_503(self):
+        response = _guild_client(GuildMembership(guild_url=GUILD_URL)).get(
+            f"{PREFIX}/guild", headers=HEADERS
+        )
+
+        assert response.status_code == 503
+        detail = response.json()["detail"]
+        assert GUILD_URL in detail
+        assert "niuu guild heartbeat --once" in detail
+        assert "guild.instanceId" in detail
+
     def test_is_authenticated_like_every_forge_route(self):
         client = _guild_client(GuildMembership(guild_url=GUILD_URL, instance=VALHALLA))
 
@@ -81,16 +91,18 @@ class TestNodeMembershipConfig:
             }
         )
 
-        assert _node_guild_membership(settings) == GuildMembership(
+        assert settings.guild.membership() == GuildMembership(
             guild_url=GUILD_URL, instance=VALHALLA
         )
 
     def test_no_guild_url_means_no_membership(self):
-        assert _node_guild_membership(Settings()) is None
+        assert Settings().guild.membership() is None
 
-    def test_a_node_must_know_its_own_instance_in_its_guild(self):
-        with pytest.raises(ValueError, match="guild.instance_id"):
-            _node_guild_membership(Settings(guild={"url": GUILD_URL}))
+    def test_a_guild_url_without_an_instance_still_loads(self):
+        """The node keeps running; only GET /guild reports the missing instance."""
+        assert Settings(guild={"url": GUILD_URL}).guild.membership() == GuildMembership(
+            guild_url=GUILD_URL
+        )
 
     @pytest.mark.parametrize(
         "section",
