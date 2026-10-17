@@ -457,16 +457,22 @@ jobs:
       run_lint: ${{ needs.changes.outputs.tier == 'full' && needs.changes.outputs.helm == 'true' }}
 
   # ---------------------------------------------------------------------------
-  # Helm — smoke test (kind cluster) — full tier only
+  # Helm — smoke test (kind cluster) — full tier only. Deploys the amd64
+  # images containers-smoke built (the kind node is amd64, so these are the
+  # images the multi-arch pr-<N> manifest resolved to here before), so it
+  # starts as soon as those two builds finish rather than after every image
+  # on both architectures.
   # ---------------------------------------------------------------------------
   helm-smoke-test:
     name: "Helm: Smoke Test"
-    needs: [changes, containers]
+    needs: [changes, containers-smoke]
     if: needs.changes.outputs.tier == 'full' && needs.changes.outputs.helm == 'true' && needs.changes.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: read
+    env:
+      IMAGE_TAG: pr-${{ github.event.number }}-amd64
     steps:
       - name: Harden runner
         uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
@@ -484,15 +490,50 @@ jobs:
           mv /tmp/linux-amd64/helm /usr/local/bin/helm
           helm version
 
-      - name: Create kind cluster
+      # The action only installs kind and kubectl (checksummed). Creating the
+      # cluster here skips the action's wait for a Ready control plane, which
+      # the steps below overlap with image pulls, and the 15 s its post step
+      # spent deleting the cluster the discarded runner takes with it (that
+      # step now looks for the action's default cluster name, finds none).
+      - name: Install kind and kubectl
         uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
         with:
-          cluster_name: ci-test
+          install_only: true
+          ignore_failed_clean: true
 
-      - name: Install Postgres in cluster
+      - name: Create kind cluster
+        run: kind create cluster --name ci-test --wait 0s
+
+      # Every image the four charts deploy, rendered from the values the
+      # installs below use (without the `helm test` hook, which never runs
+      # here), is pulled into the node in parallel while the
+      # control plane comes Ready and Postgres installs. The chart installs
+      # then start their pods from images already on the node instead of
+      # pulling them one chart after another. A failed pull only warns: the
+      # kubelet pulls that image again at install.
+      - name: Pull the charts' images and install Postgres
         run: |
+          set -euo pipefail
+          images="$(
+            for chart in volundr guild ting skuld; do
+              helm template "${chart}" "charts/${chart}/" -f "charts/${chart}/ci-values.yaml" --set image.tag="${IMAGE_TAG}" --no-hooks
+            done | sed -nE 's/^[[:space:]]*image:[[:space:]]*"?([^"[:space:]]+)"?[[:space:]]*$/\1/p' | sort -u
+          )"
+          pulls="${RUNNER_TEMP}/image-pulls"
+          mkdir -p "${pulls}"
+          for image in ${images}; do
+            echo "Pulling ${image} into the node"
+            (
+              if ! docker exec ci-test-control-plane crictl pull "${image}" > "${pulls}/${image//[\/:@]/_}.log" 2>&1; then
+                cat "${pulls}/${image//[\/:@]/_}.log"
+                echo "::warning title=Image pre-pull::${image} did not pull ahead of the install; the kubelet pulls it then"
+              fi
+            ) &
+          done
+
           helm repo add bitnami https://charts.bitnami.com/bitnami
           helm repo update
+          kubectl wait --for=condition=Ready node --all --timeout=60s
           for attempt in 1 2 3; do
             if helm install pg bitnami/postgresql \
               --set auth.postgresPassword=test \
@@ -500,7 +541,7 @@ jobs:
               --set primary.persistence.enabled=false \
               --set primary.initdb.scripts."init\.sql"="CREATE DATABASE ting; CREATE DATABASE guild;" \
               --wait --timeout 120s; then
-              exit 0
+              break
             fi
             helm uninstall pg --ignore-not-found || true
             if [ "$attempt" -eq 3 ]; then
@@ -510,6 +551,9 @@ jobs:
             echo "Retrying Postgres bootstrap after transient Helm/chart fetch failure..."
             sleep 10
           done
+
+          wait
+          docker exec ci-test-control-plane crictl images
 
       - name: Create registry pull secret in kind
         run: |
@@ -524,7 +568,7 @@ jobs:
           output="$(helm install volundr charts/volundr/ \
             -f charts/volundr/ci-values.yaml \
             --set global.imagePullSecrets[0]=ghcr-pull-secret \
-            --set image.tag="pr-${{ github.event.number }}" \
+            --set image.tag="${IMAGE_TAG}" \
             --qps 50 --burst-limit 100 2>&1)" || {
             printf "%s\n" "$output"
             annotation="$(printf "%s" "$output" | tail -c 3000 | sed -z "s/%/%25/g; s/\n/%0A/g; s/\r/%0D/g")"
@@ -533,33 +577,46 @@ jobs:
           }
           printf "%s\n" "$output"
 
-      - name: Install Guild chart
+      # The same three installs, each still waited on for up to 120 s, run
+      # side by side instead of one after another.
+      - name: Install Guild, Ting and Skuld charts
         run: |
-          helm install guild charts/guild/ \
-            -f charts/guild/ci-values.yaml \
-            --set global.imagePullSecrets[0]=ghcr-pull-secret \
-            --set image.tag="pr-${{ github.event.number }}" \
-            --wait --timeout 120s
+          set -uo pipefail
+          logs="${RUNNER_TEMP}/helm-install"
+          mkdir -p "${logs}"
+          declare -A pids
+          for chart in guild ting skuld; do
+            helm install "${chart}" "charts/${chart}/" \
+              -f "charts/${chart}/ci-values.yaml" \
+              --set 'global.imagePullSecrets[0]=ghcr-pull-secret' \
+              --set image.tag="${IMAGE_TAG}" \
+              --wait --timeout 120s > "${logs}/${chart}.log" 2>&1 &
+            pids[${chart}]=$!
+          done
+          failed=0
+          for chart in guild ting skuld; do
+            if wait "${pids[${chart}]}"; then
+              result=deployed
+            else
+              result=failed
+              failed=1
+            fi
+            echo "::group::helm install ${chart}: ${result}"
+            cat "${logs}/${chart}.log"
+            echo "::endgroup::"
+            if [ "${result}" = failed ]; then
+              annotation="$(tail -c 3000 "${logs}/${chart}.log" | sed -z "s/%/%25/g; s/\n/%0A/g; s/\r/%0D/g")"
+              echo "::error title=${chart} Helm install failure::${annotation}"
+            fi
+          done
+          exit "${failed}"
 
-      - name: Install Ting chart
-        run: |
-          helm install ting charts/ting/ \
-            -f charts/ting/ci-values.yaml \
-            --set global.imagePullSecrets[0]=ghcr-pull-secret \
-            --set image.tag="pr-${{ github.event.number }}" \
-            --wait --timeout 120s
-
-      - name: Install Skuld chart
-        run: |
-          helm install skuld charts/skuld/ \
-            -f charts/skuld/ci-values.yaml \
-            --set global.imagePullSecrets[0]=ghcr-pull-secret \
-            --set image.tag="pr-${{ github.event.number }}" \
-            --wait --timeout 120s
-
+      # Volundr's install does not wait, and the three installs above now run
+      # in parallel rather than taking about 90 s in turn, so its readiness
+      # wait gets that time back (150 s, as before counted from its install).
       - name: Verify Volundr pods are ready
         run: |
-          output="$(kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=volundr --timeout=60s 2>&1)" || {
+          output="$(kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=volundr --timeout=150s 2>&1)" || {
             previous_logs="$(kubectl logs -l app.kubernetes.io/name=volundr --all-containers=true --previous --tail=80 2>&1 || true)"
             printf "%s\n" "$previous_logs"
             previous_annotation="$(printf "%s" "$previous_logs" | tail -c 3500 | sed -z "s/%/%25/g; s/\n/%0A/g; s/\r/%0D/g")"
@@ -587,29 +644,33 @@ jobs:
       - name: Verify Skuld pods are ready
         run: kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=skuld --timeout=60s
 
-      - name: Health check Volundr
+      # Polls for the port-forward instead of sleeping 3 s per service. Only
+      # "could not connect" (curl exit 7) is retried; any HTTP error fails.
+      - name: Health check Volundr, Guild and Ting
         run: |
-          kubectl port-forward svc/volundr 8080:80 &
-          PF_PID=$!
-          sleep 3
-          curl -sf http://localhost:8080/health
-          kill $PF_PID || true
-
-      - name: Health check Guild
-        run: |
-          kubectl port-forward svc/guild 8084:80 &
-          PF_PID=$!
-          sleep 3
-          curl -sf http://localhost:8084/health
-          kill $PF_PID || true
-
-      - name: Health check Ting
-        run: |
-          kubectl port-forward svc/ting 8081:80 &
-          PF_PID=$!
-          sleep 3
-          curl -sf http://localhost:8081/health
-          kill $PF_PID || true
+          set -uo pipefail
+          health_check() {
+            local service="$1" port="$2" rc=7
+            kubectl port-forward "svc/${service}" "${port}:80" &
+            local pf_pid=$!
+            for _ in $(seq 1 100); do
+              rc=0
+              curl -sf "http://localhost:${port}/health" || rc=$?
+              [ "${rc}" -eq 7 ] || break
+              sleep 0.1
+            done
+            kill "${pf_pid}" || true
+            echo
+            if [ "${rc}" -ne 0 ]; then
+              echo "::error title=${service} health check::curl exited ${rc} for /health"
+              return 1
+            fi
+          }
+          failed=0
+          health_check volundr 8080 || failed=1
+          health_check guild 8084 || failed=1
+          health_check ting 8081 || failed=1
+          exit "${failed}"
 
       - name: Verify Kubernetes resources
         run: |
@@ -644,10 +705,73 @@ jobs:
   # images this PR tested when the merged tree is the tested tree (ci-gate
   # tags them pr-tested-<tree>). APP_VERSION stays at its default: nothing
   # reads the VITE_APP_VERSION it sets.
+  #
+  # GitHub has no job priority and a free plan runs 20 jobs at a time across
+  # every workflow (arm64 runners included), so the order comes from the
+  # dependency graph, in three calls:
+  #   1. containers-smoke: the amd64 images the Helm smoke test deploys (niuu,
+  #      skuld), which it waits for alone.
+  #   2. containers-amd64: the other five amd64 images, which the scans wait
+  #      for as well.
+  #   Neither has `needs`, so both are queued at t=0 with `changes`, ahead of
+  #   the ~25 test jobs `changes` releases. Their `if` and `push` restate the
+  #   full-tier and same-repository checks `changes` makes (keep them in
+  #   step); a full-tier PR always builds all seven images.
+  #   3. containers-arm64: all seven arm64 images once the amd64 builds are
+  #      done, so they take runners after the critical path has its own; it
+  #      then publishes the multi-arch pr-<N> and pr-<N>-<sha> manifests from
+  #      both platforms' tags, which ci-gate's pr-tested-<tree> tagging needs.
+  # All three read and write the pr-<N> registry cache scope per platform.
   # ---------------------------------------------------------------------------
-  containers:
-    name: Containers
-    needs: changes
+  containers-smoke:
+    name: Containers (smoke-test images)
+    if: >-
+      !startsWith(github.base_ref, 'feat/') && !startsWith(github.base_ref, 'codex/')
+      && !startsWith(github.base_ref, 'claude/')
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/reusable-container-build.yaml
+    with:
+      containers: '["niuu","skuld"]'
+      platforms: '["amd64"]'
+      publish-manifests: false
+      push: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+      cache-scope: pr-${{ github.event.number }}
+      tag-prefix: pr-${{ github.event.number }}
+      manifest-tags: ""
+      labels: |
+        org.opencontainers.image.title=niuu
+        org.opencontainers.image.licenses=Apache-2.0
+        org.opencontainers.image.vendor=Niuu Labs
+        org.opencontainers.image.source=https://github.com/${{ github.repository }}
+
+  containers-amd64:
+    name: Containers (amd64)
+    if: >-
+      !startsWith(github.base_ref, 'feat/') && !startsWith(github.base_ref, 'codex/')
+      && !startsWith(github.base_ref, 'claude/')
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/reusable-container-build.yaml
+    with:
+      containers: '["agent","openshell","devrunner","niuu-web","gbrain"]'
+      platforms: '["amd64"]'
+      publish-manifests: false
+      push: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+      cache-scope: pr-${{ github.event.number }}
+      tag-prefix: pr-${{ github.event.number }}
+      manifest-tags: ""
+      labels: |
+        org.opencontainers.image.title=niuu
+        org.opencontainers.image.licenses=Apache-2.0
+        org.opencontainers.image.vendor=Niuu Labs
+        org.opencontainers.image.source=https://github.com/${{ github.repository }}
+
+  containers-arm64:
+    name: Containers (arm64)
+    needs: [changes, containers-smoke, containers-amd64]
     if: needs.changes.outputs.tier == 'full' && needs.changes.outputs.has_containers == 'true'
     permissions:
       contents: read
@@ -655,7 +779,8 @@ jobs:
     uses: ./.github/workflows/reusable-container-build.yaml
     with:
       containers: ${{ needs.changes.outputs.container-names }}
-      platforms: '["amd64","arm64"]'
+      platforms: '["arm64"]'
+      manifest-platforms: '["amd64","arm64"]'
       push: ${{ needs.changes.outputs.publish == 'true' }}
       cache-scope: pr-${{ github.event.number }}
       tag-prefix: pr-${{ github.event.number }}
@@ -738,11 +863,13 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Security — container vulnerability scanning — full tier only.
-  # Delegated to reusable workflow.
+  # Delegated to reusable workflow. Scans pr-<N>-amd64, the image the
+  # pr-<N> manifest resolved to on the amd64 scanner before (dev.yaml scans
+  # <sha>-amd64 the same way), so it starts once the amd64 builds finish.
   # ---------------------------------------------------------------------------
   scan:
     name: Scan
-    needs: [changes, containers]
+    needs: [changes, containers-smoke, containers-amd64]
     if: needs.changes.outputs.tier == 'full' && needs.changes.outputs.has_containers == 'true' && needs.changes.outputs.publish == 'true'
     permissions:
       contents: read
@@ -751,7 +878,7 @@ jobs:
     uses: ./.github/workflows/reusable-container-scan.yaml
     with:
       containers: ${{ needs.changes.outputs.container-names }}
-      tag: pr-${{ github.event.number }}
+      tag: pr-${{ github.event.number }}-amd64
 
   # ---------------------------------------------------------------------------
   # Security (always runs)
@@ -807,7 +934,9 @@ jobs:
       - web-next-consumer-e2e
       - helm-lint
       - helm-smoke-test
-      - containers
+      - containers-smoke
+      - containers-amd64
+      - containers-arm64
       - build-charts
       - scan
       - dependency-review
@@ -854,7 +983,11 @@ jobs:
               "web-next-consumer-e2e": on("WEB_NEXT"),
               "helm-lint": True,
               "helm-smoke-test": full and on("HELM") and publish,
-              "containers": full and on("HAS_CONTAINERS"),
+              # The two amd64 calls check the tier themselves; a full-tier PR
+              # always has containers.
+              "containers-smoke": full,
+              "containers-amd64": full,
+              "containers-arm64": full and on("HAS_CONTAINERS"),
               "build-charts": full and on("HELM"),
               "scan": full and on("HAS_CONTAINERS") and publish,
               "dependency-review": True,
@@ -903,6 +1036,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Tag the tested images pr-tested-<tree>
+        id: tested
         if: steps.login.outcome == 'success'
         continue-on-error: true
         env:
@@ -928,4 +1062,31 @@ jobs:
             fi
             crane tag "${IMAGE}@${DIGEST}" "pr-tested-${TREE}"
             echo "${IMAGE}@${DIGEST} -> pr-tested-${TREE}"
+          done
+
+      # dev.yaml's promote skips the build, so dev's own registry cache
+      # (buildcache-<arch>) would keep the last tree dev built rather than the
+      # one it now runs. Promote points it at this PR's cache of the tested
+      # tree instead, found under this tag. Best effort: a missing cache only
+      # costs the next builds their cache hits.
+      - name: Tag the tested build caches pr-tested-<tree>-buildcache-<arch>
+        if: steps.tested.outcome == 'success'
+        continue-on-error: true
+        env:
+          IMAGE_BASE: ghcr.io/${{ github.repository_owner }}
+          CONTAINERS: ${{ needs.changes.outputs.container-names }}
+          CACHE_SCOPE: pr-${{ github.event.number }}
+          MERGE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          TREE="$(git rev-parse "${MERGE_SHA}^{tree}")"
+          for container in $(echo "${CONTAINERS}" | jq -r '.[]'); do
+            IMAGE="${IMAGE_BASE}/${container}"
+            for arch in amd64 arm64; do
+              if crane tag "${IMAGE}:${CACHE_SCOPE}-buildcache-${arch}" "pr-tested-${TREE}-buildcache-${arch}"; then
+                echo "${IMAGE}:${CACHE_SCOPE}-buildcache-${arch} -> pr-tested-${TREE}-buildcache-${arch}"
+              else
+                echo "::warning title=pr-tested cache::${IMAGE}:${CACHE_SCOPE}-buildcache-${arch} not tagged"
+              fi
+            done
           done
