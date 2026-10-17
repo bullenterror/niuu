@@ -926,19 +926,99 @@ def test_manifest_rejects_a_stream_that_is_not_a_tar():
         workspace_module.read_workspace_manifest(io.BytesIO(b"profile banner\n" * 100))
 
 
+RELAY_CLOSED = "exec relay closed before the command reported an exit status"
+
+
+def _exec_event(proto, **payload):
+    return proto.ExecSandboxRequest(**{"stdout": None, "stderr": None, "exit": None, **payload})
+
+
+class _RelayedInteractiveExec:
+    """ExecSandboxInteractive as the OpenShell gateway (b1780123) relays it.
+
+    The input stream carries no stdin EOF of its own. When the request stream
+    ends, the gateway sends the sandbox's SSH channel EOF and CLOSE together;
+    russh answers the CLOSE and drops the channel, so the command's exit status
+    is never delivered and the call fails UNAVAILABLE (grpc/sandbox.rs,
+    run_interactive_exec_with_russh). A command that has read all it needs
+    exits first; then the gateway reports the exit and stops reading stdin.
+
+    The remote command needs stdin EOF unless it reads a fixed ``head -c N``.
+    ``exit_after`` makes it exit with ``exit_code`` once that many bytes arrived.
+    """
+
+    def __init__(self, adapter, *, exit_after: int | None = None, exit_code: int = 0) -> None:
+        self._adapter = adapter
+        self._exit_after = exit_after
+        self._exit_code = exit_code
+        self.start = None
+        self.received = bytearray()
+        self.chunks: list[int] = []
+        self.half_closed = False
+
+    def _needs(self, command: list[str]) -> int | None:
+        if self._exit_after is not None:
+            return self._exit_after
+        match = re.match(r"head -c (\d+) \| ", command[-1])
+        return int(match.group(1)) if match else None
+
+    def __call__(self, frames, **_kwargs):
+        proto = self._adapter.openshell_pb2
+        frames = iter(frames)
+        self.start = next(frames).start
+        needs = self._needs(list(self.start.command))
+        while needs is None or len(self.received) < needs:
+            try:
+                frame = next(frames)
+            except StopIteration:
+                # EOF and CLOSE together: the channel is gone before the exit.
+                self.half_closed = True
+                error = self._adapter.grpc.RpcError(RELAY_CLOSED)
+                error.code = lambda: types.SimpleNamespace(name="UNAVAILABLE")
+                error.details = lambda: RELAY_CLOSED
+                raise error
+            self.chunks.append(len(frame.stdin))
+            self.received.extend(frame.stdin)
+        return [_exec_event(proto, exit=types.SimpleNamespace(exit_code=self._exit_code))]
+
+
+def _relay_client(adapter, interactive):
+    client = object.__new__(adapter.OpenShellGatewayClient)
+    client._stub = types.SimpleNamespace(ExecSandboxInteractive=interactive)
+    client._timeout = 30.0
+    client._token_provider = types.SimpleNamespace(token=lambda: "token")
+    return client
+
+
+def test_relay_closes_without_an_exit_when_the_input_stream_ends_first(monkeypatch):
+    """The failure on Noatun: a restore that ends its stream to send stdin EOF."""
+    adapter = _import_adapter(monkeypatch)
+    proto = adapter.openshell_pb2
+    proto.ExecSandboxInput = proto.ExecSandboxRequest
+    relay = _RelayedInteractiveExec(adapter)
+    start = proto.ExecSandboxRequest(command=["sh", "-c", "tar -xf -"])
+
+    def frames():  # how exec_from_file streamed before this fix
+        yield proto.ExecSandboxInput(start=start)
+        yield proto.ExecSandboxInput(stdin=b"archive")
+
+    with pytest.raises(adapter.grpc.RpcError, match=RELAY_CLOSED):
+        relay(frames())
+    assert relay.half_closed
+
+
 def test_gateway_client_streams_archives_in_bounded_chunks(monkeypatch):
     adapter = _import_adapter(monkeypatch)
     proto = adapter.openshell_pb2
     proto.ExecSandboxInput = proto.ExecSandboxRequest
     sent: list = []
+    relay = _RelayedInteractiveExec(adapter)
 
     def event(**payload):
-        return proto.ExecSandboxRequest(**{"stdout": None, "stderr": None, "exit": None, **payload})
+        return _exec_event(proto, **payload)
 
     class _Stub:
-        def ExecSandboxInteractive(self, frames, **_kwargs):  # noqa: N802
-            sent.extend(frames)
-            return [event(exit=types.SimpleNamespace(exit_code=0))]
+        ExecSandboxInteractive = relay
 
         def ExecSandbox(self, request, **_kwargs):  # noqa: N802
             sent.append(request)
@@ -948,23 +1028,36 @@ def test_gateway_client_streams_archives_in_bounded_chunks(monkeypatch):
                 event(exit=types.SimpleNamespace(exit_code=0)),
             ]
 
-    client = object.__new__(adapter.OpenShellGatewayClient)
+    client = _relay_client(adapter, relay)
     client._stub = _Stub()
-    client._timeout = 30.0
-    client._token_provider = types.SimpleNamespace(token=lambda: "token")
-    source = io.BytesIO(b"z" * (adapter.EXEC_STDIN_CHUNK_BYTES * 2 + 5))
+    payload = bytes(range(256)) * (adapter.EXEC_STDIN_CHUNK_BYTES // 128) + b"tail!"
+    source = io.BytesIO(b"skipped" + payload)
+    source.seek(len(b"skipped"))
 
     restored = client.exec_from_file(
-        sandbox_id="sandbox-1", command=["tar", "-xf", "-"], source=source, timeout_seconds=60
+        sandbox_id="sandbox-1",
+        command=["sh", "-c", "exec tar -C '/sandbox/my dir' -xf -"],
+        source=source,
+        timeout_seconds=60,
     )
 
     assert restored.exit_code == 0
-    assert sent[0].start.no_login_shell is True
-    assert [len(frame.stdin) for frame in sent[1:]] == [
+    assert restored.size == len(payload)
+    assert relay.start.no_login_shell is True
+    assert relay.start.command == [
+        "sh",
+        "-c",
+        f"head -c {len(payload)} | sh -c 'exec tar -C '\"'\"'/sandbox/my dir'\"'\"' -xf -'",
+    ]
+    # The command got every byte, in gateway-sized chunks, and the stream never
+    # ended before the exit was reported.
+    assert bytes(relay.received) == payload
+    assert relay.chunks == [
         adapter.EXEC_STDIN_CHUNK_BYTES,
         adapter.EXEC_STDIN_CHUNK_BYTES,
         5,
     ]
+    assert not relay.half_closed
 
     destination = io.BytesIO()
     truncated = client.exec_to_file(
@@ -976,6 +1069,81 @@ def test_gateway_client_streams_archives_in_bounded_chunks(monkeypatch):
     )
     assert truncated.truncated is True
     assert destination.getvalue() == b"x" * 10
+
+
+def test_gateway_client_stops_streaming_once_the_command_exits(monkeypatch):
+    adapter = _import_adapter(monkeypatch)
+    proto = adapter.openshell_pb2
+    proto.ExecSandboxInput = proto.ExecSandboxRequest
+    # tar gives up after the first chunk (say, the disk is full).
+    relay = _RelayedInteractiveExec(adapter, exit_after=1, exit_code=2)
+    client = _relay_client(adapter, relay)
+    source = io.BytesIO(b"z" * (adapter.EXEC_STDIN_CHUNK_BYTES * 3))
+
+    restored = client.exec_from_file(
+        sandbox_id="sandbox-1", command=["tar", "-xf", "-"], source=source, timeout_seconds=60
+    )
+
+    assert restored.exit_code == 2
+    assert relay.chunks == [adapter.EXEC_STDIN_CHUNK_BYTES]
+    assert not relay.half_closed
+
+
+def test_gateway_client_restores_an_empty_archive_without_stdin(monkeypatch):
+    adapter = _import_adapter(monkeypatch)
+    proto = adapter.openshell_pb2
+    proto.ExecSandboxInput = proto.ExecSandboxRequest
+    relay = _RelayedInteractiveExec(adapter)
+    client = _relay_client(adapter, relay)
+
+    restored = client.exec_from_file(
+        sandbox_id="sandbox-1", command=["true"], source=io.BytesIO(), timeout_seconds=60
+    )
+
+    assert restored.exit_code == 0
+    assert relay.start.command == ["sh", "-c", "head -c 0 | true"]
+    assert relay.chunks == []
+    assert not relay.half_closed
+
+
+@pytest.mark.asyncio
+async def test_a_relay_failure_while_restoring_keeps_the_old_sandbox(monkeypatch):
+    harness = _Harness(monkeypatch)
+    runtime = _resident_runtime()
+    old = harness.old_sandbox(runtime)
+    runtime = _running(runtime, old.name)
+    profile = _resident_profile()
+    new_name = f"m-{runtime.id.hex[:17]}"
+    error = harness.adapter.grpc.RpcError("<_MultiThreadedRendezvous ...>")
+    error.code = lambda: types.SimpleNamespace(name="UNAVAILABLE")
+    error.details = lambda: RELAY_CLOSED
+    harness.client.fail_restore_with = error
+
+    observation = await harness.manager.deploy(_awaiting_deployment(runtime), profile)
+
+    assert old.name in harness.client.sandboxes
+    assert new_name not in harness.client.sandboxes
+    assert old.running  # its processes were started again
+    condition = _condition(observation, "WorkspaceMigration")
+    assert condition.reason == "MigrationFailed"
+    # It names the step that failed, not the copy out of the old sandbox.
+    assert (
+        f"Restoring into {WORKSPACE} in {new_name} failed: UNAVAILABLE: {RELAY_CLOSED}"
+        in condition.message
+    )
+    assert "_MultiThreadedRendezvous" not in condition.message
+    assert observation.backend_ref["name"] == old.name
+
+    # Restart retries the copy from the start, and it verifies.
+    harness.client.fail_restore_with = None
+    restarted = await harness.manager.restart(
+        runtime.model_copy(update={"backend_ref": observation.backend_ref}), profile
+    )
+    assert restarted.backend_ref["name"] == new_name
+    assert old.name not in harness.client.sandboxes
+    assert harness.core.phase(_claim_name(runtime)) == "complete"
+    files = harness.client.claim_files[_claim_name(runtime)]
+    assert files[".ravn-home/memory.db"] == b"episodes"
 
 
 @pytest.mark.parametrize(

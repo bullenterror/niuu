@@ -875,38 +875,60 @@ class OpenShellGatewayClient:
         source: IO[bytes],
         timeout_seconds: float,
     ) -> OpenShellTransfer:
-        """Run a command with ``source`` streamed to its stdin, in gateway-sized chunks.
+        """Run a command with the rest of ``source`` on its stdin, in gateway-sized chunks.
 
-        ExecSandbox takes stdin in one message, which the gateway caps; the
-        interactive exec streams it, and closes stdin when ``source`` ends.
+        ExecSandbox takes stdin in one message, which the gateway caps, so this
+        streams it over the interactive exec. That stream has no stdin EOF of its
+        own: when the request stream ends, the gateway sends the sandbox EOF and
+        closes the SSH channel at once, so the supervisor can no longer report
+        the command's exit and the call fails with "exec relay closed before the
+        command reported an exit status". So the command reads exactly the
+        source's size (``head -c``) and finishes without EOF, and the request
+        stream stays open until the gateway has reported the exit.
+
+        ``source`` must be seekable; it is read from its current position.
         """
+        position = source.tell()
+        size = source.seek(0, io.SEEK_END) - position
+        source.seek(position)
+        remote = f"head -c {size} | {shlex.join(str(part) for part in command)}"
         start = openshell_pb2.ExecSandboxRequest(
             sandbox_id=sandbox_id,
-            command=[str(part) for part in command],
+            command=["sh", "-c", remote],
             timeout_seconds=int(timeout_seconds),
             no_login_shell=True,
         )
+        deadline = max(self._timeout, float(timeout_seconds))
+        finished = threading.Event()
+        sent = 0
 
         def frames():
+            nonlocal sent
             yield openshell_pb2.ExecSandboxInput(start=start)
-            while chunk := source.read(EXEC_STDIN_CHUNK_BYTES):
+            while not finished.is_set() and (chunk := source.read(EXEC_STDIN_CHUNK_BYTES)):
+                sent += len(chunk)
                 yield openshell_pb2.ExecSandboxInput(stdin=chunk)
+            # Ending the request stream now would close the channel before the exit.
+            finished.wait(deadline)
 
-        stream = self._stub.ExecSandboxInteractive(
-            frames(),
-            timeout=max(self._timeout, float(timeout_seconds)),
-            metadata=self._metadata(),
-        )
         output: list[str] = []
         exit_code: int | None = None
-        for event in stream:
-            if event.HasField("stdout"):
-                output.append(_exec_output_text(event.stdout.data))
-            elif event.HasField("stderr"):
-                output.append(_exec_output_text(event.stderr.data))
-            elif event.HasField("exit"):
-                exit_code = int(event.exit.exit_code)
-        return OpenShellTransfer(exit_code=exit_code, stderr="".join(output), size=0)
+        try:
+            stream = self._stub.ExecSandboxInteractive(
+                frames(),
+                timeout=deadline,
+                metadata=self._metadata(),
+            )
+            for event in stream:
+                if event.HasField("stdout"):
+                    output.append(_exec_output_text(event.stdout.data))
+                elif event.HasField("stderr"):
+                    output.append(_exec_output_text(event.stderr.data))
+                elif event.HasField("exit"):
+                    exit_code = int(event.exit.exit_code)
+        finally:
+            finished.set()
+        return OpenShellTransfer(exit_code=exit_code, stderr="".join(output), size=sent)
 
     def write_files(self, *, sandbox_id: str, files: dict[str, bytes]) -> None:
         for extraction_root, archive in _credential_file_archives(files):
@@ -2667,13 +2689,18 @@ class OpenShellGatewayPodManager(
         for destination, archive in archives:
             archive.seek(0)
             target = str(PurePosixPath(self._sandbox_workspace, destination))
-            transfer = await asyncio.to_thread(
-                self._client.exec_from_file,
-                sandbox_id=sandbox.id,
-                command=["sh", "-c", _workspace_extract_script(target)],
-                source=archive,
-                timeout_seconds=self._workspace_migration_timeout,
-            )
+            try:
+                transfer = await asyncio.to_thread(
+                    self._client.exec_from_file,
+                    sandbox_id=sandbox.id,
+                    command=["sh", "-c", _workspace_extract_script(target)],
+                    source=archive,
+                    timeout_seconds=self._workspace_migration_timeout,
+                )
+            except grpc.RpcError as exc:
+                raise WorkspaceMigrationError(
+                    f"Restoring into {target} in {sandbox.name} failed: {_rpc_error_text(exc)}"
+                ) from exc
             if transfer.exit_code != 0:
                 raise WorkspaceMigrationError(
                     f"Restoring into {target} in {sandbox.name} failed with exit "
@@ -5088,6 +5115,15 @@ def _resident_process_log_script(lines: int, sources: Sequence[str]) -> str:
             )
         )
     return "\n".join(commands)
+
+
+def _rpc_error_text(exc: grpc.RpcError) -> str:
+    """``CODE: details`` of a failed gateway call, without the gRPC debug dump."""
+    code = exc.code() if callable(getattr(exc, "code", None)) else None
+    details = exc.details() if callable(getattr(exc, "details", None)) else None
+    name = getattr(code, "name", "")
+    text = str(details or exc)
+    return f"{name}: {text}" if name else text
 
 
 def _exec_output_text(value: Any) -> str:
