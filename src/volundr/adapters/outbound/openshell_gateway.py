@@ -153,6 +153,10 @@ DEFAULT_SANDBOX_COMMAND = ["/usr/local/bin/openshell-run-installed-skuld"]
 DEFAULT_SERVICE_PORT = 9200
 READY_POLL_INTERVAL = 1.0
 DEFAULT_RESOURCE_DELETE_TIMEOUT_SECONDS = 30.0
+#: How long a resident's deploy or migration waits for a sandbox it removes to go.
+#: Deleting a resident sandbox (its pod, volumes and gateway records) took over
+#: 30s on Noatun, so a rollback gave up on a sandbox that was still going.
+DEFAULT_RESIDENT_SANDBOX_DELETE_TIMEOUT_SECONDS = 180.0
 TCP_FORWARD_BUFFER_BYTES = 64 * 1024
 # The gateway decodes at most 1 MiB per gRPC message; streamed stdin stays well below.
 EXEC_STDIN_CHUNK_BYTES = 256 * 1024
@@ -875,38 +879,60 @@ class OpenShellGatewayClient:
         source: IO[bytes],
         timeout_seconds: float,
     ) -> OpenShellTransfer:
-        """Run a command with ``source`` streamed to its stdin, in gateway-sized chunks.
+        """Run a command with the rest of ``source`` on its stdin, in gateway-sized chunks.
 
-        ExecSandbox takes stdin in one message, which the gateway caps; the
-        interactive exec streams it, and closes stdin when ``source`` ends.
+        ExecSandbox takes stdin in one message, which the gateway caps, so this
+        streams it over the interactive exec. That stream has no stdin EOF of its
+        own: when the request stream ends, the gateway sends the sandbox EOF and
+        closes the SSH channel at once, so the supervisor can no longer report
+        the command's exit and the call fails with "exec relay closed before the
+        command reported an exit status". So the command reads exactly the
+        source's size (``head -c``) and finishes without EOF, and the request
+        stream stays open until the gateway has reported the exit.
+
+        ``source`` must be seekable; it is read from its current position.
         """
+        position = source.tell()
+        size = source.seek(0, io.SEEK_END) - position
+        source.seek(position)
+        remote = f"head -c {size} | {shlex.join(str(part) for part in command)}"
         start = openshell_pb2.ExecSandboxRequest(
             sandbox_id=sandbox_id,
-            command=[str(part) for part in command],
+            command=["sh", "-c", remote],
             timeout_seconds=int(timeout_seconds),
             no_login_shell=True,
         )
+        deadline = max(self._timeout, float(timeout_seconds))
+        finished = threading.Event()
+        sent = 0
 
         def frames():
+            nonlocal sent
             yield openshell_pb2.ExecSandboxInput(start=start)
-            while chunk := source.read(EXEC_STDIN_CHUNK_BYTES):
+            while not finished.is_set() and (chunk := source.read(EXEC_STDIN_CHUNK_BYTES)):
+                sent += len(chunk)
                 yield openshell_pb2.ExecSandboxInput(stdin=chunk)
+            # Ending the request stream now would close the channel before the exit.
+            finished.wait(deadline)
 
-        stream = self._stub.ExecSandboxInteractive(
-            frames(),
-            timeout=max(self._timeout, float(timeout_seconds)),
-            metadata=self._metadata(),
-        )
         output: list[str] = []
         exit_code: int | None = None
-        for event in stream:
-            if event.HasField("stdout"):
-                output.append(_exec_output_text(event.stdout.data))
-            elif event.HasField("stderr"):
-                output.append(_exec_output_text(event.stderr.data))
-            elif event.HasField("exit"):
-                exit_code = int(event.exit.exit_code)
-        return OpenShellTransfer(exit_code=exit_code, stderr="".join(output), size=0)
+        try:
+            stream = self._stub.ExecSandboxInteractive(
+                frames(),
+                timeout=deadline,
+                metadata=self._metadata(),
+            )
+            for event in stream:
+                if event.HasField("stdout"):
+                    output.append(_exec_output_text(event.stdout.data))
+                elif event.HasField("stderr"):
+                    output.append(_exec_output_text(event.stderr.data))
+                elif event.HasField("exit"):
+                    exit_code = int(event.exit.exit_code)
+        finally:
+            finished.set()
+        return OpenShellTransfer(exit_code=exit_code, stderr="".join(output), size=sent)
 
     def write_files(self, *, sandbox_id: str, files: dict[str, bytes]) -> None:
         for extraction_root, archive in _credential_file_archives(files):
@@ -1044,6 +1070,9 @@ class OpenShellGatewayPodManager(
         command_timeout: float = 30.0,
         ready_timeout: float = 300.0,
         resource_delete_timeout: float = DEFAULT_RESOURCE_DELETE_TIMEOUT_SECONDS,
+        resident_sandbox_delete_timeout_seconds: float = (
+            DEFAULT_RESIDENT_SANDBOX_DELETE_TIMEOUT_SECONDS
+        ),
         credential_token_endpoint: str = DEFAULT_CREDENTIAL_TOKEN_ENDPOINT,
         volundr_api_url: str = "",
         workload_audience: str = "volundr-api",
@@ -1082,6 +1111,8 @@ class OpenShellGatewayPodManager(
             raise ValueError("resident_workspace_migration_lease_seconds must be positive")
         if resident_workspace_migration_timeout_seconds <= 0:
             raise ValueError("resident_workspace_migration_timeout_seconds must be positive")
+        if resident_sandbox_delete_timeout_seconds <= 0:
+            raise ValueError("resident_sandbox_delete_timeout_seconds must be positive")
         # Each resident's own workspace claim, in the namespace where the gateway runs
         # sandboxes. Unset, residents keep their workspace in the sandbox only.
         self._workspace_claims = (
@@ -1108,6 +1139,9 @@ class OpenShellGatewayPodManager(
         # Residents whose workspace migration failed in this Völundr: id -> reason.
         # Their old sandbox keeps running; retried on Restart or when Völundr restarts.
         self._failed_workspace_migrations: dict[str, WorkspaceMigrationError] = {}
+        # The sandbox a resident's failed migration created and could not remove,
+        # by resident id: reconcile removes it (_remove_abandoned_migration_sandbox).
+        self._abandoned_migration_sandboxes: dict[str, str] = {}
         self._gateway_public_url = gateway_public_url.rstrip("/")
         gateway_hostport = _endpoint_hostport(gateway_endpoint)
         gateway_host, separator, gateway_port = gateway_hostport.rpartition(":")
@@ -1129,6 +1163,7 @@ class OpenShellGatewayPodManager(
         self._memory = memory
         self._ready_timeout = float(ready_timeout)
         self._resource_delete_timeout = float(resource_delete_timeout)
+        self._resident_delete_timeout = float(resident_sandbox_delete_timeout_seconds)
         self._credential_token_endpoint = credential_token_endpoint
         self._volundr_api_url = volundr_api_url.rstrip("/")
         self._workload_audience = workload_audience
@@ -2076,7 +2111,9 @@ class OpenShellGatewayPodManager(
         if sandbox.phase == openshell_pb2.SANDBOX_PHASE_DELETING:
             # A rolled-back attempt is still being deleted: let it go, then
             # provision a fresh sandbox under the same name.
-            await self._wait_for_sandbox_deleted(sandbox_name)
+            await self._wait_for_sandbox_deleted(
+                sandbox_name, timeout=self._resident_delete_timeout
+            )
             return None
         return sandbox
 
@@ -2233,10 +2270,16 @@ class OpenShellGatewayPodManager(
             if not keep_sandbox_on_failure:
                 try:
                     await self._cleanup_resources(
-                        sandbox_name, () if keep_grants else grants, service_name=service_name
+                        sandbox_name,
+                        () if keep_grants else grants,
+                        service_name=service_name,
+                        delete_timeout=self._resident_delete_timeout,
                     )
                 except Exception:
                     logger.exception("OpenShell resident rollback failed for %s", runtime.id)
+                    if migration is not None and not migration.retired_old:
+                        # Reconcile removes it once it is safe to.
+                        migration.abandoned = sandbox_name
             if upgraded_from is not None:
                 reason = (
                     f"Upgrading resident {runtime.name} from {upgraded_from} to {image} "
@@ -2403,6 +2446,93 @@ class OpenShellGatewayPodManager(
             conditions.append(self._hold_upgrade(runtime, running, target))
         return replace(observation, conditions=conditions)
 
+    async def _remove_abandoned_migration_sandbox(
+        self,
+        runtime: ResidentRuntime,
+        values: dict[str, Any],
+        claim: ResidentWorkspaceClaim,
+        old: OpenShellSandbox,
+    ) -> None:
+        """Remove the sandbox this resident's failed migration created and left behind.
+
+        Only the sandbox this Völundr recorded when that migration's rollback could
+        not remove it, and only while it is still the resident's migration sandbox
+        beside ``old`` (labelled for the resident, mounting its claim), never
+        ``old`` itself, which runs the resident. It is removed under the
+        migration's lease and only while the claim is still ``copying``, so a
+        migration that another Völundr runs, or a verified copy, keeps its sandbox.
+        The removal is requested, not awaited; a later pass sees the sandbox gone.
+        """
+        runtime_id = str(runtime.id)
+        name = self._abandoned_migration_sandboxes.get(runtime_id)
+        if not name:
+            return
+        if name == old.name or name != self._migration_sandbox_name(runtime, old.name):
+            self._abandoned_migration_sandboxes.pop(runtime_id, None)
+            return
+        lock = self._resident_process_lock(runtime)
+        if lock.locked():
+            return
+        async with lock:
+            leftover = await asyncio.to_thread(self._client.get_sandbox, name)
+            if leftover is None:
+                self._abandoned_migration_sandboxes.pop(runtime_id, None)
+                logger.info(
+                    "Sandbox %s of resident %s's failed migration is gone", name, runtime.name
+                )
+                return
+            owner = dict(leftover.labels or {}).get("volundr.niuu.io/resident")
+            if owner != runtime_id or not _sandbox_mounts_claim(leftover, claim):
+                self._abandoned_migration_sandboxes.pop(runtime_id, None)
+                logger.warning(
+                    "Not removing sandbox %s: it is not resident %s's migration sandbox",
+                    name,
+                    runtime.name,
+                )
+                return
+            if leftover.phase == openshell_pb2.SANDBOX_PHASE_DELETING:
+                return
+            claims = self._require_workspace_claims()
+            pvc = await claims.read(claim.name)
+            state = workspace_migration_state(pvc) if pvc is not None else None
+            if state is None or state.phase != PHASE_COPYING:
+                return
+            lease = WorkspaceMigrationLease(
+                claims,
+                pvc,
+                self._workspace_migration_holder,
+                self._workspace_migration_lease_seconds,
+            )
+            try:
+                await lease.acquire(source=state.source or old.name)
+            except (WorkspaceMigrationHeldError, WorkspaceClaimInUseError):
+                return
+            service_name, _ = _resident_service(values, self._service_name, self._service_port)
+            try:
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(
+                        self._client.delete_service, sandbox_name=name, service=service_name
+                    )
+                await asyncio.to_thread(self._client.delete_sandbox, name)
+                logger.info(
+                    "Removing sandbox %s, left by resident %s's failed workspace migration",
+                    name,
+                    runtime.name,
+                )
+            except Exception:
+                logger.warning(
+                    "Could not remove sandbox %s of resident %s's failed workspace migration; "
+                    "retrying on the next pass",
+                    name,
+                    runtime.name,
+                    exc_info=True,
+                )
+            finally:
+                try:
+                    await lease.release()
+                except Exception:
+                    logger.exception("Could not release %s's migration lease", runtime.name)
+
     async def _migrate_workspace(
         self,
         runtime: ResidentRuntime,
@@ -2430,6 +2560,8 @@ class OpenShellGatewayPodManager(
         service_name, _ = _resident_service(values, self._service_name, self._service_port)
         new_name = self._migration_sandbox_name(runtime, old.name)
         progress = _WorkspaceMigrationProgress()
+        # This attempt removes any leftover of an earlier one itself, under its lease.
+        self._abandoned_migration_sandboxes.pop(runtime_id, None)
         lease: WorkspaceMigrationLease | None = None
         renewer: asyncio.Task[None] | None = None
         with contextlib.ExitStack() as spools:
@@ -2472,7 +2604,12 @@ class OpenShellGatewayPodManager(
                 renewer = asyncio.create_task(self._renew_workspace_migration_lease(lease))
                 for leftover in stale:
                     # A sandbox an interrupted attempt created: its claim is re-copied.
-                    await self._cleanup_resources(leftover.name, (), service_name=service_name)
+                    await self._cleanup_resources(
+                        leftover.name,
+                        (),
+                        service_name=service_name,
+                        delete_timeout=self._resident_delete_timeout,
+                    )
                 await self._stop_resident_processes(old, processes)
                 archives: list[tuple[str, IO[bytes]]] = []
                 expected = WorkspaceManifest({})
@@ -2495,7 +2632,12 @@ class OpenShellGatewayPodManager(
                     await lease.renew()
                     await self._close_resident_forwarders(runtime)
                     self._service_urls.pop(runtime_id, None)
-                    await self._cleanup_resources(old.name, (), service_name=service_name)
+                    await self._cleanup_resources(
+                        old.name,
+                        (),
+                        service_name=service_name,
+                        delete_timeout=self._resident_delete_timeout,
+                    )
                     progress.retired_old = True
                     await lease.set_phase(PHASE_COMPLETE)
                     await lease.release()
@@ -2524,6 +2666,8 @@ class OpenShellGatewayPodManager(
                 if progress.retired_old:
                     # The verified copy is the resident's state now; it redeploys on it.
                     raise
+                if progress.abandoned:
+                    self._abandoned_migration_sandboxes[runtime_id] = progress.abandoned
                 if lease is not None and not lease.lost:
                     try:
                         await lease.release()
@@ -2667,13 +2811,18 @@ class OpenShellGatewayPodManager(
         for destination, archive in archives:
             archive.seek(0)
             target = str(PurePosixPath(self._sandbox_workspace, destination))
-            transfer = await asyncio.to_thread(
-                self._client.exec_from_file,
-                sandbox_id=sandbox.id,
-                command=["sh", "-c", _workspace_extract_script(target)],
-                source=archive,
-                timeout_seconds=self._workspace_migration_timeout,
-            )
+            try:
+                transfer = await asyncio.to_thread(
+                    self._client.exec_from_file,
+                    sandbox_id=sandbox.id,
+                    command=["sh", "-c", _workspace_extract_script(target)],
+                    source=archive,
+                    timeout_seconds=self._workspace_migration_timeout,
+                )
+            except grpc.RpcError as exc:
+                raise WorkspaceMigrationError(
+                    f"Restoring into {target} in {sandbox.name} failed: {_rpc_error_text(exc)}"
+                ) from exc
             if transfer.exit_code != 0:
                 raise WorkspaceMigrationError(
                     f"Restoring into {target} in {sandbox.name} failed with exit "
@@ -2827,6 +2976,7 @@ class OpenShellGatewayPodManager(
                         )
                     ],
                 )
+            await self._remove_abandoned_migration_sandbox(runtime, values, claim, sandbox)
         if running_resident:
             follow = await self._follow_platform(
                 runtime,
@@ -3249,6 +3399,7 @@ class OpenShellGatewayPodManager(
                 )
         service_name = str(runtime.backend_ref.get("service_name") or self._service_name)
         self._failed_workspace_migrations.pop(runtime_id, None)
+        self._abandoned_migration_sandboxes.pop(runtime_id, None)
         # A workspace migration leaves a second sandbox while it runs: remove both
         # (only the resident's own), then the resident's workspace claim.
         for other_name in self._resident_sandbox_names(runtime):
@@ -3782,6 +3933,7 @@ class OpenShellGatewayPodManager(
         grants: Sequence[OpenShellProviderGrant],
         *,
         service_name: str | None = None,
+        delete_timeout: float | None = None,
     ) -> bool:
         errors: list[Exception] = []
         try:
@@ -3799,7 +3951,7 @@ class OpenShellGatewayPodManager(
             deleted = False
         else:
             try:
-                await self._wait_for_sandbox_deleted(sandbox_name)
+                await self._wait_for_sandbox_deleted(sandbox_name, timeout=delete_timeout)
             except Exception as exc:
                 errors.append(exc)
             else:
@@ -3815,13 +3967,15 @@ class OpenShellGatewayPodManager(
             )
         return deleted
 
-    async def _wait_for_sandbox_deleted(self, sandbox_name: str) -> None:
-        deadline = time.monotonic() + self._resource_delete_timeout
+    async def _wait_for_sandbox_deleted(
+        self, sandbox_name: str, *, timeout: float | None = None
+    ) -> None:
+        limit = self._resource_delete_timeout if timeout is None else timeout
+        deadline = time.monotonic() + limit
         while await asyncio.to_thread(self._client.get_sandbox, sandbox_name) is not None:
             if time.monotonic() >= deadline:
                 raise TimeoutError(
-                    f"OpenShell sandbox {sandbox_name!r} was not deleted within "
-                    f"{self._resource_delete_timeout:g}s"
+                    f"OpenShell sandbox {sandbox_name!r} was not deleted within {limit:g}s"
                 )
             await asyncio.sleep(READY_POLL_INTERVAL)
 
@@ -4861,6 +5015,8 @@ class _WorkspaceMigrationProgress:
     """Whether a migration removed the old sandbox: past that, nothing is rolled back."""
 
     retired_old: bool = False
+    #: The new sandbox, when the rollback could not remove it.
+    abandoned: str = ""
 
 
 def _sandbox_mounts_claim(sandbox: OpenShellSandbox, claim: ResidentWorkspaceClaim) -> bool:
@@ -5088,6 +5244,15 @@ def _resident_process_log_script(lines: int, sources: Sequence[str]) -> str:
             )
         )
     return "\n".join(commands)
+
+
+def _rpc_error_text(exc: grpc.RpcError) -> str:
+    """``CODE: details`` of a failed gateway call, without the gRPC debug dump."""
+    code = exc.code() if callable(getattr(exc, "code", None)) else None
+    details = exc.details() if callable(getattr(exc, "details", None)) else None
+    name = getattr(code, "name", "")
+    text = str(details or exc)
+    return f"{name}: {text}" if name else text
 
 
 def _exec_output_text(value: Any) -> str:

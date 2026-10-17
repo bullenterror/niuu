@@ -8,6 +8,7 @@ import io
 import logging
 import re
 import tarfile
+import time
 import types
 
 import pytest
@@ -141,6 +142,11 @@ class _SandboxFleetClient(_FakeOpenShellGatewayClient):
         self.events = events
         self.corrupt_restore = False
         self.fail_restore_with: BaseException | None = None
+        #: Deletions the gateway accepts and finishes this many seconds later.
+        self.delete_seconds = 0.0
+        self.deleting: dict[str, float] = {}
+        #: name -> how many delete calls the gateway rejects first.
+        self.fail_deletes: dict[str, int] = {}
 
     # -- sandboxes ---------------------------------------------------------------
     def add(self, sandbox: _Sandbox) -> _Sandbox:
@@ -168,17 +174,24 @@ class _SandboxFleetClient(_FakeOpenShellGatewayClient):
         return self._proto(sandbox, ready=False)
 
     def get_sandbox(self, name: str):
+        due = self.deleting.get(name)
+        if due is not None and time.monotonic() >= due:
+            del self.deleting[name]
+            self.sandboxes.pop(name, None)
         sandbox = self.sandboxes.get(name)
         return None if sandbox is None else self._proto(sandbox, ready=True)
 
     def _proto(self, sandbox: _Sandbox, *, ready: bool):
+        phases = self._adapter.openshell_pb2
         return self._adapter.OpenShellSandbox(
             id=sandbox.id,
             name=sandbox.name,
             phase=(
-                self._adapter.openshell_pb2.SANDBOX_PHASE_READY
+                phases.SANDBOX_PHASE_DELETING
+                if sandbox.name in self.deleting
+                else phases.SANDBOX_PHASE_READY
                 if ready
-                else self._adapter.openshell_pb2.SANDBOX_PHASE_PROVISIONING
+                else phases.SANDBOX_PHASE_PROVISIONING
             ),
             ready=ready,
             labels=sandbox.labels,
@@ -188,8 +201,14 @@ class _SandboxFleetClient(_FakeOpenShellGatewayClient):
         )
 
     def delete_sandbox(self, name: str) -> bool:
+        if self.fail_deletes.get(name):
+            self.fail_deletes[name] -= 1
+            raise RuntimeError(f"gateway could not delete {name} now")
         self.deleted.append(name)
         self.events.append(f"deleted:{name}")
+        if name in self.sandboxes and self.delete_seconds:
+            self.deleting.setdefault(name, time.monotonic() + self.delete_seconds)
+            return True
         return self.sandboxes.pop(name, None) is not None
 
     # -- files and processes ---------------------------------------------------------
@@ -926,19 +945,99 @@ def test_manifest_rejects_a_stream_that_is_not_a_tar():
         workspace_module.read_workspace_manifest(io.BytesIO(b"profile banner\n" * 100))
 
 
+RELAY_CLOSED = "exec relay closed before the command reported an exit status"
+
+
+def _exec_event(proto, **payload):
+    return proto.ExecSandboxRequest(**{"stdout": None, "stderr": None, "exit": None, **payload})
+
+
+class _RelayedInteractiveExec:
+    """ExecSandboxInteractive as the OpenShell gateway (b1780123) relays it.
+
+    The input stream carries no stdin EOF of its own. When the request stream
+    ends, the gateway sends the sandbox's SSH channel EOF and CLOSE together;
+    russh answers the CLOSE and drops the channel, so the command's exit status
+    is never delivered and the call fails UNAVAILABLE (grpc/sandbox.rs,
+    run_interactive_exec_with_russh). A command that has read all it needs
+    exits first; then the gateway reports the exit and stops reading stdin.
+
+    The remote command needs stdin EOF unless it reads a fixed ``head -c N``.
+    ``exit_after`` makes it exit with ``exit_code`` once that many bytes arrived.
+    """
+
+    def __init__(self, adapter, *, exit_after: int | None = None, exit_code: int = 0) -> None:
+        self._adapter = adapter
+        self._exit_after = exit_after
+        self._exit_code = exit_code
+        self.start = None
+        self.received = bytearray()
+        self.chunks: list[int] = []
+        self.half_closed = False
+
+    def _needs(self, command: list[str]) -> int | None:
+        if self._exit_after is not None:
+            return self._exit_after
+        match = re.match(r"head -c (\d+) \| ", command[-1])
+        return int(match.group(1)) if match else None
+
+    def __call__(self, frames, **_kwargs):
+        proto = self._adapter.openshell_pb2
+        frames = iter(frames)
+        self.start = next(frames).start
+        needs = self._needs(list(self.start.command))
+        while needs is None or len(self.received) < needs:
+            try:
+                frame = next(frames)
+            except StopIteration:
+                # EOF and CLOSE together: the channel is gone before the exit.
+                self.half_closed = True
+                error = self._adapter.grpc.RpcError(RELAY_CLOSED)
+                error.code = lambda: types.SimpleNamespace(name="UNAVAILABLE")
+                error.details = lambda: RELAY_CLOSED
+                raise error
+            self.chunks.append(len(frame.stdin))
+            self.received.extend(frame.stdin)
+        return [_exec_event(proto, exit=types.SimpleNamespace(exit_code=self._exit_code))]
+
+
+def _relay_client(adapter, interactive):
+    client = object.__new__(adapter.OpenShellGatewayClient)
+    client._stub = types.SimpleNamespace(ExecSandboxInteractive=interactive)
+    client._timeout = 30.0
+    client._token_provider = types.SimpleNamespace(token=lambda: "token")
+    return client
+
+
+def test_relay_closes_without_an_exit_when_the_input_stream_ends_first(monkeypatch):
+    """The failure on Noatun: a restore that ends its stream to send stdin EOF."""
+    adapter = _import_adapter(monkeypatch)
+    proto = adapter.openshell_pb2
+    proto.ExecSandboxInput = proto.ExecSandboxRequest
+    relay = _RelayedInteractiveExec(adapter)
+    start = proto.ExecSandboxRequest(command=["sh", "-c", "tar -xf -"])
+
+    def frames():  # how exec_from_file streamed before this fix
+        yield proto.ExecSandboxInput(start=start)
+        yield proto.ExecSandboxInput(stdin=b"archive")
+
+    with pytest.raises(adapter.grpc.RpcError, match=RELAY_CLOSED):
+        relay(frames())
+    assert relay.half_closed
+
+
 def test_gateway_client_streams_archives_in_bounded_chunks(monkeypatch):
     adapter = _import_adapter(monkeypatch)
     proto = adapter.openshell_pb2
     proto.ExecSandboxInput = proto.ExecSandboxRequest
     sent: list = []
+    relay = _RelayedInteractiveExec(adapter)
 
     def event(**payload):
-        return proto.ExecSandboxRequest(**{"stdout": None, "stderr": None, "exit": None, **payload})
+        return _exec_event(proto, **payload)
 
     class _Stub:
-        def ExecSandboxInteractive(self, frames, **_kwargs):  # noqa: N802
-            sent.extend(frames)
-            return [event(exit=types.SimpleNamespace(exit_code=0))]
+        ExecSandboxInteractive = relay
 
         def ExecSandbox(self, request, **_kwargs):  # noqa: N802
             sent.append(request)
@@ -948,23 +1047,36 @@ def test_gateway_client_streams_archives_in_bounded_chunks(monkeypatch):
                 event(exit=types.SimpleNamespace(exit_code=0)),
             ]
 
-    client = object.__new__(adapter.OpenShellGatewayClient)
+    client = _relay_client(adapter, relay)
     client._stub = _Stub()
-    client._timeout = 30.0
-    client._token_provider = types.SimpleNamespace(token=lambda: "token")
-    source = io.BytesIO(b"z" * (adapter.EXEC_STDIN_CHUNK_BYTES * 2 + 5))
+    payload = bytes(range(256)) * (adapter.EXEC_STDIN_CHUNK_BYTES // 128) + b"tail!"
+    source = io.BytesIO(b"skipped" + payload)
+    source.seek(len(b"skipped"))
 
     restored = client.exec_from_file(
-        sandbox_id="sandbox-1", command=["tar", "-xf", "-"], source=source, timeout_seconds=60
+        sandbox_id="sandbox-1",
+        command=["sh", "-c", "exec tar -C '/sandbox/my dir' -xf -"],
+        source=source,
+        timeout_seconds=60,
     )
 
     assert restored.exit_code == 0
-    assert sent[0].start.no_login_shell is True
-    assert [len(frame.stdin) for frame in sent[1:]] == [
+    assert restored.size == len(payload)
+    assert relay.start.no_login_shell is True
+    assert relay.start.command == [
+        "sh",
+        "-c",
+        f"head -c {len(payload)} | sh -c 'exec tar -C '\"'\"'/sandbox/my dir'\"'\"' -xf -'",
+    ]
+    # The command got every byte, in gateway-sized chunks, and the stream never
+    # ended before the exit was reported.
+    assert bytes(relay.received) == payload
+    assert relay.chunks == [
         adapter.EXEC_STDIN_CHUNK_BYTES,
         adapter.EXEC_STDIN_CHUNK_BYTES,
         5,
     ]
+    assert not relay.half_closed
 
     destination = io.BytesIO()
     truncated = client.exec_to_file(
@@ -976,6 +1088,195 @@ def test_gateway_client_streams_archives_in_bounded_chunks(monkeypatch):
     )
     assert truncated.truncated is True
     assert destination.getvalue() == b"x" * 10
+
+
+def test_gateway_client_stops_streaming_once_the_command_exits(monkeypatch):
+    adapter = _import_adapter(monkeypatch)
+    proto = adapter.openshell_pb2
+    proto.ExecSandboxInput = proto.ExecSandboxRequest
+    # tar gives up after the first chunk (say, the disk is full).
+    relay = _RelayedInteractiveExec(adapter, exit_after=1, exit_code=2)
+    client = _relay_client(adapter, relay)
+    source = io.BytesIO(b"z" * (adapter.EXEC_STDIN_CHUNK_BYTES * 3))
+
+    restored = client.exec_from_file(
+        sandbox_id="sandbox-1", command=["tar", "-xf", "-"], source=source, timeout_seconds=60
+    )
+
+    assert restored.exit_code == 2
+    assert relay.chunks == [adapter.EXEC_STDIN_CHUNK_BYTES]
+    assert not relay.half_closed
+
+
+def test_gateway_client_restores_an_empty_archive_without_stdin(monkeypatch):
+    adapter = _import_adapter(monkeypatch)
+    proto = adapter.openshell_pb2
+    proto.ExecSandboxInput = proto.ExecSandboxRequest
+    relay = _RelayedInteractiveExec(adapter)
+    client = _relay_client(adapter, relay)
+
+    restored = client.exec_from_file(
+        sandbox_id="sandbox-1", command=["true"], source=io.BytesIO(), timeout_seconds=60
+    )
+
+    assert restored.exit_code == 0
+    assert relay.start.command == ["sh", "-c", "head -c 0 | true"]
+    assert relay.chunks == []
+    assert not relay.half_closed
+
+
+@pytest.mark.asyncio
+async def test_a_relay_failure_while_restoring_keeps_the_old_sandbox(monkeypatch):
+    harness = _Harness(monkeypatch)
+    runtime = _resident_runtime()
+    old = harness.old_sandbox(runtime)
+    runtime = _running(runtime, old.name)
+    profile = _resident_profile()
+    new_name = f"m-{runtime.id.hex[:17]}"
+    error = harness.adapter.grpc.RpcError("<_MultiThreadedRendezvous ...>")
+    error.code = lambda: types.SimpleNamespace(name="UNAVAILABLE")
+    error.details = lambda: RELAY_CLOSED
+    harness.client.fail_restore_with = error
+
+    observation = await harness.manager.deploy(_awaiting_deployment(runtime), profile)
+
+    assert old.name in harness.client.sandboxes
+    assert new_name not in harness.client.sandboxes
+    assert old.running  # its processes were started again
+    condition = _condition(observation, "WorkspaceMigration")
+    assert condition.reason == "MigrationFailed"
+    # It names the step that failed, not the copy out of the old sandbox.
+    assert (
+        f"Restoring into {WORKSPACE} in {new_name} failed: UNAVAILABLE: {RELAY_CLOSED}"
+        in condition.message
+    )
+    assert "_MultiThreadedRendezvous" not in condition.message
+    assert observation.backend_ref["name"] == old.name
+
+    # Restart retries the copy from the start, and it verifies.
+    harness.client.fail_restore_with = None
+    restarted = await harness.manager.restart(
+        runtime.model_copy(update={"backend_ref": observation.backend_ref}), profile
+    )
+    assert restarted.backend_ref["name"] == new_name
+    assert old.name not in harness.client.sandboxes
+    assert harness.core.phase(_claim_name(runtime)) == "complete"
+    files = harness.client.claim_files[_claim_name(runtime)]
+    assert files[".ravn-home/memory.db"] == b"episodes"
+
+
+def _relay_error(harness):
+    error = harness.adapter.grpc.RpcError(RELAY_CLOSED)
+    error.code = lambda: types.SimpleNamespace(name="UNAVAILABLE")
+    error.details = lambda: RELAY_CLOSED
+    return error
+
+
+async def _failed_migration(harness, runtime, profile):
+    """Deploy a resident whose migration fails while restoring; return its observation."""
+    harness.client.fail_restore_with = _relay_error(harness)
+    observation = await harness.manager.deploy(_awaiting_deployment(runtime), profile)
+    harness.client.fail_restore_with = None
+    assert _condition(observation, "WorkspaceMigration").reason == "MigrationFailed"
+    return observation
+
+
+@pytest.mark.asyncio
+async def test_rollback_waits_for_a_slow_sandbox_deletion(monkeypatch, caplog):
+    # Sessions keep the short delete wait; a resident's rollback has its own, longer one.
+    harness = _Harness(monkeypatch, resource_delete_timeout=0.05)
+    monkeypatch.setattr(harness.adapter, "READY_POLL_INTERVAL", 0.01)
+    runtime = _resident_runtime()
+    old = harness.old_sandbox(runtime)
+    runtime = _running(runtime, old.name)
+    new_name = f"m-{runtime.id.hex[:17]}"
+    harness.client.delete_seconds = 0.3  # Noatun took over 30s
+
+    await _failed_migration(harness, runtime, _resident_profile())
+
+    assert new_name not in harness.client.sandboxes
+    assert not any("rollback failed" in record.getMessage() for record in caplog.records)
+    assert harness.manager._abandoned_migration_sandboxes == {}
+    assert old.name in harness.client.sandboxes
+    assert old.running
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("left_by", ["rejected delete", "slow delete"])
+async def test_reconcile_removes_the_sandbox_a_failed_migration_left(monkeypatch, left_by):
+    harness = _Harness(monkeypatch, resident_sandbox_delete_timeout_seconds=0.05)
+    monkeypatch.setattr(harness.adapter, "READY_POLL_INTERVAL", 0.01)
+    runtime = _resident_runtime()
+    old = harness.old_sandbox(runtime)
+    runtime = _running(runtime, old.name)
+    profile = _resident_profile()
+    new_name = f"m-{runtime.id.hex[:17]}"
+    if left_by == "rejected delete":
+        harness.client.fail_deletes[new_name] = 1
+    else:
+        harness.client.delete_seconds = 0.3  # longer than this Völundr waits
+
+    observation = await _failed_migration(harness, runtime, profile)
+
+    # The rollback gave up on the new sandbox; the old one runs the resident again.
+    assert new_name in harness.client.sandboxes
+    assert harness.manager._abandoned_migration_sandboxes == {str(runtime.id): new_name}
+    assert old.running
+    events_before = list(harness.events)
+    running = runtime.model_copy(update={"backend_ref": observation.backend_ref})
+
+    reconciled = await harness.manager.reconcile(running, profile)
+    if left_by == "slow delete":
+        await asyncio.sleep(0.35)
+    settled = await harness.manager.reconcile(running, profile)
+
+    assert new_name not in harness.client.sandboxes
+    assert harness.events.count(f"deleted:{new_name}") == 1
+    assert harness.manager._abandoned_migration_sandboxes == {}
+    # The old sandbox and its processes are left exactly as they were.
+    later = harness.events[len(events_before) :]
+    assert not any(old.name in event for event in later)
+    assert old.name in harness.client.sandboxes
+    assert old.running
+    for observed in (reconciled, settled):
+        assert observed.backend_ref["name"] == old.name
+        assert _condition(observed, "WorkspaceMigration").reason == "MigrationFailed"
+    # The claim still records the unfinished copy, and nobody holds its lease.
+    claim = harness.core.pvcs[_claim_name(runtime)]
+    assert harness.core.phase(_claim_name(runtime)) == "copying"
+    assert workspace_module.ANNOTATION_MIGRATION_HOLDER not in claim.metadata.annotations
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("why", ["another resident's", "not on the claim", "another Völundr's"])
+async def test_reconcile_never_removes_a_sandbox_it_did_not_leave(monkeypatch, why):
+    harness = _Harness(monkeypatch)
+    runtime = _resident_runtime()
+    old = harness.old_sandbox(runtime)
+    runtime = _running(runtime, old.name)
+    profile = _resident_profile()
+    new_name = f"m-{runtime.id.hex[:17]}"
+    harness.client.fail_deletes[new_name] = 1
+    observation = await _failed_migration(harness, runtime, profile)
+    leftover = harness.client.sandboxes[new_name]
+    if why == "another resident's":
+        leftover.labels["volundr.niuu.io/resident"] = "00000000-0000-0000-0000-000000000001"
+    elif why == "not on the claim":
+        leftover.annotations.pop("volundr.niuu.io/workspace-claim")
+    else:
+        # Another Völundr is migrating the resident now: the sandbox is its copy.
+        annotations = harness.core.pvcs[_claim_name(runtime)].metadata.annotations
+        annotations[workspace_module.ANNOTATION_MIGRATION_HOLDER] = "volundr-b"
+        annotations[workspace_module.ANNOTATION_MIGRATION_EXPIRES] = f"{time.time() + 600:.0f}"
+
+    await harness.manager.reconcile(
+        runtime.model_copy(update={"backend_ref": observation.backend_ref}), profile
+    )
+
+    assert new_name in harness.client.sandboxes
+    assert f"deleted:{new_name}" not in harness.events
+    assert old.name in harness.client.sandboxes
+    assert old.running
 
 
 @pytest.mark.parametrize(
