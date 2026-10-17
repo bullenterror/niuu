@@ -1354,11 +1354,15 @@ def gateway(
 def _make_channel_tasks(
     channels_cfg: Any,
     gw: Any,
+    *,
+    notifications: Any | None = None,
 ) -> list[tuple[Any, str]]:
     """Create asyncio tasks for the extended gateway channel adapters.
 
     Returns a list of ``(task, name)`` pairs so callers can populate both
     a task list and a display list without duplicating the if-chain.
+    ``notifications`` is the resident notification outbox the OpenClaw shim
+    serves to Forge (``build_resident_notification_outbox``).
     """
     from ravn.adapters.channels.gateway_discord import DiscordGateway
     from ravn.adapters.channels.gateway_matrix import MatrixGateway
@@ -1369,7 +1373,8 @@ def _make_channel_tasks(
     pairs: list[tuple[Any, str]] = []
     if getattr(channels_cfg, "openclaw", None) is not None and channels_cfg.openclaw.enabled:
         task = asyncio.create_task(
-            OpenClawGateway(channels_cfg.openclaw, gw).run(), name="openclaw"
+            OpenClawGateway(channels_cfg.openclaw, gw, notifications=notifications).run(),
+            name="openclaw",
         )
         pairs.append((task, "openclaw"))
     if channels_cfg.discord.enabled:

@@ -1466,6 +1466,22 @@ class OpenClawChannelConfig(BaseModel):
             "history endpoint, so chat.history has nothing else to read."
         ),
     )
+    notifications_enabled: bool = Field(
+        default=True,
+        description=(
+            "Serve the resident's notification outbox (what it waits on its owner for, "
+            "and what its agent notifies on purpose) to Forge over this shim, and offer "
+            "the agent the `notify` tool. The outbox shares store_path's database."
+        ),
+    )
+    notifications_max_pending: int = Field(
+        default=1000,
+        ge=1,
+        description=(
+            "Most outbox entries kept while Forge has not acknowledged them. Past it the "
+            "oldest are dropped, with a warning: Forge has not reached this shim for long."
+        ),
+    )
 
 
 class GatewayChannelsConfig(BaseModel):

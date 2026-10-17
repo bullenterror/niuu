@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from niuu.domain.notifications import MAX_BODY_CHARS
+from niuu.domain.resident_notifications import AttentionInputKind
 from niuu.observability import get_observability
 from ravn.domain.models import AgentTask, OutputMode, TokenUsage, TurnResult
 from ravn.domain.resident_continuation import (
@@ -30,6 +32,7 @@ from ravn.domain.resident_continuation import (
 )
 from ravn.domain.resident_state import ResidentStatePort
 from ravn.odin.review import ReviewItem, ReviewKind, ReviewRequester
+from ravn.ports.resident_notifications import ResidentNotificationOutboxPort
 from ravn.ports.trigger import TriggerPort
 from ravn.resident_continuation import (
     _parse_a2a_task,
@@ -160,6 +163,7 @@ class ResidentRuntime:
         self._directed_messages_enabled = directed_messages_enabled
         self._environment_id = environment_id.strip() or "unknown"
         self._review_requester = review_requester
+        self._notifications: ResidentNotificationOutboxPort | None = None
         self._enqueue: EnqueueResidentTask | None = None
         self._inflight_cases: set[str] = set()
         self._inflight_refs: set[str] = set()
@@ -186,6 +190,39 @@ class ResidentRuntime:
 
     def bind_review_requester(self, requester: ReviewRequester | None) -> None:
         self._review_requester = requester
+
+    def bind_notification_outbox(self, outbox: ResidentNotificationOutboxPort | None) -> None:
+        """Tell the owner (through Forge's notification feed) when a question waits on them."""
+        self._notifications = outbox
+
+    async def raise_pending_attention(self) -> int:
+        """Raise an attention notification for every operator question still waiting.
+
+        Run at startup: a question asked before the outbox existed, or while this
+        resident was down, still reaches its owner. A question already raised is
+        not raised again, so this is safe to repeat.
+        """
+        if self._notifications is None:
+            return 0
+        raised = 0
+        for entry in await self._state.list_operator_needed():
+            case_id = _metadata(entry.content, "case_id") or _case_from_path(entry.path)
+            raised += await self._raise_attention(
+                case_id=case_id,
+                turn_index=_metadata(entry.content, "turn"),
+                question=_metadata(entry.content, "question"),
+            )
+        return raised
+
+    async def _raise_attention(self, *, case_id: str, turn_index: str, question: str) -> bool:
+        if self._notifications is None or not case_id:
+            return False
+        return await self._notifications.attention(
+            request_id=operator_question_request_id(case_id, turn_index),
+            group=case_id,
+            input_kind=AttentionInputKind.QUESTION,
+            prompt=question[:MAX_BODY_CHARS],
+        )
 
     # ------------------------------------------------------------------
     # Health scorecard
@@ -1185,6 +1222,11 @@ class ResidentRuntime:
                 attributes={"ravn.resident.case_id": record.case_id},
                 content={"question": question, "reason": reason},
             )
+        await self._raise_attention(
+            case_id=record.case_id,
+            turn_index=str(record.turn_index),
+            question=question,
+        )
         await self._request_operator_review(
             case_id=record.case_id,
             question=question,
@@ -1282,6 +1324,9 @@ class ResidentRuntime:
                 raise LookupError(f"no pending operator question for case {case_id}")
             prior_turn_handoff = await self._read_parent_handoff(pending)
             answer_ref = await self._state.write_operator_answer(answer, case_id=case_id)
+            if self._notifications is not None:
+                # The owner answered: their "needs your input" item must not stay unread.
+                await self._notifications.resolve(group=case_id)
             task = _operator_resume_task(
                 pending,
                 answer=answer,
@@ -2061,6 +2106,15 @@ def _resident_turn_handoff(content: str) -> str:
 def _body(content: str) -> str:
     parts = re.split(r"\n\n", content, maxsplit=2)
     return parts[-1].strip() if parts else content.strip()
+
+
+def operator_question_request_id(case_id: str, turn_index: str) -> str:
+    """The attention request id of one operator question: its case and the turn that asked.
+
+    Stable across restarts (both are on the persisted question), and distinct for a
+    case that asks again on a later turn.
+    """
+    return f"operator:{case_id}:{turn_index or '0'}"
 
 
 def _case_from_path(path: str) -> str:

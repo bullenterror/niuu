@@ -64,6 +64,10 @@ class OutboundNotification:
     delivery_id: str | None = None
     attempt: int = 1
     metadata: dict[str, Any] = field(default_factory=dict)
+    #: Set for a resident's notification (it has no session): the resident, and the
+    #: channel it came from (``None`` for the resident's main room).
+    resident_id: str | None = None
+    resident_session_id: str | None = None
 
     def to_payload(self) -> dict[str, Any]:
         """The full notification as JSON-safe data (used by webhook-style sinks)."""
@@ -77,6 +81,8 @@ class OutboundNotification:
             "owner_id": self.owner_id,
             "session_id": self.session_id,
             "session_name": self.session_label,
+            "resident_id": self.resident_id,
+            "resident_session_id": self.resident_session_id,
             "host": self.host_label,
             "project_id": self.project_id,
             "url": self.url,

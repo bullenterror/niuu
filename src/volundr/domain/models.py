@@ -282,6 +282,9 @@ class PushMessage:
     notification_id: str = ""
     #: Deep link back to Forge, when known.
     url: str = ""
+    #: A resident's notification: the resident and its channel ("" = main room).
+    resident_id: str = ""
+    resident_session_id: str = ""
 
 
 class GitSource(BaseModel):

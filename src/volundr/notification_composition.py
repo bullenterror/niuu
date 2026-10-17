@@ -66,6 +66,8 @@ def notification_renderer(config: NotificationsConfig, public_origin: str) -> No
         public_base_url=base,
         session_link_path=config.session_link_path,
         feed_link_path=config.feed_link_path,
+        resident_link_path=config.resident_link_path,
+        resident_session_link_path=config.resident_session_link_path,
         host_label=host_label,
     )
 

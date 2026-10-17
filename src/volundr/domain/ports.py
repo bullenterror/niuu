@@ -24,6 +24,7 @@ from credentials.ports import (  # noqa: F401
 from identity.models import Resource  # noqa: F401
 from identity.ports import AuthorizationPort, TenantRepository, UserRepository  # noqa: F401
 from niuu.domain.outcome import OutcomeField
+from niuu.domain.resident_notifications import ResidentNotificationEntry
 from niuu.ports.credentials import CredentialStorePort  # noqa: F401
 from niuu.ports.git import (
     GitAuthError,  # noqa: F401
@@ -1057,6 +1058,50 @@ class ResidentSessionController(ABC):
         session_id: UUID,
     ) -> ResidentChatConnection:
         """Open a normalized shared-chat connection."""
+
+
+class ResidentNotificationsUnavailableError(RuntimeError):
+    """The resident serves no notification outbox (an older engine, or switched off)."""
+
+
+class ResidentNotificationStream(ABC):
+    """An open read of one resident's notification outbox (see
+    :mod:`niuu.domain.resident_notifications`)."""
+
+    @abstractmethod
+    async def pending(self, *, limit: int) -> list[ResidentNotificationEntry]:
+        """The oldest entries not acknowledged yet, in the resident's write order."""
+
+    @abstractmethod
+    async def acknowledge(self, *, through_seq: int) -> None:
+        """Everything up to ``through_seq`` is recorded; the resident may drop it."""
+
+    @abstractmethod
+    async def wait_for_more(self, *, timeout: float) -> None:
+        """Return when the resident reports new entries, or after ``timeout`` seconds.
+
+        Raises when the connection to the resident ends.
+        """
+
+    @abstractmethod
+    def resident_session_id(self, channel: str | None) -> UUID | None:
+        """The resident session an entry's ``channel`` names; ``None`` is the main room."""
+
+    @abstractmethod
+    async def close(self) -> None:
+        """Close the read."""
+
+
+class ResidentNotificationSource(ABC):
+    """A resident session controller that can also read its residents' notifications."""
+
+    @abstractmethod
+    async def open_notifications(self, runtime: ResidentRuntime) -> ResidentNotificationStream:
+        """Open the resident's notification outbox.
+
+        Raises :class:`ResidentNotificationsUnavailableError` when the resident
+        serves none.
+        """
 
 
 class ResidentRuntimeRepository(ABC):

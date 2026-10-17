@@ -63,9 +63,11 @@ from ravn.adapters.channels.openclaw_protocol import (
 )
 from ravn.adapters.channels.openclaw_store import OpenClawStore, now_ms
 from ravn.adapters.channels.openclaw_translate import TurnTranslator
+from ravn.domain.notification_channel import current_notification_channel
 
 if TYPE_CHECKING:
     from ravn.adapters.channels.gateway import RavnGateway
+    from ravn.ports.resident_notifications import ResidentNotificationOutboxPort
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +90,18 @@ SUPPORTED_METHODS = [
     "chat.abort",
 ]
 
+#: Advertised only when this shim serves a resident notification outbox: Forge drains
+#: it with these (see ``niuu.domain.resident_notifications``).
+NOTIFICATION_METHODS = [
+    "notifications.subscribe",
+    "notifications.pull",
+    "notifications.ack",
+]
+#: Sent to connections that called ``notifications.subscribe`` when an entry is added.
+NOTIFICATIONS_CHANGED_EVENT = "notifications.changed"
+#: The most entries one ``notifications.pull`` returns.
+MAX_NOTIFICATION_PULL = 200
+
 
 @dataclass
 class _ActiveRun:
@@ -108,9 +122,18 @@ class OpenClawGateway:
         *,
         store: OpenClawStore | None = None,
         agent_id: str | None = None,
+        notifications: ResidentNotificationOutboxPort | None = None,
     ) -> None:
         self._config = config
         self._gateway = gateway
+        #: The resident's notification outbox, drained by Forge through this shim.
+        self._notifications = notifications
+        self._notification_sends: set[asyncio.Task[None]] = set()
+        self._unsubscribe_notifications = (
+            notifications.subscribe(self._notifications_changed)
+            if notifications is not None
+            else None
+        )
         self._agent_id = agent_id or getattr(config, "agent_id", None) or "travis"
         self._store = store or OpenClawStore(
             getattr(config, "store_path", "~/.ravn/openclaw/state.db")
@@ -196,6 +219,8 @@ class OpenClawGateway:
         try:
             await server.serve()
         finally:
+            if self._unsubscribe_notifications is not None:
+                self._unsubscribe_notifications()
             if self._room_poller is not None:
                 self._room_poller.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -235,6 +260,22 @@ class OpenClawGateway:
 
     # -- fan-out -----------------------------------------------------------
 
+    def _notifications_changed(self) -> None:
+        """Tell every notification subscriber the outbox has a new entry."""
+        subscribers = [conn for conn in list(self._conns) if conn.wants_notifications]
+        for conn in subscribers:
+            task = asyncio.get_running_loop().create_task(
+                conn.send_event(NOTIFICATIONS_CHANGED_EVENT, {"ts": now_ms()})
+            )
+            self._notification_sends.add(task)
+            task.add_done_callback(self._notification_sent)
+
+    def _notification_sent(self, task: asyncio.Task[None]) -> None:
+        self._notification_sends.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            # A connection that went away mid-send; it re-pulls when it reconnects.
+            logger.info("notifications.changed not delivered: %s", task.exception())
+
     async def broadcast(self, session_key: str, event: str, payload: dict[str, Any]) -> None:
         """Send an event to every connection subscribed to *session_key*."""
         for conn in list(self._conns):
@@ -246,6 +287,22 @@ class OpenClawGateway:
     @property
     def store(self) -> OpenClawStore:
         return self._store
+
+    @property
+    def notifications(self) -> ResidentNotificationOutboxPort | None:
+        return self._notifications
+
+    def require_notifications(self) -> ResidentNotificationOutboxPort:
+        if self._notifications is None:
+            raise RuntimeError("This OpenClaw shim serves no resident notification outbox")
+        return self._notifications
+
+    @property
+    def methods(self) -> list[str]:
+        """The RPCs this shim answers, as hello-ok advertises them."""
+        if self._notifications is None:
+            return list(SUPPORTED_METHODS)
+        return [*SUPPORTED_METHODS, *NOTIFICATION_METHODS]
 
     @property
     def token(self) -> str:
@@ -451,6 +508,8 @@ class OpenClawGateway:
         translator = run.translator
         run_id = run.run_id
         reason = "stream closed"
+        # The turn's own task inherits this, so what it notifies names this channel.
+        current_notification_channel.set(session_key)
         try:
             async for event in self._gateway.handle_message_stream(session_key, message):
                 if run.aborted:
@@ -493,6 +552,7 @@ class _Connection:
         self._device_id: str | None = None
         self._subscriptions: set[str] = set()
         self._subscribe_all = False
+        self._notification_subscriber = False
         self._tick_task: asyncio.Task | None = None
         self._send_lock = asyncio.Lock()
 
@@ -508,6 +568,10 @@ class _Connection:
 
     def is_subscribed(self, session_key: str) -> bool:
         return self._authed and (self._subscribe_all or session_key in self._subscriptions)
+
+    @property
+    def wants_notifications(self) -> bool:
+        return self._authed and self._notification_subscriber
 
     async def aclose(self) -> None:
         if self._tick_task:
@@ -592,6 +656,14 @@ class _Connection:
             "chat.send": self._on_chat_send,
             "chat.abort": self._on_chat_abort,
         }
+        if self._gw.notifications is not None:
+            handlers.update(
+                {
+                    "notifications.subscribe": self._on_notifications_subscribe,
+                    "notifications.pull": self._on_notifications_pull,
+                    "notifications.ack": self._on_notifications_ack,
+                }
+            )
         handler = handlers.get(method)
         if handler is None:
             # Must stay decodable and must NOT tear down the socket — verified
@@ -669,7 +741,7 @@ class _Connection:
                     device_token=mint_device_token(device_id, self._gw.token),
                     agent_id=self._gw.agent_id,
                     main_session_key=self._gw.main_session_key,
-                    methods=SUPPORTED_METHODS,
+                    methods=self._gw.methods,
                 ),
             )
         )
@@ -721,6 +793,42 @@ class _Connection:
         else:
             self._subscribe_all = True
         await self._send(response_frame(req_id, {"ok": True}))
+
+    # -- resident notification outbox ------------------------------------
+
+    async def _on_notifications_subscribe(self, req_id: str, _params: dict[str, Any]) -> None:
+        self._notification_subscriber = True
+        await self._send(response_frame(req_id, {"ok": True}))
+
+    async def _on_notifications_pull(self, req_id: str, params: dict[str, Any]) -> None:
+        """The oldest unacknowledged outbox entries, in write order."""
+        outbox = self._gw.require_notifications()
+        limit = params.get("limit", MAX_NOTIFICATION_PULL)
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            await self._send(
+                error_frame(req_id, ErrorCodes.INVALID_REQUEST, "limit must be a positive integer")
+            )
+            return
+        entries = await outbox.pending(limit=min(limit, MAX_NOTIFICATION_PULL))
+        await self._send(
+            response_frame(
+                req_id, {"entries": [entry.model_dump(mode="json") for entry in entries]}
+            )
+        )
+
+    async def _on_notifications_ack(self, req_id: str, params: dict[str, Any]) -> None:
+        """Forge recorded everything up to ``throughSeq``: drop it from the outbox."""
+        outbox = self._gw.require_notifications()
+        through = params.get("throughSeq")
+        if not isinstance(through, int) or isinstance(through, bool) or through < 1:
+            await self._send(
+                error_frame(
+                    req_id, ErrorCodes.INVALID_REQUEST, "throughSeq must be a positive integer"
+                )
+            )
+            return
+        acknowledged = await outbox.acknowledge(through_seq=through)
+        await self._send(response_frame(req_id, {"ok": True, "acknowledged": acknowledged}))
 
     async def _on_chat_history(self, req_id: str, params: dict[str, Any]) -> None:
         key = params.get("sessionKey")
