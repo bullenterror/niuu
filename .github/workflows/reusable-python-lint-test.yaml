@@ -189,7 +189,12 @@ jobs:
           fi
           exit "$status"
 
+      # FinalizeArtifact sometimes fails with ECONNRESET. Retry once; if that
+      # fails too, the shard still reports its test result and "Python: Test
+      # Volundr" fails on the missing coverage file as an infra problem.
       - name: Upload shard coverage
+        id: upload
+        continue-on-error: true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: volundr-coverage-${{ matrix.shard }}
@@ -197,6 +202,22 @@ jobs:
           if-no-files-found: error
           include-hidden-files: true
           retention-days: 1
+
+      - name: Wait before retrying the coverage upload
+        if: steps.upload.outcome == 'failure'
+        run: sleep 15
+
+      - name: Retry shard coverage upload
+        if: steps.upload.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: volundr-coverage-${{ matrix.shard }}
+          path: .coverage.shard-${{ matrix.shard }}
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 1
+          overwrite: true
 
   test-volundr:
     name: "Python: Test Volundr"
@@ -232,6 +253,16 @@ jobs:
           pattern: volundr-coverage-*
           path: coverage-shards
           merge-multiple: true
+
+      # One file per shard (the matrix above). A missing one means its upload
+      # failed after the retry, not that its tests did.
+      - name: Require every shard's coverage file
+        run: |
+          count="$(find coverage-shards -maxdepth 1 -type f -name '.coverage.shard-*' 2>/dev/null | wc -l)"
+          if [ "$count" -ne 4 ]; then
+            echo "::error title=Coverage artifact missing::coverage artifact missing (infra), rerun (found ${count} of 4 .coverage.shard-* files)"
+            exit 1
+          fi
 
       - name: Combine coverage and enforce 85%
         run: |
