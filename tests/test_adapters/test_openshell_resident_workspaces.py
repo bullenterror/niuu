@@ -2117,3 +2117,301 @@ def test_workspace_link_moves_a_directory_with_state_aside(monkeypatch, tmp_path
     assert f"moved-aside={aside}" in result.stdout.decode()
     state = _run_script(adapter._workspace_link_state_script(str(link), str(volume)))
     assert state.stdout.decode().strip() == "linked"
+
+
+# -- an upgrade's old sandbox that is slow to go (Heimdall on Noatun, 2026-10-17) ------
+
+NEWER_IMAGE = "ghcr.io/niuulabs/openshell:dev-newer"
+#: The resident's own state on its claim, which no upgrade may copy over or change.
+HEIMDALL_STATE = {
+    ".ravn-home/memory.db": b"episodes",
+    ".skuld/conversation_1.json": b'{"turns": 3}',
+    "notes/plan.md": b"# plan",
+}
+
+
+async def _heimdall(harness):
+    """A resident on its own claim (copied, ``complete``) in its sandbox ``r-…``.
+
+    As Heimdall ran on Noatun when a new Völundr brought a new sandbox image.
+    Returns the resident, its running record and the platform's newer profile.
+    """
+    runtime = _resident_runtime()
+    claim_name = _claim_name(runtime)
+    await harness.core.create_namespaced_persistent_volume_claim(
+        namespace=NAMESPACE,
+        body=_fake_manifest(
+            name=claim_name,
+            namespace=NAMESPACE,
+            storage="2Gi",
+            storage_class=None,
+            access_mode="ReadWriteOnce",
+            labels={
+                "app.kubernetes.io/managed-by": "volundr",
+                "volundr/pvc-type": "resident-workspace",
+                "niuu.world/resident-id": str(runtime.id),
+            },
+        ),
+    )
+    harness.core.pvcs[claim_name].metadata.annotations = {
+        workspace_module.ANNOTATION_MIGRATION_PHASE: "complete",
+        workspace_module.ANNOTATION_MIGRATION_SOURCE: f"r-{runtime.id.hex[:17]}",
+        workspace_module.ANNOTATION_MIGRATION_DIGEST: "files=3 bytes=26 sha256=abc",
+    }
+    harness.client.claim_files[claim_name] = dict(HEIMDALL_STATE)
+    deployed = await harness.manager.deploy(_awaiting_deployment(runtime), _resident_profile())
+    assert deployed.backend_ref["name"] == f"r-{runtime.id.hex[:17]}"
+    running = _running(runtime, deployed.backend_ref["name"]).model_copy(
+        update={"backend_ref": deployed.backend_ref}
+    )
+    harness.manager._linked_workspaces.clear()  # the new Völundr has not checked it yet
+    newer = _profile_with(
+        {"image": {"repository": "ghcr.io/niuulabs/openshell", "tag": "dev-newer"}}
+    )
+    return runtime, running, newer
+
+
+def _claim_annotations(harness, runtime) -> dict:
+    return dict(harness.core.pvcs[_claim_name(runtime)].metadata.annotations)
+
+
+def _assert_on_its_claim_as_it_was(harness, runtime, observation, annotations, since: int):
+    """Redeployed on its claim with its state as it was: nothing copied, nothing changed."""
+    claim = _claim_name(runtime)
+    assert observation.observed_state is ResidentObservedState.ACTIVE
+    assert observation.backend_ref["name"] == f"r-{runtime.id.hex[:17]}"
+    assert observation.backend_ref["workspace_claim"] == claim
+    assert observation.backend_ref["image"] == NEWER_IMAGE
+    assert _condition(observation, "PlatformUpgrade") is None
+    later = harness.events[since:]
+    assert not any(event.startswith(("archived:", "restored:", "cleared:")) for event in later)
+    assert later.count(f"created:{observation.backend_ref['name']}") == 1
+    files = harness.client.claim_files[claim]
+    assert {key: files.get(key) for key in HEIMDALL_STATE} == HEIMDALL_STATE
+    assert _claim_annotations(harness, runtime) == annotations
+    sandbox = harness.client.sandboxes[observation.backend_ref["name"]]
+    assert sandbox.links[WORKSPACE] == VOLUME
+    assert sandbox.running
+
+
+def _warnings(caplog) -> list[str]:
+    return [record.getMessage() for record in caplog.records if record.levelno >= logging.WARNING]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "delete_seconds", [0.0, 0.3], ids=["fast delete (Bragi, Kvasir)", "slow delete (Heimdall)"]
+)
+async def test_an_upgrade_waits_as_long_as_a_resident_sandbox_takes_to_go(
+    monkeypatch, caplog, delete_seconds
+):
+    # A session gives up after resource_delete_timeout (30s); a resident's upgrade
+    # waits resident_sandbox_delete_timeout_seconds (180s) for its old sandbox.
+    harness = _Harness(
+        monkeypatch, resource_delete_timeout=0.05, resident_sandbox_delete_timeout_seconds=3.0
+    )
+    monkeypatch.setattr(harness.adapter, "READY_POLL_INTERVAL", 0.01)
+    runtime, running, newer = await _heimdall(harness)
+    annotations = _claim_annotations(harness, runtime)
+    harness.client.delete_seconds = delete_seconds
+    since = len(harness.events)
+    caplog.clear()
+
+    with caplog.at_level(logging.INFO):
+        upgrading = await harness.manager.reconcile(running, newer)
+        assert upgrading.observed_state is ResidentObservedState.PENDING
+        assert upgrading.backend_ref == {}
+        assert _condition(upgrading, "SandboxReady").reason == "Upgrading"
+        platform = _condition(upgrading, "PlatformUpgrade")
+        assert (platform.status.value, platform.reason) == ("false", "Upgrading")
+        assert NEWER_IMAGE in platform.message
+        assert running.backend_ref["name"] not in harness.client.sandboxes
+        assert harness.events[since:].count(f"deleted:{running.backend_ref['name']}") == 1
+
+        redeployed = await harness.manager.deploy(_awaiting_deployment(runtime), newer)
+
+    _assert_on_its_claim_as_it_was(harness, runtime, redeployed, annotations, since)
+    assert _warnings(caplog) == []
+    assert harness.manager._failed_resident_upgrades == {}
+
+
+@pytest.mark.asyncio
+async def test_an_old_sandbox_that_outlasts_the_wait_is_redeployed_once_it_goes(
+    monkeypatch, caplog
+):
+    harness = _Harness(
+        monkeypatch, resource_delete_timeout=0.05, resident_sandbox_delete_timeout_seconds=0.3
+    )
+    monkeypatch.setattr(harness.adapter, "READY_POLL_INTERVAL", 0.01)
+    runtime, running, newer = await _heimdall(harness)
+    name = running.backend_ref["name"]
+    annotations = _claim_annotations(harness, runtime)
+    harness.client.delete_seconds = 1.2  # longer than the upgrade and its redeployment wait
+    since = len(harness.events)
+    caplog.clear()
+
+    with caplog.at_level(logging.INFO):
+        # The upgrade's wait runs out: no failure, the resident is handed to its
+        # redeployment, and the upgrade says what it waits for.
+        upgrading = await harness.manager.reconcile(running, newer)
+        assert upgrading.observed_state is ResidentObservedState.PENDING
+        assert upgrading.backend_ref == {}
+        platform = _condition(upgrading, "PlatformUpgrade")
+        assert platform.reason == "Upgrading"
+        assert f"once OpenShell has finished deleting sandbox {name}" in platform.message
+        assert name in harness.client.deleting
+        assert harness.manager._failed_resident_upgrades == {}
+
+        # The redeployment waits for it too; when OpenShell is slower still, that
+        # deployment fails (the service records FAILED) and the next pass retries.
+        with pytest.raises(TimeoutError, match="was not deleted within"):
+            await harness.manager.deploy(_awaiting_deployment(runtime), newer)
+        failed = runtime.model_copy(
+            update={"observed_state": ResidentObservedState.FAILED, "backend_ref": {}}
+        )
+        going = await harness.manager.reconcile(failed, newer)
+        assert going.observed_state is ResidentObservedState.PENDING
+        assert going.backend_ref == {}
+        assert _condition(going, "PlatformUpgrade").reason == "Upgrading"
+
+        deadline = time.monotonic() + 3.0
+        while harness.client.get_sandbox(name) is not None:
+            assert time.monotonic() < deadline, "the fake gateway never finished the delete"
+            await asyncio.sleep(0.02)
+        # Gone: still an upgrade in progress, never "Restart the resident to retry".
+        gone = await harness.manager.reconcile(failed, newer)
+        assert gone.observed_state is ResidentObservedState.PENDING
+        assert _condition(gone, "PlatformUpgrade").reason == "Upgrading"
+
+        redeployed = await harness.manager.deploy(_awaiting_deployment(runtime), newer)
+
+    _assert_on_its_claim_as_it_was(harness, runtime, redeployed, annotations, since)
+    assert harness.events[since:].count(f"deleted:{name}") == 1
+    assert redeployed.backend_ref["image"] == NEWER_IMAGE
+    assert harness.client.sandboxes[name].annotations["volundr.niuu.io/replaced-image"] == (
+        TARGET_IMAGE
+    )
+    warnings = _warnings(caplog)
+    assert len(warnings) == 1
+    assert warnings[0].startswith(f"Resident OpenShell Muninn's old sandbox {name} was not gone")
+    assert not any("Restart the resident" in message for message in caplog.messages)
+
+
+@pytest.mark.asyncio
+async def test_a_refused_delete_keeps_the_resident_running_and_is_retried(monkeypatch, caplog):
+    harness = _Harness(monkeypatch)
+    runtime, running, newer = await _heimdall(harness)
+    name = running.backend_ref["name"]
+    harness.client.fail_deletes[name] = 3
+    caplog.clear()
+
+    with caplog.at_level(logging.INFO):
+        for _ in range(3):
+            harness.client.exposed = None
+            retrying = await harness.manager.reconcile(running, newer)
+            # It still runs on its old sandbox, its service exposed again.
+            assert retrying.observed_state is ResidentObservedState.ACTIVE
+            assert retrying.backend_ref["name"] == name
+            platform = _condition(retrying, "PlatformUpgrade")
+            assert platform.reason == "UpgradeRetrying"
+            assert "gateway could not delete" in platform.message
+            assert harness.client.sandboxes[name].running
+            assert harness.client.exposed["sandbox_name"] == name
+
+        upgrading = await harness.manager.reconcile(running, newer)
+
+    assert _condition(upgrading, "PlatformUpgrade").reason == "Upgrading"
+    assert name not in harness.client.sandboxes
+    # One line for the state, not one per pass.
+    assert [message for message in _warnings(caplog) if "is retried" in message] == [
+        f"Upgrading resident OpenShell Muninn from {TARGET_IMAGE} to {NEWER_IMAGE} is retried "
+        f"on the next pass: its sandbox {name} could not be removed (OpenShell resource "
+        f"cleanup failed for {name}: gateway could not delete {name} now)"
+    ]
+    redeployed = await harness.manager.deploy(_awaiting_deployment(runtime), newer)
+    assert redeployed.backend_ref["image"] == NEWER_IMAGE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", ["deleted during the pass", "being deleted"])
+async def test_repair_never_touches_a_missing_sandbox_and_deploys_it_instead(
+    monkeypatch, caplog, how
+):
+    harness = _Harness(monkeypatch, resident_sandbox_delete_timeout_seconds=3.0)
+    monkeypatch.setattr(harness.adapter, "READY_POLL_INTERVAL", 0.01)
+    runtime, profile = _resident_runtime(), _resident_profile()
+    claim = _claim_name(runtime)
+    harness.client.claim_files[claim] = {"AGENTS.md": b"# agents", "memory/notes.md": b"kept"}
+    running, sandbox = await _off_its_volume(harness, runtime, profile)
+    annotations = _claim_annotations(harness, runtime)
+    real_get = harness.client.get_sandbox
+    if how == "deleted during the pass":
+
+        def get_then_delete(name):
+            found = real_get(name)
+            harness.client.sandboxes.pop(name, None)  # removed right after reconcile's read
+            return found
+
+        harness.client.get_sandbox = get_then_delete
+    else:
+        harness.client.deleting[sandbox.name] = time.monotonic() + 0.2
+    since = len(harness.events)
+    caplog.clear()
+
+    with caplog.at_level(logging.INFO):
+        observation = await harness.manager.reconcile(running, profile)
+        harness.client.get_sandbox = real_get
+
+        assert observation.observed_state is ResidentObservedState.PENDING
+        assert observation.backend_ref == {}
+        assert _condition(observation, "SandboxReady").reason == "SandboxGone"
+        assert not any(
+            event.startswith(("stopped:", "linked:", "written:", "launched:"))
+            for event in harness.events[since:]
+        )
+
+        deployed = await harness.manager.deploy(_awaiting_deployment(runtime), profile)
+
+    assert deployed.observed_state is ResidentObservedState.ACTIVE
+    assert deployed.backend_ref["workspace_claim"] == claim
+    assert harness.client.sandboxes[deployed.backend_ref["name"]].links[WORKSPACE] == VOLUME
+    later = harness.events[since:]
+    assert not any(event.startswith(("archived:", "restored:", "cleared:")) for event in later)
+    files = harness.client.claim_files[claim]
+    assert (files["AGENTS.md"], files["memory/notes.md"]) == (b"# agents", b"kept")
+    assert _claim_annotations(harness, runtime) == annotations
+    assert not any("back on its workspace volume" in message for message in caplog.messages)
+
+
+@pytest.mark.asyncio
+async def test_a_repair_that_keeps_failing_is_logged_once(monkeypatch, caplog):
+    harness = _Harness(monkeypatch)
+    runtime, profile = _resident_runtime(), _resident_profile()
+    running, sandbox = await _off_its_volume(harness, runtime, profile)
+    real_exec = harness.client.exec_script
+    broken = {"on": True}
+
+    def not_ready(*, sandbox_id, script, env):
+        if broken["on"] and "echo mounted" in script:
+            raise RuntimeError("sandbox is not ready")
+        return real_exec(sandbox_id=sandbox_id, script=script, env=env)
+
+    harness.client.exec_script = not_ready
+    caplog.clear()
+
+    with caplog.at_level(logging.INFO):
+        for _ in range(3):
+            await harness.manager.reconcile(running, profile)
+        broken["on"] = False
+        await harness.manager.reconcile(running, profile)
+
+    failures = [message for message in _warnings(caplog) if message.startswith("Could not put")]
+    assert failures == [
+        f"Could not put resident OpenShell Muninn's sandbox {sandbox.name} back on its "
+        "workspace volume; retrying on every pass: sandbox is not ready"
+    ]
+    assert sandbox.links[WORKSPACE] == VOLUME
+    assert (
+        f"Resident OpenShell Muninn runs on its workspace volume again in sandbox "
+        f"{sandbox.name}" in caplog.messages
+    )

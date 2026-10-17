@@ -26,6 +26,7 @@ from collections.abc import Sequence
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import IO, Any
 from urllib.parse import urlparse, urlunparse
@@ -258,6 +259,18 @@ class OpenShellSandbox:
     annotations: dict[str, str] | None = None
 
 
+class WorkspaceRepair(Enum):
+    """What checking a running resident's workspace link did."""
+
+    #: Already on its volume, checked before, or a deployment owns its processes.
+    SKIPPED = "skipped"
+    REPAIRED = "repaired"
+    #: Its sandbox exists but the repair failed; tried again on the next pass.
+    FAILED = "failed"
+    #: Its sandbox is gone or being deleted: redeploy it, do not repair it.
+    SANDBOX_GONE = "sandbox-gone"
+
+
 @dataclass(frozen=True)
 class OpenShellPlatformFollow:
     """What following the platform's version means for one resident this pass."""
@@ -267,6 +280,8 @@ class OpenShellPlatformFollow:
     #: Reported with the resident's observation: a held or failed upgrade.
     condition: ResidentCondition | None = None
     failed: bool = False
+    #: The upgrade removed the resident's service but not its sandbox: expose it again.
+    service_removed: bool = False
 
 
 @dataclass(frozen=True)
@@ -1237,6 +1252,15 @@ class OpenShellGatewayPodManager(
         self._failed_resident_upgrades: dict[str, tuple[str, str]] = {}
         # (resident id, target image) upgrades held, logged once; "" when the image is unknown.
         self._held_resident_upgrades: set[tuple[str, str]] = set()
+        # Residents whose old sandbox an upgrade could not remove: id -> the reason,
+        # logged once per reason. Retried on every pass.
+        self._retrying_resident_upgrades: dict[str, str] = {}
+        # Residents whose sandbox was seen gone or being deleted while they should run:
+        # id -> that sandbox, logged once until the resident is deployed again.
+        self._going_resident_sandboxes: dict[str, str] = {}
+        # Why a running resident's workspace link could not be repaired: sandbox id ->
+        # the error, logged once per error until the repair succeeds.
+        self._failed_workspace_repairs: dict[str, str] = {}
 
     def set_resident_openclaw_tokens(self, tokens: ResidentOpenClawTokens) -> None:
         """Where each Ravn resident's own shim token is kept (RavnResidentSessionController)."""
@@ -2305,11 +2329,10 @@ class OpenShellGatewayPodManager(
             keep_grants = migration is not None
             if not keep_sandbox_on_failure:
                 try:
-                    await self._cleanup_resources(
+                    await self._cleanup_resident_resources(
                         sandbox_name,
                         () if keep_grants else grants,
                         service_name=service_name,
-                        delete_timeout=self._resident_delete_timeout,
                     )
                 except Exception:
                     logger.exception("OpenShell resident rollback failed for %s", runtime.id)
@@ -2344,6 +2367,7 @@ class OpenShellGatewayPodManager(
         self._provider_grants[str(runtime.id)] = grants
         self._resident_upgrades.pop(str(runtime.id), None)
         self._failed_resident_upgrades.pop(str(runtime.id), None)
+        self._going_resident_sandboxes.pop(str(runtime.id), None)
         if claim is not None:
             self._failed_workspace_migrations.pop(str(runtime.id), None)
         return self._resident_observation(
@@ -2657,11 +2681,10 @@ class OpenShellGatewayPodManager(
                 for leftover in stale:
                     # A sandbox an earlier attempt created: it never ran the resident
                     # healthy, or ``old`` would be gone. The claim keeps its state.
-                    await self._cleanup_resources(
+                    await self._cleanup_resident_resources(
                         leftover.name,
                         (),
                         service_name=service_name,
-                        delete_timeout=self._resident_delete_timeout,
                     )
                 await self._stop_resident_processes(old, processes)
                 await self._close_resident_forwarders(runtime)
@@ -2770,11 +2793,10 @@ class OpenShellGatewayPodManager(
         """
         claims = self._require_workspace_claims()
         try:
-            await self._cleanup_resources(
+            await self._cleanup_resident_resources(
                 old.name,
                 (),
                 service_name=service_name,
-                delete_timeout=self._resident_delete_timeout,
             )
             logger.info(
                 "Migrated resident %s's workspace to %s/%s; it runs there, and its old "
@@ -3071,62 +3093,80 @@ class OpenShellGatewayPodManager(
         sandbox: OpenShellSandbox,
         processes: Sequence[OpenShellRuntimeProcess],
         service_port: int,
-    ) -> bool:
+    ) -> WorkspaceRepair:
         """Put a running resident back on its volume if its workspace path is not the link.
 
-        Checked once per sandbox in this Völundr. The resident's processes stop,
-        what is at the workspace path is moved aside (never deleted), the path is
-        linked, and the processes start again with their files projected anew.
-        The volume itself is not written by the repair. Returns whether it ran.
+        Checked once per sandbox in this Völundr, and only on a sandbox that still
+        exists and is not being deleted (else SANDBOX_GONE: its redeployment
+        recreates it on the claim). The resident's processes stop, what is at the
+        workspace path is moved aside (never deleted), the path is linked, and the
+        processes start again with their files projected anew. The volume itself
+        is not written by the repair. A failure is logged once per error and
+        retried on the next pass.
         """
         if sandbox.id in self._linked_workspaces:
-            return False
+            return WorkspaceRepair.SKIPPED
         lock = self._resident_process_lock(runtime)
         if lock.locked():
-            return False
+            return WorkspaceRepair.SKIPPED
         async with lock:
+            # Re-read under the lock: an upgrade or rollback may have removed it.
+            current = await asyncio.to_thread(self._client.get_sandbox, sandbox.name)
+            if (
+                current is None
+                or current.id != sandbox.id
+                or current.phase == openshell_pb2.SANDBOX_PHASE_DELETING
+            ):
+                self._failed_workspace_repairs.pop(sandbox.id, None)
+                return WorkspaceRepair.SANDBOX_GONE
             try:
-                state = await self._resident_workspace_link_state(sandbox)
+                state = await self._resident_workspace_link_state(current)
                 if state in WORKSPACE_ON_VOLUME:
-                    self._linked_workspaces.add(sandbox.id)
-                    return False
+                    self._linked_workspaces.add(current.id)
+                    self._failed_workspace_repairs.pop(current.id, None)
+                    return WorkspaceRepair.SKIPPED
                 logger.warning(
                     "Resident %s's sandbox %s runs with %s %s, not on its workspace volume; "
                     "stopping its processes, linking %s to %s and starting them again",
                     runtime.name,
-                    sandbox.name,
+                    current.name,
                     self._sandbox_workspace,
                     "missing" if state == "missing" else f"a {state}",
                     self._sandbox_workspace,
                     RESIDENT_WORKSPACE_VOLUME_PATH,
                 )
                 files, env = await self._resident_launch_inputs(runtime, values, processes)
-                await self._stop_resident_processes_in(sandbox, processes)
-                await self._ensure_resident_workspace_link(sandbox)
+                await self._stop_resident_processes_in(current, processes)
+                await self._ensure_resident_workspace_link(current)
                 await asyncio.to_thread(
-                    self._client.write_files, sandbox_id=sandbox.id, files=files
+                    self._client.write_files, sandbox_id=current.id, files=files
                 )
-                await self._verify_resident_workspace_link(sandbox)
-                await self._ensure_resident_home_links(runtime, sandbox)
-                await self._launch_resident_processes(sandbox.id, env, processes)
+                await self._verify_resident_workspace_link(current)
+                await self._ensure_resident_home_links(runtime, current)
+                await self._launch_resident_processes(current.id, env, processes)
                 await self._wait_for_resident_processes(
-                    sandbox.id, processes, service_port=service_port
+                    current.id, processes, service_port=service_port
                 )
-            except Exception:
-                logger.warning(
-                    "Could not put resident %s's sandbox %s back on its workspace volume; "
-                    "retrying on the next pass",
-                    runtime.name,
-                    sandbox.name,
-                    exc_info=True,
-                )
-                return True
+            except Exception as exc:
+                error = str(exc) or type(exc).__name__
+                if self._failed_workspace_repairs.get(current.id) != error:
+                    self._failed_workspace_repairs[current.id] = error
+                    logger.warning(
+                        "Could not put resident %s's sandbox %s back on its workspace volume; "
+                        "retrying on every pass: %s",
+                        runtime.name,
+                        current.name,
+                        error,
+                        exc_info=True,
+                    )
+                return WorkspaceRepair.FAILED
+        self._failed_workspace_repairs.pop(current.id, None)
         logger.info(
             "Resident %s runs on its workspace volume again in sandbox %s",
             runtime.name,
-            sandbox.name,
+            current.name,
         )
-        return True
+        return WorkspaceRepair.REPAIRED
 
     def _require_workspace_claims(self) -> ResidentWorkspaceClaims:
         if self._workspace_claims is None:
@@ -3153,6 +3193,12 @@ class OpenShellGatewayPodManager(
                     observed_state=ResidentObservedState.FAILED,
                     conditions=[_upgrade_failed_condition(failed_upgrade)],
                 )
+            if (
+                runtime.desired_state is ResidentDesiredState.RUNNING
+                and str(runtime.id) in self._resident_upgrades
+            ):
+                # Its upgrade removed the old sandbox: the redeployment is the upgrade.
+                return _upgrading_observation(self._target_image(_resident_profile_values(profile)))
             if runtime.desired_state is ResidentDesiredState.RUNNING:
                 # The gateway no longer knows this sandbox (for example after a
                 # gateway upgrade orphaned it). Report the resident as owning no
@@ -3180,6 +3226,11 @@ class OpenShellGatewayPodManager(
                     )
                 ],
             )
+        if (
+            sandbox.phase == openshell_pb2.SANDBOX_PHASE_DELETING
+            and runtime.desired_state is ResidentDesiredState.RUNNING
+        ):
+            return self._going_sandbox_observation(runtime, profile, sandbox.name)
         if (
             runtime.observed_state is ResidentObservedState.FAILED
             and not runtime.backend_ref
@@ -3244,9 +3295,11 @@ class OpenShellGatewayPodManager(
             values, self._service_name, self._service_port
         )
         if running_resident and claim is not None and _sandbox_mounts_claim(sandbox, claim):
-            await self._repair_resident_workspace_link(
+            repaired = await self._repair_resident_workspace_link(
                 runtime, values, sandbox, processes, service_port
             )
+            if repaired is WorkspaceRepair.SANDBOX_GONE:
+                return self._going_sandbox_observation(runtime, profile, sandbox.name)
         if sandbox.ready:
             processes_ready = await self._resident_processes_ready(
                 sandbox.id,
@@ -3272,7 +3325,9 @@ class OpenShellGatewayPodManager(
                 and self._resident_openclaw_enabled(runtime, values)
             ):
                 await self._start_resident_openclaw_shim(runtime, profile, values, sandbox)
-        service_url = str(runtime.backend_ref.get("service_url") or "")
+        service_url = (
+            "" if follow.service_removed else str(runtime.backend_ref.get("service_url") or "")
+        )
         if not service_url and runtime.engine is ResidentEngine.HERMES:
             service_url = HERMES_INTERNAL_SERVICE_URL
         if (
@@ -3317,6 +3372,46 @@ class OpenShellGatewayPodManager(
             conditions=[*observation.conditions, follow.condition],
         )
 
+    def _going_sandbox_observation(
+        self,
+        runtime: ResidentRuntime,
+        profile: ResidentDeploymentProfile,
+        sandbox_name: str,
+    ) -> ResidentRuntimeObservation:
+        """A resident that should run whose sandbox is gone or being deleted: redeploy it.
+
+        Its deployment waits for the sandbox to go, then creates it anew on the
+        resident's workspace claim (no copy: the claim already holds its state), as
+        a Restart does. Logged once per sandbox.
+        """
+        runtime_id = str(runtime.id)
+        if self._going_resident_sandboxes.get(runtime_id) != sandbox_name:
+            self._going_resident_sandboxes[runtime_id] = sandbox_name
+            logger.info(
+                "Resident %s's sandbox %s is gone or being deleted; redeploying it",
+                runtime.name,
+                sandbox_name,
+            )
+        if runtime_id in self._resident_upgrades:
+            return _upgrading_observation(
+                self._target_image(_resident_profile_values(profile)),
+                waiting_for=sandbox_name,
+            )
+        return ResidentRuntimeObservation(
+            observed_state=ResidentObservedState.PENDING,
+            conditions=[
+                ResidentCondition(
+                    type="SandboxReady",
+                    status=ResidentConditionStatus.FALSE,
+                    reason="SandboxGone",
+                    message=(
+                        f"OpenShell sandbox {sandbox_name} is gone or being deleted; "
+                        "redeploying the resident once it is gone"
+                    ),
+                )
+            ],
+        )
+
     def _target_image(self, values: dict[str, Any]) -> str:
         """The image this Völundr deploys a resident's sandbox with."""
         return _image_from_values(values, default=self._sandbox_image)
@@ -3354,8 +3449,10 @@ class OpenShellGatewayPodManager(
         other would lose its state under ``/sandbox``, so its upgrade is held and
         reported (UpgradeHeld), and neither reconcile nor restart recreates it. An image
         the sandbox replaced is never deployed again by reconcile (an older
-        Völundr replica during Völundr's own rollout), and a failed upgrade is
+        Völundr replica during Völundr's own rollout), and a failed redeployment is
         reported, not retried, until the target changes or the resident restarts.
+        An old sandbox that is slow to go, or that the gateway would not remove, is
+        no failure: the redeployment waits for it, or the next pass tries again.
         """
         runtime_id = str(runtime.id)
         target = self._target_image(values)
@@ -3370,6 +3467,7 @@ class OpenShellGatewayPodManager(
             return OpenShellPlatformFollow()
         if running == target:
             self._failed_resident_upgrades.pop(runtime_id, None)
+            self._retrying_resident_upgrades.pop(runtime_id, None)
             return OpenShellPlatformFollow()
         if target == (sandbox.annotations or {}).get(SANDBOX_REPLACED_IMAGE_ANNOTATION):
             return OpenShellPlatformFollow()
@@ -3388,27 +3486,58 @@ class OpenShellGatewayPodManager(
             try:
                 await self._retire_resident_sandbox(runtime, running)
             except Exception as exc:
-                reason = (
-                    f"Upgrading resident {runtime.name} from {running} to {target} failed: "
-                    f"{exc}. Restart the resident to retry."
-                )
-                logger.warning(reason)
-                self._failed_resident_upgrades[runtime_id] = (target, reason)
-                return OpenShellPlatformFollow(
-                    condition=_upgrade_failed_condition(reason), failed=True
-                )
-        return OpenShellPlatformFollow(
-            redeploy=ResidentRuntimeObservation(
-                observed_state=ResidentObservedState.PENDING,
-                conditions=[
-                    ResidentCondition(
-                        type="SandboxReady",
-                        status=ResidentConditionStatus.FALSE,
-                        reason="Upgrading",
-                        message=f"Recreating the OpenShell sandbox on {target}",
-                    )
-                ],
+                return await self._unfinished_upgrade(runtime, sandbox.name, running, target, exc)
+        self._retrying_resident_upgrades.pop(runtime_id, None)
+        return OpenShellPlatformFollow(redeploy=_upgrading_observation(target))
+
+    async def _unfinished_upgrade(
+        self,
+        runtime: ResidentRuntime,
+        sandbox_name: str,
+        running: str,
+        target: str,
+        error: Exception,
+    ) -> OpenShellPlatformFollow:
+        """What an upgrade reports when its old sandbox did not go; never a dead end.
+
+        A deletion the gateway accepted but had not finished in time: the resident
+        is handed to its redeployment, which waits for the sandbox to go and
+        creates it anew on its workspace claim, as Restart does. A deletion the
+        gateway refused leaves the old sandbox running the resident: its service is
+        exposed again and the upgrade is retried on the next pass.
+        """
+        runtime_id = str(runtime.id)
+        if await self._sandbox_going(sandbox_name):
+            self._retrying_resident_upgrades.pop(runtime_id, None)
+            logger.warning(
+                "Resident %s's old sandbox %s was not gone within %gs of its upgrade to %s; "
+                "its redeployment waits for OpenShell to finish deleting it, then recreates "
+                "it on its workspace volume",
+                runtime.name,
+                sandbox_name,
+                self._resident_delete_timeout,
+                target,
             )
+            return OpenShellPlatformFollow(
+                redeploy=_upgrading_observation(target, waiting_for=sandbox_name)
+            )
+        # The sandbox was not replaced: it runs the resident on its old image.
+        self._resident_upgrades.pop(runtime_id, None)
+        reason = (
+            f"Upgrading resident {runtime.name} from {running} to {target} is retried on the "
+            f"next pass: its sandbox {sandbox_name} could not be removed ({error})"
+        )
+        if self._retrying_resident_upgrades.get(runtime_id) != reason:
+            self._retrying_resident_upgrades[runtime_id] = reason
+            logger.warning(reason)
+        return OpenShellPlatformFollow(
+            condition=ResidentCondition(
+                type="PlatformUpgrade",
+                status=ResidentConditionStatus.FALSE,
+                reason="UpgradeRetrying",
+                message=reason,
+            ),
+            service_removed=True,
         )
 
     def _hold_upgrade(
@@ -3447,11 +3576,16 @@ class OpenShellGatewayPodManager(
         self._resident_upgrades[runtime_id] = image
         await self._close_resident_forwarders(runtime)
         self._service_urls.pop(runtime_id, None)
-        await self._cleanup_resources(
+        await self._cleanup_resident_resources(
             self._resident_sandbox_name(runtime),
             (),
             service_name=str(runtime.backend_ref.get("service_name") or self._service_name),
         )
+
+    async def _sandbox_going(self, sandbox_name: str) -> bool:
+        """Whether the sandbox is gone or the gateway is deleting it."""
+        sandbox = await asyncio.to_thread(self._client.get_sandbox, sandbox_name)
+        return sandbox is None or sandbox.phase == openshell_pb2.SANDBOX_PHASE_DELETING
 
     async def _close_resident_forwarders(self, runtime: ResidentRuntime) -> None:
         runtime_id = str(runtime.id)
@@ -3580,7 +3714,12 @@ class OpenShellGatewayPodManager(
                 # new image needs a new sandbox, and its workspace survives that.
                 logger.info("Upgrading resident %s from %s to %s", runtime.name, running, target)
                 self._failed_resident_upgrades.pop(runtime_id, None)
-                await self._retire_resident_sandbox(runtime, running)
+                try:
+                    await self._retire_resident_sandbox(runtime, running)
+                except Exception:
+                    # Accepted but slow: the deployment waits for it to go.
+                    if not await self._sandbox_going(sandbox.name):
+                        raise
                 return await self._deploy(runtime, profile)
             # Its state is only in this sandbox: restart its processes in place,
             # as always, and keep reporting why it stays on its image.
@@ -3647,6 +3786,8 @@ class OpenShellGatewayPodManager(
         self._resident_openclaw_checked.discard(runtime_id)
         self._resident_upgrades.pop(runtime_id, None)
         self._failed_resident_upgrades.pop(runtime_id, None)
+        self._retrying_resident_upgrades.pop(runtime_id, None)
+        self._going_resident_sandboxes.pop(runtime_id, None)
         await self._close_resident_forwarders(runtime)
         sandbox_name = self._resident_sandbox_name(runtime)
         grants = self._provider_grants.pop(runtime_id, ())
@@ -3671,8 +3812,8 @@ class OpenShellGatewayPodManager(
                 continue
             if dict(other.labels or {}).get("volundr.niuu.io/resident") != runtime_id:
                 continue
-            await self._cleanup_resources(other_name, (), service_name=service_name)
-        deleted = await self._cleanup_resources(
+            await self._cleanup_resident_resources(other_name, (), service_name=service_name)
+        deleted = await self._cleanup_resident_resources(
             sandbox_name,
             grants,
             service_name=service_name,
@@ -4227,6 +4368,25 @@ class OpenShellGatewayPodManager(
                 + "; ".join(str(error) for error in errors)
             )
         return deleted
+
+    async def _cleanup_resident_resources(
+        self,
+        sandbox_name: str,
+        grants: Sequence[OpenShellProviderGrant],
+        *,
+        service_name: str | None = None,
+    ) -> bool:
+        """Remove a resident's sandbox, service and grants, waiting as long as a resident needs.
+
+        Every removal of a resident sandbox goes through here: a resident's pod,
+        volumes and gateway records take longer to go than a session's.
+        """
+        return await self._cleanup_resources(
+            sandbox_name,
+            grants,
+            service_name=service_name,
+            delete_timeout=self._resident_delete_timeout,
+        )
 
     async def _wait_for_sandbox_deleted(
         self, sandbox_name: str, *, timeout: float | None = None
@@ -5491,6 +5651,30 @@ def _home_link_script(link: str, target: str) -> str:
         "  exit 1\n"
         "fi\n"
         'ln -s "$target" "$link"\n'
+    )
+
+
+def _upgrading_observation(target: str, *, waiting_for: str = "") -> ResidentRuntimeObservation:
+    """A resident whose sandbox is being recreated on ``target``: no backend, redeploy it."""
+    message = f"Recreating the OpenShell sandbox on {target}"
+    if waiting_for:
+        message += f" once OpenShell has finished deleting sandbox {waiting_for}"
+    return ResidentRuntimeObservation(
+        observed_state=ResidentObservedState.PENDING,
+        conditions=[
+            ResidentCondition(
+                type="SandboxReady",
+                status=ResidentConditionStatus.FALSE,
+                reason="Upgrading",
+                message=message,
+            ),
+            ResidentCondition(
+                type="PlatformUpgrade",
+                status=ResidentConditionStatus.FALSE,
+                reason="Upgrading",
+                message=message,
+            ),
+        ],
     )
 
 
