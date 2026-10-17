@@ -143,7 +143,7 @@ data:
       {{- end }}
       room_role_source: {{ .Values.podManager.roomRoleSource | default "deployment" | quote }}
       room_role_cache_ttl_seconds: {{ .Values.podManager.roomRoleCacheTtlSeconds | default 5.0 }}
-      kwargs: {{ .Values.podManager.kwargs | toJson }}
+      kwargs: {{ include "volundr.openshellResidentKwargs" (dict "kwargs" .Values.podManager.kwargs "adapter" .Values.podManager.adapter "root" $) }}
       {{- if .Values.podManager.secretKwargs }}
       secret_kwargs_env:
         {{- range .Values.podManager.secretKwargs }}
@@ -188,7 +188,7 @@ data:
       controllers:{{ if not .Values.residentRuntimeControllers }} []{{ else }}
         {{- range $index, $controller := .Values.residentRuntimeControllers }}
         - adapter: {{ $controller.adapter | quote }}
-          kwargs: {{ $controller.kwargs | default dict | toJson }}
+          kwargs: {{ include "volundr.openshellResidentKwargs" (dict "kwargs" $controller.kwargs "adapter" $controller.adapter "root" $) }}
           {{- if $controller.secretKwargs }}
           secret_kwargs_env:
             {{- range $controller.secretKwargs }}

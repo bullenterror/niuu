@@ -318,3 +318,40 @@ Return the session gateway hostname (defaults to sessions.{domain})
   {{- printf "sessions.%s" (include "volundr.domain" .) -}}
 {{- end -}}
 {{- end }}
+
+{{/*
+OpenShell residents' workspace claims: the kwargs one OpenShellGatewayPodManager
+gets, with resident_workspace_namespace defaulted to the storage adapter's
+namespace (where OpenShell sessions' claims already live, i.e. where the gateway
+runs sandboxes). Setting resident_workspace_namespace, even to "", wins.
+Call with (dict "kwargs" <kwargs> "adapter" <adapter> "root" $).
+*/}}
+{{- define "volundr.openshellResidentKwargs" -}}
+{{- $kwargs := deepCopy (.kwargs | default dict) -}}
+{{- if and (contains "OpenShellGatewayPodManager" .adapter) (not (hasKey $kwargs "resident_workspace_namespace")) -}}
+{{- $_ := set $kwargs "resident_workspace_namespace" ((.root.Values.storageAdapter.kwargs).namespace | default "") -}}
+{{- end -}}
+{{- $kwargs | toJson -}}
+{{- end }}
+
+{{/*
+The namespaces where OpenShell residents' workspace claims are created, one per
+line (empty when no OpenShell controller manages claims).
+*/}}
+{{- define "volundr.openshellResidentWorkspaceNamespaces" -}}
+{{- $namespaces := list -}}
+{{- $controllers := list (dict "adapter" .Values.podManager.adapter "kwargs" .Values.podManager.kwargs) -}}
+{{- range .Values.residentRuntimeControllers -}}
+{{- $controllers = append $controllers (dict "adapter" .adapter "kwargs" .kwargs) -}}
+{{- end -}}
+{{- range $controllers -}}
+{{- if contains "OpenShellGatewayPodManager" .adapter -}}
+{{- $kwargs := include "volundr.openshellResidentKwargs" (dict "kwargs" .kwargs "adapter" .adapter "root" $) | fromJson -}}
+{{- $namespace := $kwargs.resident_workspace_namespace | default "" -}}
+{{- if and $namespace (not (has $namespace $namespaces)) -}}
+{{- $namespaces = append $namespaces $namespace -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- join "\n" $namespaces -}}
+{{- end }}

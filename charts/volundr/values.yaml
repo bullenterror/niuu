@@ -375,11 +375,28 @@ podManager:
     # overrides them per volume in deployment.volumes.<home|workspace>
     # ({storageClass, size, accessMode}). A profile that sets its own
     # homeVolume/persistence existingClaim keeps that claim instead.
+    #
+    # OpenShell residents (OpenShellGatewayPodManager) get their own workspace
+    # PVC the same way: resident-<id>-workspace, mounted at the sandbox workspace
+    # (/sandbox/workspace), sized by resident_workspace_size / storage class /
+    # access mode below and deployment.volumes.workspace per profile. It is
+    # created in resident_workspace_namespace, the namespace where the OpenShell
+    # gateway runs sandboxes; unset, the chart uses storageAdapter.kwargs.namespace
+    # (where OpenShell sessions' claims already live). Set it to "" to keep
+    # OpenShell residents' workspaces in their sandboxes only. A resident whose
+    # sandbox predates its claim has its workspace (and a Ravn's ~/.ravn) copied
+    # onto it once, verified, before its old sandbox is removed.
+    # resident_workspace_namespace: "openshell-sandboxes"
     resident_home_size: "1Gi"
     resident_workspace_size: "2Gi"
     # -- Empty means the cluster's default StorageClass
     resident_storage_class: ""
     resident_access_mode: "ReadWriteOnce"
+    # -- OpenShell: the largest workspace the one-time copy onto a resident's new
+    # claim moves (Kubernetes quantity). A larger one is not migrated: the
+    # resident keeps running on its old sandbox with a WorkspaceMigration /
+    # WorkspaceTooLarge condition.
+    resident_workspace_migration_max_size: "1Gi"
   # -- Secret kwargs from K8s Secrets, merged into kwargs at runtime
   # Each entry: { kwarg: "name", secretName: "k8s-secret", secretKey: "key" }
   secretKwargs: []
