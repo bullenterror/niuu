@@ -44,7 +44,9 @@ WORKSPACE_VOLUME_SETTINGS = frozenset({"storageClass", "size", "accessMode"})
 MANAGED_PERSISTENCE_KEYS = frozenset({"enabled", "emptyDir"})
 
 #: How far a migration got: ``copying`` until the copy is verified on the claim,
-#: ``verified`` until the old sandbox is gone, then ``complete``.
+#: then ``complete``. The old sandbox (the annotated source) goes only once the
+#: resident runs healthy on the claim. ``verified`` is what Völundr before that
+#: order wrote between the copy and removing the old sandbox.
 ANNOTATION_MIGRATION_PHASE = "volundr.niuu.io/workspace-migration"
 #: The sandbox the workspace is copied from.
 ANNOTATION_MIGRATION_SOURCE = "volundr.niuu.io/workspace-migration-source"
@@ -360,10 +362,22 @@ class WorkspaceMigrationLease:
     def _expiry(self) -> str:
         return f"{self.clock() + self.lease_seconds:.0f}"
 
-    async def acquire(self, source: str, *, phase: str = PHASE_COPYING) -> None:
-        """Hold the migration from ``source``; a live holder elsewhere keeps it."""
+    async def acquire(
+        self, source: str, *, phase: str = PHASE_COPYING, handover: bool = False
+    ) -> None:
+        """Hold the migration from ``source``; a live holder elsewhere keeps it.
+
+        ``handover`` also holds a ``complete`` claim copied from ``source``, while
+        ``source`` still runs the resident: the copy is done, the move is not.
+        """
         state = workspace_migration_state(self.pvc)
-        if state is not None and state.phase not in RESTARTABLE_PHASES:
+        handing_over = (
+            handover
+            and state is not None
+            and state.phase == PHASE_COMPLETE
+            and state.source == source
+        )
+        if state is not None and state.phase not in RESTARTABLE_PHASES and not handing_over:
             raise WorkspaceClaimInUseError(
                 f"Volume {self.claims.namespace}/{self.pvc.metadata.name} already holds a "
                 f"migrated workspace ({ANNOTATION_MIGRATION_PHASE}={state.phase})"
