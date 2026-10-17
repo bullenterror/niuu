@@ -187,6 +187,40 @@ Session routes go to the host that owns the session. Rules and sinks go to the s
 host (local by default). Deliveries are looked up on the host that holds the
 notification.
 
+### Finding the Guild from a node
+
+A node's own feed covers only that node: it has no `instances` and ignores
+`all_instances`. A client that talks to a node directly asks it for its Guild:
+
+```
+GET /api/v1/forge/guild
+{"guild_url": "https://yggdrasil.niuu.world",
+ "instance_id": "ae40cfda-426a-46b4-a080-1ad668000859",
+ "instance_name": "Valhalla", "instance_slug": "valhalla"}
+```
+
+and reads the merged feed from `guild_url`, where this node's items and read state are
+keyed by `instance_id`. The route is authenticated like every Forge route and answers
+`404` when the node belongs to no Guild. The node also puts the same three
+`instance_*` fields on every item of its own feed and on its live `session_notification`
+events (`null` / absent when it belongs to no Guild).
+
+The values come from the node's `guild:` config section:
+
+- a host joined with `niuu join` gets them written by the CLI from the join response
+  (`niuu guild heartbeat` fills them in for hosts joined before this);
+- a cluster its Guild registers from configuration (the Guild's `niuu.instances`) sets
+  the Volundr chart's `guild.url`, `guild.instanceId`, `guild.instanceName` and
+  `guild.instanceSlug` from the Guild's registry (`GET /api/v1/niuu/targets/volundr`).
+
+A Forge node with `guild.url` but no instance keeps running: its items carry `null`
+instance fields and only `GET /api/v1/forge/guild` reports it, with `503` and the remedy
+(`niuu guild heartbeat --once` on a joined host, the chart's `guild.instance*` values on a
+cluster). Through the Guild facade
+the same route describes the Guild itself: `guild_url` is the Guild chart's `guild.url`
+(its own public origin), and the instance is its embedded node, else its default node,
+else `null`.
+
 ## Delivery rules and the outbox
 
 A rule selects notifications from its owner and names a sink:

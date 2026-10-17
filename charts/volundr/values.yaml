@@ -820,6 +820,21 @@ envoy:
         prefix: true
         methods: [GET]
 
+# The Guild this Forge belongs to, and this Forge's entry in that Guild's instance
+# registry (the Guild's niuu.instances seed or GET /api/v1/niuu/targets/volundr).
+# Served at GET /api/v1/forge/guild and stamped on every notification, so a client
+# that talks to this node directly can find the Guild feed and its own place in
+# it. Empty url: this Forge belongs to no Guild (the route answers 404).
+guild:
+  # -- Public origin of the Guild, e.g. https://yggdrasil.niuu.world
+  url: ""
+  # -- This Forge's instance id in that Guild (required with url)
+  instanceId: ""
+  # -- This Forge's instance name in that Guild (required with url)
+  instanceName: ""
+  # -- This Forge's instance slug in that Guild (required with url)
+  instanceSlug: ""
+
 workloadIdentity:
   enabled: false
   issuer: ""

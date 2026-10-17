@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime
 from enum import StrEnum
 from typing import Any
@@ -98,6 +99,15 @@ class NotificationResponse(BaseModel):
     )
     created_at: datetime
     read: bool
+    instance_id: str | None = Field(
+        default=None,
+        description=(
+            "This node's instance id in its Guild (GET /api/v1/forge/guild); null when "
+            "the node belongs to no Guild."
+        ),
+    )
+    instance_name: str | None = None
+    instance_slug: str | None = None
 
     @classmethod
     def build(
@@ -105,9 +115,11 @@ class NotificationResponse(BaseModel):
         notification: Notification,
         read_through_seq: int,
         read_ids: set[UUID] | frozenset[UUID] = frozenset(),
+        instance_fields: Mapping[str, str] | None = None,
     ) -> NotificationResponse:
         return cls(
             **notification.wire(),
+            **(instance_fields or {}),
             read=notification.seq <= read_through_seq or notification.id in read_ids,
         )
 
@@ -225,6 +237,8 @@ def create_notifications_router(
 ) -> APIRouter:
     """Create the notification feed, read-state, rules and submit routes."""
     router = APIRouter(prefix=prefix, tags=["Notifications"])
+    # Every served item names this node's Guild instance, like the Guild feed's.
+    instance_fields = notification_service.instance_fields
 
     async def _session_for(session_id: UUID, principal: Principal, action: str) -> Session:
         session = await session_service.get_session(session_id)
@@ -275,7 +289,7 @@ def create_notifications_router(
         feed = await notification_service.list_feed(principal, query)
         return NotificationFeedResponse(
             items=[
-                NotificationResponse.build(n, feed.read_through_seq, feed.read_ids)
+                NotificationResponse.build(n, feed.read_through_seq, feed.read_ids, instance_fields)
                 for n in feed.items
             ],
             revision=feed.revision,
@@ -430,7 +444,10 @@ def create_notifications_router(
             principal, session_id, after=after, limit=limit
         )
         read_ids = await notification_service.read_ids(principal, items)
-        return [NotificationResponse.build(item, read_through, read_ids) for item in items]
+        return [
+            NotificationResponse.build(item, read_through, read_ids, instance_fields)
+            for item in items
+        ]
 
     @router.post(
         "/sessions/{session_id}/notifications",
@@ -475,6 +492,7 @@ def create_notifications_router(
             notification,
             read_through,
             await notification_service.read_ids(principal, [notification]),
+            instance_fields,
         )
 
     return router

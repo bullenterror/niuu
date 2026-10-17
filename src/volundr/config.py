@@ -40,6 +40,7 @@ from niuu.config import (
 )
 from niuu.config_models import (
     DatabaseConfig,
+    GuildMembershipConfig,
     SessionDefinitionConfig,
     WorkloadIdentityConfig,
     default_session_definitions,
@@ -2776,6 +2777,13 @@ class Settings(BaseSettings):
     linear: LinearConfig = Field(default_factory=LinearConfig)
     pat: PATConfig = Field(default_factory=PATConfig)
     workload_identity: WorkloadIdentityConfig = Field(default_factory=WorkloadIdentityConfig)
+    guild: GuildMembershipConfig = Field(
+        default_factory=GuildMembershipConfig,
+        description=(
+            "The Guild this host belongs to and its Forge instance there, served at "
+            "GET /api/v1/forge/guild and stamped on every notification."
+        ),
+    )
     workflow_execution_credentials: WorkflowExecutionCredentialsConfig = Field(
         default_factory=WorkflowExecutionCredentialsConfig
     )

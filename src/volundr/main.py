@@ -24,6 +24,7 @@ from niuu.adapters.postgres_credential_refresh_lock import PostgresCredentialRef
 from niuu.adapters.postgres_realms import PostgresRealmRepository
 from niuu.build_identity import build_identity
 from niuu.cors import apply_cors_middleware
+from niuu.domain.guild_membership import GuildInstance
 from niuu.domain.services.realm import RealmService
 from niuu.service_integrations import (
     has_seeded_linear_integration as _has_seeded_linear_integration,
@@ -56,6 +57,7 @@ from volundr.adapters.inbound.rest_credentials import create_canonical_credentia
 from volundr.adapters.inbound.rest_events import create_events_router
 from volundr.adapters.inbound.rest_forge_mcp import create_forge_mcp_router
 from volundr.adapters.inbound.rest_git import create_git_router
+from volundr.adapters.inbound.rest_guild import create_guild_router
 from volundr.adapters.inbound.rest_integrations import create_canonical_integrations_router
 from volundr.adapters.inbound.rest_issues import create_canonical_issues_router
 from volundr.adapters.inbound.rest_message_delivery import create_message_delivery_router
@@ -265,6 +267,7 @@ def _create_notification_service(
     *,
     broadcaster: InMemoryEventBroadcaster,
     integration_repository: PostgresIntegrationRepository,
+    guild_instance: GuildInstance | None = None,
 ) -> NotificationService | None:
     """Compose the notification feed, rules and outbox (``notifications.enabled``)."""
     config = settings.notifications
@@ -295,6 +298,7 @@ def _create_notification_service(
         ],
         engine_resolver=engine_resolver_for(cli_types, settings.default_definition),
         integration_repository=integration_repository,
+        guild_instance=guild_instance,
     )
 
 
@@ -1054,8 +1058,15 @@ def create_app(
                 )
                 logger.info("Push devices: integration connections (credential store)")
             mapping_repository = PostgresMappingRepository(pool)
+            # A node whose instance is not recorded yet keeps running: only
+            # GET /guild reports it (503), and its items carry null instance fields.
+            guild_membership = settings.guild.membership()
             notification_service = _create_notification_service(
-                settings, pool, broadcaster=broadcaster, integration_repository=integration_repo
+                settings,
+                pool,
+                broadcaster=broadcaster,
+                integration_repository=integration_repo,
+                guild_instance=guild_membership.instance if guild_membership else None,
             )
             app.state.notification_service = notification_service
             resident_notification_relay = _create_resident_notification_relay(
@@ -1772,6 +1783,7 @@ def create_app(
                 notification_service=notification_service,
             )
             app.include_router(session_log_router)
+            app.include_router(create_guild_router(guild_membership, prefix="/api/v1/forge"))
             if notification_service is not None:
                 app.include_router(
                     create_notifications_router(
