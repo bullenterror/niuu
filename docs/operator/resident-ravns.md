@@ -168,13 +168,63 @@ OpenShell).
   does not move a resident back during Volundr's own rollout.
 - **OpenShell:** a sandbox's image is fixed at creation, so the sandbox is
   recreated on the new image and the resident keeps its record, credentials and
-  shim token. This happens only when the profile keeps the workspace on a claim
-  (`persistence.existingClaim` with a `mountPath` at or above the sandbox
-  workspace). Without one, nothing ever recreates the sandbox: the upgrade is
-  held with a `PlatformUpgrade` / `UpgradeHeld` condition ("No persistent
-  workspace; the sandbox image can't change without losing /sandbox"), shown
-  in the resident's conditions, and Restart restarts its processes in place as
-  before.
+  shim token. This happens only when its sandbox keeps the workspace on a claim:
+  its own (below), or the profile's `persistence.existingClaim` with a
+  `mountPath` at or above the sandbox workspace. Without one (the profile sets
+  `persistence.enabled: false`, or Volundr manages no claims), nothing ever
+  recreates the sandbox: the upgrade is held with a `PlatformUpgrade` /
+  `UpgradeHeld` condition ("No persistent workspace; the sandbox image can't
+  change without losing /sandbox"), shown in the resident's conditions, and
+  Restart restarts its processes in place as before.
+
+### OpenShell residents' workspaces
+
+Every OpenShell resident gets its own PVC, `resident-<id>-workspace`, mounted
+at `/sandbox/workspace`. Volundr creates it on deploy and deletes it with the
+resident, in the namespace where the OpenShell gateway runs sandboxes
+(`podManager.kwargs.resident_workspace_namespace`, which the chart defaults to
+`storageAdapter.kwargs.namespace`; the chart grants Volundr the PVC rights there
+with the `<release>-resident-workspaces` Role). Size, storage class and access
+mode come from `resident_workspace_size`, `resident_storage_class` and
+`resident_access_mode`, and a profile overrides them in
+`deployment.volumes.workspace`. The claim holds Skuld's conversations, Ravn's
+`RAVN_STATE_DIR` (channels and the notification outbox), Hermes' and OpenClaw's
+state; a Ravn resident's `~/.ravn` (memory.db, the drive-loop queue and cron
+state, skills) is a link to `/sandbox/workspace/.ravn-home` on it. The rest of
+`/sandbox` (rendered config, logs, the image's tools, the Codex CLI home) is
+rebuilt with each sandbox.
+
+The claim is ReadWriteOnce and carries no node affinity of its own: a sandbox
+mounting it is scheduled wherever Kubernetes places it, and the volume attaches
+to that node. A recreated sandbox is created only once the old one is gone, so
+the volume is free to move. A storage class whose volumes are node-local binds
+the resident to that node.
+
+A resident whose sandbox predates its claim is moved onto it once, by its next
+deployment (reconcile hands it over with a `WorkspaceMigration` / `Migrating`
+condition) or its next Restart. Volundr logs `Migrating resident <name>'s
+workspace to a persistent volume` and:
+
+1. measures the workspace (and `~/.ravn`); more than
+   `resident_workspace_migration_max_size` (default 1Gi) or the claim's size is
+   refused before anything changes;
+2. creates the claim and takes the migration's lease on it;
+3. stops the resident's processes and archives its state out through the
+   sandbox exec channel;
+4. creates a new sandbox on the current image with the claim mounted, restores
+   the archive into it before any resident process starts, and reads it back:
+   every path, size and SHA-256 must match;
+5. only then deletes the old sandbox and starts the resident on its claim.
+
+Until step 5 the old sandbox is never touched beyond stopping its processes. If
+anything fails, the new sandbox is removed, the old one's processes are started
+again, and the resident reports `WorkspaceMigration` with the reason
+(`WorkspaceTooLarge`, `VerificationFailed`, `ClaimInUse`, `MigrationFailed`); it
+is retried on Restart or when Volundr restarts. Progress is kept on the claim's
+annotations (`volundr.niuu.io/workspace-migration`: `copying`, `verified`,
+`complete`, with the holding Volundr and its lease), so a Volundr that restarts
+mid-copy, or a second replica, resumes or waits rather than starting over. A
+claim that already holds a workspace is never overwritten.
 - **Restart** re-renders the resident on the current version, where that keeps
   its state. **Resume** starts a suspended Flux resident on the current
   version; suspended residents are not woken to upgrade.

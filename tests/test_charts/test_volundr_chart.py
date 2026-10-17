@@ -1145,6 +1145,106 @@ class TestConfigMapTemplate:
         names = {doc["metadata"]["name"] for doc in documents}
         assert "test-volundr-resident-logs" not in names
 
+    _OPENSHELL = "volundr.adapters.outbound.openshell_gateway.OpenShellGatewayPodManager"
+
+    @staticmethod
+    def _configmap_kwargs(documents: list[dict], path: tuple[str, ...]) -> dict:
+        configmap = next(
+            doc
+            for doc in documents
+            if doc["kind"] == "ConfigMap" and "config.yaml" in (doc.get("data") or {})
+        )
+        config = yaml.safe_load(configmap["data"]["config.yaml"])
+        for key in path:
+            config = config[key]
+        return config
+
+    def test_openshell_residents_can_always_manage_their_workspace_claims(self):
+        """No per-cluster grant: the sandbox namespace follows from the storage adapter."""
+        documents = self._rbac(
+            "--namespace",
+            "volundr",
+            "--set",
+            f"podManager.adapter={self._OPENSHELL}",
+            "--set",
+            "storageAdapter.kwargs.namespace=openshell-sandboxes",
+        )
+        role = next(
+            doc
+            for doc in documents
+            if doc["kind"] == "Role"
+            and doc["metadata"]["name"] == "test-volundr-resident-workspaces"
+        )
+        assert role["metadata"]["namespace"] == "openshell-sandboxes"
+        assert role["rules"] == [
+            {
+                "apiGroups": [""],
+                "resources": ["persistentvolumeclaims"],
+                "verbs": ["get", "create", "patch", "delete"],
+            }
+        ]
+        binding = next(
+            doc
+            for doc in documents
+            if doc["kind"] == "RoleBinding"
+            and doc["metadata"]["name"] == "test-volundr-resident-workspaces"
+        )
+        assert binding["metadata"]["namespace"] == "openshell-sandboxes"
+        assert binding["subjects"] == [
+            {"kind": "ServiceAccount", "name": "test-volundr", "namespace": "volundr"}
+        ]
+        kwargs = self._configmap_kwargs(documents, ("pod_manager", "kwargs"))
+        assert kwargs["resident_workspace_namespace"] == "openshell-sandboxes"
+        assert kwargs["resident_workspace_size"] == "2Gi"
+        assert kwargs["resident_workspace_migration_max_size"] == "1Gi"
+
+    def test_openshell_resident_controller_uses_its_own_workspace_namespace(self):
+        documents = self._rbac(
+            "--set",
+            "podManager.adapter=volundr.adapters.outbound.direct_k8s_pod_manager.DirectK8sPodManager",
+            "--set",
+            f"residentRuntimeControllers[0].adapter={self._OPENSHELL}",
+            "--set",
+            "residentRuntimeControllers[0].kwargs.resident_workspace_namespace=agents",
+        )
+        role = next(
+            doc
+            for doc in documents
+            if doc["kind"] == "Role"
+            and doc["metadata"]["name"] == "test-volundr-resident-workspaces"
+        )
+        assert role["metadata"]["namespace"] == "agents"
+        kwargs = self._configmap_kwargs(documents, ("resident_runtimes", "controllers"))[0][
+            "kwargs"
+        ]
+        assert kwargs == {"resident_workspace_namespace": "agents"}
+
+    def test_no_workspace_role_when_openshell_residents_keep_workspaces_in_sandboxes(self):
+        documents = self._rbac(
+            "--set",
+            f"podManager.adapter={self._OPENSHELL}",
+            "--set",
+            "storageAdapter.kwargs.namespace=openshell-sandboxes",
+            "--set",
+            "podManager.kwargs.resident_workspace_namespace=",
+        )
+        names = {doc["metadata"]["name"] for doc in documents}
+        assert "test-volundr-resident-workspaces" not in names
+        kwargs = self._configmap_kwargs(documents, ("pod_manager", "kwargs"))
+        assert kwargs["resident_workspace_namespace"] == ""
+
+    def test_no_workspace_role_without_an_openshell_controller(self):
+        documents = self._rbac(
+            "--set",
+            "podManager.adapter=volundr.adapters.outbound.flux.FluxPodManager",
+            "--set",
+            "storageAdapter.kwargs.namespace=openshell-sandboxes",
+        )
+        names = {doc["metadata"]["name"] for doc in documents}
+        assert "test-volundr-resident-workspaces" not in names
+        kwargs = self._configmap_kwargs(documents, ("pod_manager", "kwargs"))
+        assert "resident_workspace_namespace" not in kwargs
+
     def test_no_resident_secret_role_without_ravn_sessions(self):
         documents = self._rbac(
             "--set",
