@@ -281,10 +281,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # NATS requires --jetstream flag which GHA service containers can't pass.
-      # Start it manually with docker run instead.
+      # Start it manually with docker run instead. Pinned to the 2.14 line, which
+      # production runs (tests/integration/sleipnir/test_nats_consumer_recovery.py).
       - name: Start NATS with JetStream
         run: |
-          docker run -d --name nats -p 4222:4222 -p 8222:8222 nats:2-alpine --jetstream --http_port 8222
+          docker run -d --name nats -p 4222:4222 -p 8222:8222 nats:2.14-alpine --jetstream --http_port 8222
           for _ in $(seq 1 10); do
             if curl -sf http://localhost:8222/healthz > /dev/null 2>&1; then
               exit 0
