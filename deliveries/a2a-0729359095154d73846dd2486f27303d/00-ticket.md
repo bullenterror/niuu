@@ -19,8 +19,9 @@ NIU-300 is `Subscribe ODIN realm detail to SSE stream`; status is `Done` after m
 ## Review follow-up
 
 The review recorded at `a66d56e1` requested a hook-level stream lifecycle
-regression test and configuration-owned stream timing. Both follow-ups are
-implemented directly on `regin`; the tracker remains `Done`.
+regression test and configuration-owned stream timing. The revision is
+implemented directly on `regin`; NIU-300 was moved to `In Progress` while the
+revision is verified and handed off.
 
 ## Operator-directed scope
 
