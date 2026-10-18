@@ -16,4 +16,4 @@
 
 ## Hosted delivery
 
-The implementation was merged into `regin` through [PR #1145](https://github.com/niuulabs/niuu/pull/1145). No new PR is required because this signal was received after that landing, and the current verification branch has no source delta from `regin`.
+The implementation was merged into `regin` through [PR #1145](https://github.com/niuulabs/niuu/pull/1145). This replayed delivery record is available for review in [PR #1147](https://github.com/niuulabs/niuu/pull/1147), which targets `regin` and contains no source implementation delta.
