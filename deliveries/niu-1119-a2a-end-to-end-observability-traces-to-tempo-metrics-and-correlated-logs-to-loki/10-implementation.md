@@ -66,4 +66,6 @@ Added config-gated OpenTelemetry support for Ting and completed the A2A observab
 - Added the OTLP/HTTP Loki `/v1/logs` endpoint to both enabled resident setup configurations: Eitri uses `https://loki.proxy.glitnir.alfheim.niuu.world/eitri/otlp/v1/logs`, and Ivaldi uses the same tenant collector endpoint.
 - Added `test_enabled_ravn_setup_config_parses`, which discovers every checked-in `scripts/setups/configs/*.yaml` file with `observability.enabled: true` and validates it through the production `Settings` YAML source.
 - Verification: the regression test and `TestObservabilityConfig` passed (5 passed); direct `RAVN_CONFIG=<setup> uv run python -c 'from ravn.config import Settings; Settings()'` validation passed for both setups; the focused observability suite passed (**30 passed, 454 deselected**) and again emitted the same-task Tempo trace, Loki metrics, and correlated Loki log evidence.
-- This direct-regin revision has no hosted PR; it will be committed and pushed to `origin/regin` only. No `dev` or `main` branch is targeted.
+- This direct-regin revision is committed and pushed to `origin/regin` as
+  `00f3d92c` (`fix(ravn): configure Loki logs for local residents`). There is
+  no hosted PR, and no `dev` or `main` branch is targeted.
