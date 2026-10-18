@@ -11,3 +11,7 @@ Resolved the Linear task through the repository tracker shim and confirmed it is
 ## Revision pass
 
 Resolved the review-blocking duplicate public metric emission by keeping `ravn_tool_build_*` ownership in the Ravn `BuildTool` lifecycle wrapper and removing the same public metric emissions from the A2A backend.
+
+## Regin delivery pass
+
+The pre-existing `feat/niu-1119-a2a-observability` branch was based on `origin/dev`, contrary to the mandatory branch rule. Its implementation was therefore reviewed and cherry-picked onto `regin`; no `dev` or `main` branch was targeted or modified by this delivery pass.
