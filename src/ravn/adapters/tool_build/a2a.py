@@ -1239,7 +1239,6 @@ def _jsonrpc_endpoint(card: dict[str, Any]) -> str:
     return ""
 
 
-
 def _skill_capability(skill: Any) -> WorkflowCapability:
     if not isinstance(skill, dict):
         skill = {}

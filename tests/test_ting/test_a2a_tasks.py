@@ -739,6 +739,28 @@ class TestSendMessage:
         assert campaign.metadata["a2a_message_id"] == "msg-1"
         assert campaign.metadata["a2a_workflow_slug"] == "build-the-widget-tool"
 
+    def test_task_lifecycle_drives_send_get_and_cancel_over_jsonrpc(self) -> None:
+        """Exercise all required task operations against one launched workflow."""
+        workflow = _make_workflow()
+        client, campaigns, port = _make_client(
+            workflow_repo=InMemoryWorkflowRepository([workflow]),
+        )
+
+        sent = _rpc(client, "SendMessage", _send_params(str(workflow.id)))
+
+        assert sent.status_code == 200
+        task_id = sent.json()["result"]["task"]["id"]
+        fetched = _rpc(client, "GetTask", {"id": task_id})
+        canceled = _rpc(client, "CancelTask", {"id": task_id})
+
+        assert fetched.status_code == 200
+        assert fetched.json()["result"]["id"] == task_id
+        assert canceled.status_code == 200
+        assert canceled.json()["result"]["status"]["state"] == "TASK_STATE_CANCELED"
+        assert port.stopped == ["session-123"]
+        persisted = next(iter(campaigns._campaigns.values()))
+        assert persisted.metadata["a2a_canceled"] is True
+
     def test_jsonrpc_span_uses_traceparent_header(self, monkeypatch: pytest.MonkeyPatch) -> None:
         class Span:
             def set_attribute(self, _name, _value) -> None:
