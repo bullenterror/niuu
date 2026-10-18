@@ -47,3 +47,32 @@ correlated log exporters for the endpoint.
 
 Accept the code review. Merge only after the remaining checks for the current
 PR head are green; merge target remains `regin` only.
+
+## Reviewer verification — current branch head `571cdc13`
+
+**Verdict: pass.** This reviewer rechecked the exact prior request rather than
+starting a first-pass review. The requested production-adapter lifecycle proof
+is present at `tests/integration/volundr/test_a2a_workflow_task_lifecycle.py:90-194`:
+it drives one real JSON-RPC task through `SendMessage`, `GetTask`, and
+`CancelTask`, persists it through Ting's PostgreSQL repositories, crosses the
+loopback `VolundrHTTPAdapter`, and verifies both the cancellation marker and
+stopped PostgreSQL-backed session. No new blocking finding was found in
+`git diff origin/regin..HEAD`.
+
+This reviewer ran, successfully:
+
+```console
+uv run ruff check tests/integration/volundr/test_a2a_workflow_task_lifecycle.py tests/test_ting/test_a2a_tasks.py src/ravn/adapters/tool_build/a2a.py
+uv run ruff format --check tests/integration/volundr/test_a2a_workflow_task_lifecycle.py tests/test_ting/test_a2a_tasks.py src/ravn/adapters/tool_build/a2a.py
+uv run --extra otel pytest -q -s tests/test_ting/test_a2a_tasks.py
+```
+
+The focused task suite completed **63 passed** (with one pre-existing
+FastAPI/TestClient deprecation warning); diff whitespace validation passed.
+PR #1150 is open with base `regin`, not `dev` or `main`. Its current-head CI
+checks were in progress at review time, so merge only after those checks are
+green.
+
+## Reviewer recommendation
+
+Accept the code review; merge only into `regin` after current-head CI is green.
