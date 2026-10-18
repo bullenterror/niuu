@@ -34,3 +34,11 @@ schema, and filtering/authorization semantics) that emits updates sufficient to
 refresh the `RealmPage` state. Once it exists, this ticket can add the frontend
 stream port, `openEventStream` adapter, a `useEffect` returning unsubscribe, and
 the requested live-update/unmount regression test without guessing.
+
+## Delivery status
+
+Evidence was committed as `c1ad6b95` and pushed to
+`origin/feat/niu-300-realm-detail-sse`. A hosted PR could not be created because
+`gh pr create --base regin` reports that GitHub CLI authentication is unavailable
+in this workspace. The intended base remains `regin`; no action targeted `dev` or
+`main`.
