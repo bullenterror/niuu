@@ -48,6 +48,57 @@ def _source_wire_fields(event: dict[str, Any]) -> dict[str, Any]:
     return fields
 
 
+def _room_agent_frame(agent_event: Any) -> dict[str, Any]:
+    """Add the ``data``/``metadata`` envelope room clients read to a projected Ravn event.
+
+    The collaboration projection carries a Ravn event as ``{type, payload, taskId, urgency}``;
+    the room's browser clients (web-next ``useSkuldChat``) render a participant's live stream
+    from ``frame.data`` and ``frame.metadata``, the shape Ravn's Skuld channel sent before the
+    projection replaced it. Both shapes ride on the frame, so neither reader has to change.
+    """
+    if not isinstance(agent_event, dict):
+        return {}
+    payload = agent_event.get("payload")
+    if not isinstance(payload, dict):
+        payload = {}
+    data: Any
+    metadata: dict[str, Any]
+    match str(agent_event.get("type") or ""):
+        case "thought":
+            data = payload.get("text", "")
+            metadata = {"thinking": True} if payload.get("thinking") else {}
+        case "response":
+            data = payload.get("text", "")
+            metadata = {}
+        case "tool_start":
+            data = payload.get("tool_name", "")
+            metadata = {"input": payload.get("input", {})}
+            if "diff" in payload:
+                metadata["diff"] = payload["diff"]
+        case "tool_result":
+            data = payload.get("result", "")
+            metadata = {
+                "tool_name": payload.get("tool_name", ""),
+                "is_error": payload.get("is_error", False),
+            }
+        case "error":
+            data = payload.get("message", "")
+            metadata = {}
+        case "task_started":
+            data = payload.get("title", "")
+            metadata = {"task_id": payload.get("task_id", ""), "title": payload.get("title", "")}
+        case "task_complete":
+            data = payload
+            metadata = {
+                "task_id": agent_event.get("taskId") or "",
+                "success": payload.get("success", False),
+            }
+        case _:
+            data = payload
+            metadata = {}
+    return {**agent_event, "data": data, "metadata": metadata}
+
+
 def _peer_observation(
     event: dict[str, Any],
     *,
@@ -501,7 +552,7 @@ class SkuldCollaborationAdapter(CollaborationRoom):
             {
                 "type": "room_agent_event",
                 "participantId": participant.peer_id,
-                "frame": event.get("event") or {},
+                "frame": _room_agent_frame(event.get("event")),
                 **_source_wire_fields(event),
             }
         )
