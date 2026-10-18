@@ -18,3 +18,6 @@ contract and browser subscription rather than duplicating source changes.
 On 2026-10-18, the reviewer requested coverage of the changed-detail emission
 branch. The ticket was returned to `In Progress` and a focused regression test
 was added before re-verification.
+
+Following focused verification, the ticket was returned to `In Review` on
+2026-10-18.
