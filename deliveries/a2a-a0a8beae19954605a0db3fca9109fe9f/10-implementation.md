@@ -34,3 +34,7 @@ inventing product behavior.
 - Searched current source, tests, all fetched remote refs, and history for the
   realm-detail event/schema and existing realm SSE subscription wiring.
 - Verified the current branch is based on `regin`, not `dev` or `main`.
+
+## Handoff
+
+Blocked delivery PR: https://github.com/niuulabs/niuu/pull/1145 (base: `regin`).
