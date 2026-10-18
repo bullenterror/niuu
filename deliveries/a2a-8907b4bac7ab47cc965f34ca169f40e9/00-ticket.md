@@ -57,3 +57,8 @@ uv run ruff format --check src/ravn/adapters/tool_build/a2a.py
 This is the single inherited `regin` format defect blocking PR #1150; no
 broader repository formatting was performed. PR #1150 remains targeted only
 at `regin`.
+
+The non-fixture proof passed in GitHub Actions Forge PostgreSQL boundaries run
+[39164904228](https://github.com/niuulabs/niuu/actions/runs/39164904228) on
+commit `8d7323f4` (**84 passed, 42 deselected**). The PR remains
+https://github.com/niuulabs/niuu/pull/1150 with base `regin`.

@@ -83,3 +83,7 @@ reported exactly one deletion: the additional blank line before
 `uv run ruff format --check src/ravn/adapters/tool_build/a2a.py` passes after
 the change. No gate configuration changed and no other `regin` formatting debt
 was remediated.
+
+### CI production-proof receipt
+
+GitHub Actions [Forge PostgreSQL boundaries run 39164904228](https://github.com/niuulabs/niuu/actions/runs/39164904228) passed on commit `8d7323f4`. Its disposable PostgreSQL 16 service executed the production-adapter integration suite, including this lifecycle proof: **84 passed, 42 deselected**. This is the non-fixture database/HTTP task-lifecycle receipt; it follows the earlier focused OTLP receipt above for trace, metric, and correlated log export.
