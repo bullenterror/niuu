@@ -135,7 +135,7 @@ async def test_a2a_task_lifecycle_uses_postgres_and_volundr_http(
                             "messageId": f"a2a-integration-{uuid4()}",
                             "role": "ROLE_USER",
                             "parts": [{"text": "Launch then cancel this A2A integration task."}],
-                            "metadata": {"workflowId": str(workflow.id), "model": "gpt-5.5"},
+                            "metadata": {"skillId": str(workflow.id), "model": "gpt-5.5"},
                         }
                     },
                 ),
