@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
+from niuu.adapters.inbound import rest_realms
 from niuu.adapters.inbound.rest_realms import create_realms_router
 from niuu.domain.models import Principal
 from niuu.domain.services.realm import RealmService
@@ -35,7 +37,7 @@ def _make_client(
     async def extract_principal() -> Principal:
         return principal or _make_principal()
 
-    app.include_router(create_realms_router(extract_principal))
+    app.include_router(create_realms_router(extract_principal, stream_interval_seconds=15.0))
     return TestClient(app)
 
 
@@ -48,7 +50,7 @@ def test_router_default_prefix() -> None:
     async def extract() -> Principal:
         return _make_principal()
 
-    router = create_realms_router(extract)
+    router = create_realms_router(extract, stream_interval_seconds=15.0)
     assert router.prefix == "/api/v1/realms"
 
 
@@ -56,7 +58,7 @@ def test_router_custom_prefix() -> None:
     async def extract() -> Principal:
         return _make_principal()
 
-    router = create_realms_router(extract, prefix="/api/v2/realms")
+    router = create_realms_router(extract, prefix="/api/v2/realms", stream_interval_seconds=15.0)
     assert router.prefix == "/api/v2/realms"
 
 
@@ -351,7 +353,9 @@ def test_upsert_realm_by_id_rejects_invalid_slug() -> None:
 
 
 @pytest.mark.asyncio
-async def test_realm_detail_stream_emits_complete_named_snapshot() -> None:
+async def test_realm_detail_stream_emits_complete_named_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The authenticated realm-detail stream starts with a usable snapshot."""
     app = FastAPI()
     service = RealmService(InMemoryRealmRepository())
@@ -363,11 +367,18 @@ async def test_realm_detail_stream_emits_complete_named_snapshot() -> None:
     async def extract_principal() -> Principal:
         return _make_principal()
 
-    router = create_realms_router(extract_principal)
+    stream_interval_seconds = 3.25
+    sleep = AsyncMock()
+    monkeypatch.setattr(rest_realms.asyncio, "sleep", sleep)
+    router = create_realms_router(
+        extract_principal,
+        stream_interval_seconds=stream_interval_seconds,
+    )
     route = next(route for route in router.routes if route.path == "/api/v1/realms/{slug}/stream")
     request = Request({"type": "http", "app": app, "headers": []})
     response = await route.endpoint(request, "forge")
     frame = await anext(response.body_iterator)
+    keepalive = await anext(response.body_iterator)
     await response.body_iterator.aclose()
 
     assert response.media_type == "text/event-stream"
@@ -378,3 +389,5 @@ async def test_realm_detail_stream_emits_complete_named_snapshot() -> None:
     assert detail["realm"]["slug"] == "forge"
     assert detail["trust_grants"][0]["action_class"] == "build"
     assert detail["capabilities"][0]["name"] == "search"
+    assert keepalive == ": keepalive\n\n"
+    sleep.assert_awaited_once_with(stream_interval_seconds)

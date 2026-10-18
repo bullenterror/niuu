@@ -26,7 +26,6 @@ from niuu.domain.services.realm import RealmService
 # src/niuu/adapters/inbound/*.py (rest_setup.py, rest_credentials_settings.py).
 ADMIN_ROLE = "volundr:admin"
 REALM_DETAIL_STREAM_EVENT = "realm.detail"
-REALM_DETAIL_STREAM_INTERVAL_SECONDS = 15.0
 
 
 def _to_sse(payload: object, *, event: str) -> str:
@@ -191,6 +190,8 @@ class RecordCapabilityRequest(BaseModel):
 def create_realms_router(
     extract_principal: Callable[..., Awaitable[object]],
     prefix: str = "/api/v1/realms",
+    *,
+    stream_interval_seconds: float,
 ) -> APIRouter:
     """Create the realm governance router.
 
@@ -201,6 +202,8 @@ def create_realms_router(
         every route so the caller is authenticated.
     prefix:
         URL prefix for the router (default ``/api/v1/realms``).
+    stream_interval_seconds:
+        Configured polling and keepalive interval for realm-detail streams.
     """
     router = APIRouter(
         prefix=prefix,
@@ -238,7 +241,7 @@ def create_realms_router(
                 yield _to_sse(detail, event=REALM_DETAIL_STREAM_EVENT)
             else:
                 yield ": keepalive\n\n"
-            await asyncio.sleep(REALM_DETAIL_STREAM_INTERVAL_SECONDS)
+            await asyncio.sleep(stream_interval_seconds)
 
     def _service(request: Request) -> RealmService:
         service: RealmService | None = getattr(request.app.state, "realm_service", None)
@@ -425,7 +428,6 @@ __all__ = [
     "CreateRealmRequest",
     "CreateTrustGrantRequest",
     "REALM_DETAIL_STREAM_EVENT",
-    "REALM_DETAIL_STREAM_INTERVAL_SECONDS",
     "RealmResponse",
     "RecordCapabilityRequest",
     "TrustGrantResponse",

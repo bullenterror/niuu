@@ -4,7 +4,11 @@ import { useService } from '@niuulabs/plugin-sdk';
 import type { IMimirService } from '@niuulabs/plugin-mimir';
 import type { IBudgetStream } from '@niuulabs/plugin-ravn';
 import type { ITrackerBrowserService } from '@niuulabs/plugin-ting';
-import type { IRealmGovernanceService, IValkyrieService } from '@niuulabs/plugin-valkyrie';
+import type {
+  IRealmGovernanceService,
+  IValkyrieService,
+  RealmSummary,
+} from '@niuulabs/plugin-valkyrie';
 import {
   REALMS_QUERY_KEY,
   useRealmTrustGrants,
@@ -29,20 +33,21 @@ export function useRealmView(slug: string) {
     () => realms.data?.find((entry) => entry.slug === slug) ?? null,
     [realms.data, slug],
   );
+  const hasRealm = realm !== null;
   const dashboard = useValkyrieDashboard();
   const ravens = useRavens();
   const valkyrieRealms = useService<IRealmGovernanceService>('valkyrie.realms');
   const grants = useRealmTrustGrants(slug, realm !== null);
 
   useEffect(() => {
-    if (realm === null) return;
+    if (!hasRealm) return;
     return valkyrieRealms.subscribeRealmDetail(slug, (detail) => {
-      queryClient.setQueryData(REALMS_QUERY_KEY, (current: typeof realms.data) =>
+      queryClient.setQueryData<RealmSummary[]>(REALMS_QUERY_KEY, (current) =>
         current?.map((entry) => (entry.slug === slug ? detail.realm : entry)),
       );
       queryClient.setQueryData([...REALMS_QUERY_KEY, slug, 'trust-grants'], detail.trust_grants);
     });
-  }, [queryClient, realm, slug, valkyrieRealms]);
+  }, [hasRealm, queryClient, slug, valkyrieRealms]);
 
   const reviews = useReviewList({});
   const sessions = useVolundrSessions();

@@ -308,6 +308,9 @@ provisioning:
   # -- Initial delay before starting readiness polls in seconds
   initialDelaySeconds: 5.0
 
+# -- Seconds between realm-detail SSE state checks and idle keepalive comments
+realmDetailStreamIntervalSeconds: 15.0
+
 bifrost:
   # -- Base URL for the co-hosted Bifrost API Volundr reads models from
   url: "http://127.0.0.1:8080"

@@ -16,6 +16,12 @@ The tracker was resolved with the required shim from the repository root:
 
 NIU-300 is `Subscribe ODIN realm detail to SSE stream`; status is `Done` after merge `24b65ddc` into `regin`.
 
+## Review follow-up
+
+The review recorded at `a66d56e1` requested a hook-level stream lifecycle
+regression test and configuration-owned stream timing. Both follow-ups are
+implemented directly on `regin`; the tracker remains `Done`.
+
 ## Operator-directed scope
 
 The realm-detail SSE surface is the delivery. The implementation defines the

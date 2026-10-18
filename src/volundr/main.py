@@ -1611,7 +1611,13 @@ def create_app(
             # realm_repository was already built above, before
             # ResidentRuntimeService, so it could validate realm_id at create().
             app.state.realm_service = RealmService(realm_repository)
-            app.include_router(create_realms_router(extract_principal, prefix="/api/v1/realms"))
+            app.include_router(
+                create_realms_router(
+                    extract_principal,
+                    prefix="/api/v1/realms",
+                    stream_interval_seconds=settings.realm_detail_stream_interval_seconds,
+                )
+            )
             # Let resident deployment controllers resolve a resident's realm slug
             # (for realm_slug/charter binding in the rendered container config).
             for controller in resident_controllers:

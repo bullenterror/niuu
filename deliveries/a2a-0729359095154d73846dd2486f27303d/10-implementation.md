@@ -39,3 +39,19 @@ its effect cleanup.
 
 Hosted PR creation is unavailable because `gh` is not authenticated. The
 finished feature branch is merged and pushed directly to `regin` as requested.
+
+## Review follow-up
+
+`useRealmView` now keys its subscription lifecycle on realm presence rather
+than the current realm object. A hook regression test delivers a
+`realm.detail` snapshot, verifies both cache entries, and verifies exactly one
+unsubscribe on unmount. The stream interval is now validated in
+`volundr.config.Settings`, passed through both host composition roots, and
+rendered by the Volundr chart.
+
+Verification for this revision:
+
+- `uv run --extra dev pytest -q tests/test_niuu/test_rest_realms.py tests/test_volundr/test_resident_runtime_config.py`
+- `uv run --extra dev ruff check src/niuu/adapters/inbound/rest_realms.py src/volundr/config.py src/volundr/main.py src/cli/shared_host.py tests/test_niuu/test_rest_realms.py tests/test_volundr/test_resident_runtime_config.py`
+- `web-next/node_modules/.bin/vitest run packages/plugin-realms/src/application/useRealmView.test.tsx packages/plugin-valkyrie/src/adapters/http.test.ts --coverage.enabled=false`
+- `web-next/node_modules/.bin/tsc -p web-next/packages/plugin-realms/tsconfig.json --noEmit`

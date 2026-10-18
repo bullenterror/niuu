@@ -287,7 +287,12 @@ def create_app(
             app.state.persona_registry = PostgresPersonaRegistry(pool)
 
             app.state.realm_service = RealmService(PostgresRealmRepository(pool))
-            app.include_router(create_realms_router(extract_principal))
+            app.include_router(
+                create_realms_router(
+                    extract_principal,
+                    stream_interval_seconds=loaded_settings.realm_detail_stream_interval_seconds,
+                )
+            )
             app.include_router(create_repos_router(repo_service))
             app.include_router(create_identity_router(tenant_service))
             app.include_router(create_pats_router(extract_principal, prefix="/api/v1/tokens"))
