@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import yaml
 
 from ravn.config import (
     TRUST_CATEGORY_TOOLS,
@@ -106,6 +108,25 @@ class TestObservabilityConfig:
         assert config.enabled is True
         assert config.capture_content is True
         assert config.content_max_chars == 20_000
+
+
+SETUP_CONFIGS = Path(__file__).parents[2] / "scripts" / "setups" / "configs"
+
+
+def _enabled_observability_setup_configs() -> list[Path]:
+    return [
+        path
+        for path in sorted(SETUP_CONFIGS.glob("*.yaml"))
+        if (yaml.safe_load(path.read_text()) or {}).get("observability", {}).get("enabled")
+    ]
+
+
+@pytest.mark.parametrize("config_path", _enabled_observability_setup_configs())
+def test_enabled_ravn_setup_config_parses(config_path: Path) -> None:
+    with patch.dict(os.environ, {"RAVN_CONFIG": str(config_path)}):
+        settings = Settings()
+
+    assert settings.observability.enabled is True
 
 
 def test_kubernetes_tool_can_use_local_kubeconfig() -> None:

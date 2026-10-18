@@ -212,6 +212,7 @@ observability:
   service_name: ravn
   trace_endpoint: https://eitri.grpc-tempo.proxy.glitnir.alfheim.niuu.world:443
   metric_endpoint: https://mimir.proxy.glitnir.alfheim.niuu.world/eitri/otlp/v1/metrics
+  log_endpoint: https://loki.proxy.glitnir.alfheim.niuu.world/eitri/otlp/v1/logs
   insecure: false
   metric_export_interval_milliseconds: 5000
 

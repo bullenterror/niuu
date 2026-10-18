@@ -25,3 +25,7 @@ The operator authorized an equivalent self-contained proof in place of live-clus
 The operator approved moving NIU-1119 to `In Review` based on the passing focused proof. The 88 full-suite failures are accepted as outside this change's blast radius and are to be tracked separately, not treated as blockers for this ticket. The tracker was moved to `In Review`.
 
 The delivery is directly integrated on `regin` (`origin/regin` at `f2f94756` when approved). No hosted PR exists; the prior feature branch based on `dev` is not the delivery branch and no PR targets `dev` or `main`. The applicable integration target is `regin`.
+
+## Review revision — enabled setup configuration
+
+The review found that the enabled Eitri and Ivaldi local Ravn configurations were missing the now-required OTLP/HTTP Loki `observability.log_endpoint`. This revision adds each setup's `/v1/logs` endpoint and a regression test that loads every checked-in enabled Ravn setup configuration through `Settings`. The tracker was returned to `In Progress` while this review correction is verified on `regin`.

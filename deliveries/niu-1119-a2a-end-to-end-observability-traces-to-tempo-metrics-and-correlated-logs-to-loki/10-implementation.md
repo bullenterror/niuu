@@ -60,3 +60,10 @@ Added config-gated OpenTelemetry support for Ting and completed the A2A observab
 - The operator approved the focused OTLP exporter proof and authorized moving NIU-1119 to `In Review`; the tracker status is now `In Review`.
 - The full-suite result remains **26,796 passed, 88 failed, 46 skipped, 230 deselected, 1 xfailed**. Per operator direction, the 88 failures are outside this change's blast radius and must be tracked as pre-existing issues separately rather than blocking this ticket.
 - **Branch target confirmation:** the approved delivery is direct integration on `regin`, and `origin/regin` was confirmed at `f2f94756` before this handoff update. There is no hosted PR for this direct-regin delivery; no PR targets `dev` or `main`. If a hosted review artifact is required later, its target must be `regin`.
+
+## Review revision — enabled setup configuration
+
+- Added the OTLP/HTTP Loki `/v1/logs` endpoint to both enabled resident setup configurations: Eitri uses `https://loki.proxy.glitnir.alfheim.niuu.world/eitri/otlp/v1/logs`, and Ivaldi uses the same tenant collector endpoint.
+- Added `test_enabled_ravn_setup_config_parses`, which discovers every checked-in `scripts/setups/configs/*.yaml` file with `observability.enabled: true` and validates it through the production `Settings` YAML source.
+- Verification: the regression test and `TestObservabilityConfig` passed (5 passed); direct `RAVN_CONFIG=<setup> uv run python -c 'from ravn.config import Settings; Settings()'` validation passed for both setups; the focused observability suite passed (**30 passed, 454 deselected**) and again emitted the same-task Tempo trace, Loki metrics, and correlated Loki log evidence.
+- This direct-regin revision has no hosted PR; it will be committed and pushed to `origin/regin` only. No `dev` or `main` branch is targeted.
