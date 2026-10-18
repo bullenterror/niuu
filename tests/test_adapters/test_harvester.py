@@ -91,6 +91,24 @@ class HarvesterAPI:
         raise AssertionError(request)
 
 
+class RecordingAuth:
+    """Test double for the outbound HTTP authentication port."""
+
+    def __init__(self, headers: dict[str, str], *, invalidates: bool = False):
+        self._headers = headers
+        self.invalidates = invalidates
+        self.header_calls = 0
+        self.invalidate_calls = 0
+
+    def headers(self) -> dict[str, str]:
+        self.header_calls += 1
+        return self._headers
+
+    def invalidate(self) -> bool:
+        self.invalidate_calls += 1
+        return self.invalidates
+
+
 @pytest.fixture
 def api():
     return HarvesterAPI()
@@ -220,6 +238,39 @@ async def test_auth_server_and_redirect_failures_are_not_hidden(provider, api, s
     await provider.close()
 
 
+async def test_missing_authentication_port_header_fails_before_request(provider, api):
+    auth = RecordingAuth({})
+    provider._auth = auth
+
+    with pytest.raises(MachineProviderError, match="authentication is missing"):
+        await provider.get(uuid4())
+
+    assert auth.header_calls == 1
+    assert auth.invalidate_calls == 0
+    assert not api.requests
+    await provider.close()
+
+
+@pytest.mark.parametrize(
+    ("response", "message"),
+    [
+        (httpx.Response(200, content=b"not-json"), "invalid JSON"),
+        (httpx.Response(200, json=["not-an-object"]), "unexpected response"),
+    ],
+)
+async def test_malformed_upstream_responses_are_rejected(provider, response, message):
+    await provider.close()
+    provider._client = httpx.AsyncClient(
+        base_url="https://harvester.test/proxy/",
+        transport=httpx.MockTransport(lambda request: response),
+    )
+
+    with pytest.raises(MachineProviderError, match=message):
+        await provider.get(uuid4())
+
+    await provider.close()
+
+
 async def test_changed_request_and_foreign_resources_are_never_adopted(provider, api):
     request = MachineRequest(allocation_id=uuid4(), profile="small")
     await provider.create(request)
@@ -282,6 +333,27 @@ async def test_vm_state_and_guest_addresses(provider, api, phase, expected):
     await provider.close()
 
 
+async def test_vm_failure_condition_overrides_ready_guest_state(provider, api):
+    request = MachineRequest(allocation_id=uuid4(), profile="small")
+    await provider.create(request)
+    vm_path = next(path for path in api.objects if "/virtualmachines/" in path)
+    vm = api.objects[vm_path]
+    vm["status"] = {
+        "ready": True,
+        "conditions": [{"type": "Failure", "status": "True"}],
+    }
+    api.objects[vm_path.replace("/virtualmachines/", "/virtualmachineinstances/")] = {
+        "metadata": copy.deepcopy(vm["metadata"]),
+        "status": {"phase": "Running", "interfaces": [{"ipAddresses": ["10.20.0.3"]}]},
+    }
+
+    result = await provider.get(request.allocation_id)
+
+    assert result.state == MachineState.FAILED
+    assert result.addresses == ("10.20.0.3",)
+    await provider.close()
+
+
 async def test_create_conflict_resolves_same_owned_request(provider, api):
     api.conflict = True
     await provider.create(MachineRequest(allocation_id=uuid4(), profile="small"))
@@ -332,6 +404,47 @@ async def test_delete_refuses_resources_without_a_uid(provider, api):
         await provider.delete(request.allocation_id)
 
     assert len(api.objects) == 3
+    await provider.close()
+
+
+async def test_list_follows_inventory_pagination(provider, api):
+    requests = [MachineRequest(allocation_id=uuid4(), profile="small") for _ in range(2)]
+    for request in requests:
+        await provider.create(request)
+
+    original_handle = api.handle
+
+    def paginated_handle(request):
+        path = request.url.path.removeprefix(api.prefix)
+        if request.method != "GET" or not request.url.params.get("labelSelector"):
+            return original_handle(request)
+        api.requests.append(request)
+        items = [item for key, item in api.objects.items() if key.rsplit("/", 1)[0] == path]
+        offset = int(request.url.params.get("continue", "0"))
+        continuation = str(offset + 1) if offset + 1 < len(items) else ""
+        return httpx.Response(
+            200,
+            json={"items": items[offset : offset + 1], "metadata": {"continue": continuation}},
+        )
+
+    await provider.close()
+    provider._client = httpx.AsyncClient(
+        base_url="https://harvester.test/proxy/",
+        transport=httpx.MockTransport(paginated_handle),
+    )
+
+    machines = await provider.list()
+
+    assert [machine.allocation_id for machine in machines] == sorted(
+        request.allocation_id for request in requests
+    )
+    inventory_requests = [
+        request
+        for request in api.requests
+        if request.method == "GET" and request.url.params.get("labelSelector")
+    ]
+    assert len(inventory_requests) == 6
+    assert all(request.url.params["limit"] == "100" for request in inventory_requests)
     await provider.close()
 
 
