@@ -21,3 +21,14 @@ which explicitly records NIU-1110. It mounts Ting's A2A v1 JSON-RPC endpoint at
 `POST /api/v1/ting/a2a` and implements `SendMessage`, `GetTask`, and
 `CancelTask` over workflow campaigns. This delivery adds a one-task lifecycle
 regression proof rather than duplicating the landed implementation.
+
+## Review revision — production-adapter lifecycle proof
+
+The `review.changes_requested` finding is addressed by
+`tests/integration/volundr/test_a2a_workflow_task_lifecycle.py`. It uses
+Ting's PostgreSQL workflow, campaign, and A2A-reservation repositories plus
+`LocalVolundrAdapterFactory`/`VolundrHTTPAdapter` against a real loopback
+Volundr REST server and its PostgreSQL session repository. The test creates an
+isolated workflow and drives `SendMessage`, `GetTask`, and `CancelTask` on its
+returned task id, then verifies the persisted cancellation marker and stopped
+Forge session. The target remains `regin` only.

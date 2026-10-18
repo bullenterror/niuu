@@ -42,3 +42,30 @@ a deployment of this workspace revision and cannot provide honest live-service
 evidence. No cluster or hosted Ting deployment credentials are available in
 this worker. The committed focused proof is therefore the available evidence;
 it does not claim a remote deployment test.
+
+## Review revision: production-adapter lifecycle proof
+
+`tests/integration/volundr/test_a2a_workflow_task_lifecycle.py` adds the
+non-fixture lifecycle boundary requested in review. It sends all three JSON-RPC
+operations through Ting's real A2A router while its production PostgreSQL
+workflow, campaign, and launch-reservation adapters persist the workflow task.
+The normal `LocalVolundrAdapterFactory` and `VolundrHTTPAdapter` cross a real
+loopback HTTP server into Volundr's production session REST router and
+PostgreSQL session repository. The assertion confirms that `CancelTask` marked
+the campaign `a2a_canceled` and stopped the exact session created by
+`SendMessage`; it also captures the three correlated A2A operation logs.
+
+The focused OTLP test in `tests/test_ting/test_a2a_tasks.py` remains the trace,
+metric, and log exporter proof for the same endpoint: it records
+`ting.a2a.SendMessage` for trace id
+`0123456789abcdef0123456789abcdef`, exports
+`a2a_requests_total` and `a2a_request_duration_seconds`, and observes the
+correlated completion log. Together the two tests cover real adapter lifecycle
+persistence/transport and the endpoint's telemetry exporters.
+
+### Revision verification
+
+- Passed: `uv run ruff check tests/integration/volundr/test_a2a_workflow_task_lifecycle.py`.
+- Passed: `uv run ruff format --check tests/integration/volundr/test_a2a_workflow_task_lifecycle.py`.
+- Passed: `uv run python -m compileall -q tests/integration/volundr/test_a2a_workflow_task_lifecycle.py`.
+- Local integration execution was attempted with `uv run --extra otel pytest -q -s -m integration tests/integration/volundr/test_a2a_workflow_task_lifecycle.py --no-cov`, but this worker has no `volundr_test` PostgreSQL role (`InvalidAuthorizationSpecificationError`). The repository's `Forge PostgreSQL boundaries` CI job supplies that disposable role and executes `tests/integration/volundr/`; its result is required before merge.
