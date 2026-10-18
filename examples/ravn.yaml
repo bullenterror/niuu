@@ -19,6 +19,7 @@ observability:
   service_name: ravn
   trace_endpoint: ""
   metric_endpoint: ""
+  log_endpoint: ""
   insecure: false
   metric_export_interval_milliseconds: 10000
   capture_content: false

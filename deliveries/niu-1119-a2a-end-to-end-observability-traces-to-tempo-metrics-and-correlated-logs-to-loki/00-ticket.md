@@ -15,3 +15,7 @@ Resolved the review-blocking duplicate public metric emission by keeping `ravn_t
 ## Regin delivery pass
 
 The pre-existing `feat/niu-1119-a2a-observability` branch was based on `origin/dev`, contrary to the mandatory branch rule. Its implementation was therefore reviewed and cherry-picked onto `regin`; no `dev` or `main` branch was targeted or modified by this delivery pass.
+
+## Equivalent local observability proof
+
+The operator authorized an equivalent self-contained proof in place of live-cluster access. The proof must exercise the actual A2A export path without `kubectl`, external sink credentials, or a deployed Tempo/Loki environment, and it must be committed directly to `regin`.

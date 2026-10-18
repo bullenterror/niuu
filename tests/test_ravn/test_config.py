@@ -89,8 +89,8 @@ class TestObservabilityConfig:
         assert config.capture_content is False
         assert config.service_name == "ravn"
 
-    def test_enabled_requires_separate_trace_and_metric_endpoints(self) -> None:
-        with pytest.raises(ValueError, match="trace_endpoint and metric_endpoint"):
+    def test_enabled_requires_separate_trace_metric_and_log_endpoints(self) -> None:
+        with pytest.raises(ValueError, match="trace_endpoint, metric_endpoint, and log_endpoint"):
             ObservabilityConfig(enabled=True, trace_endpoint="https://tempo:4317")
 
     def test_enabled_accepts_glitnir_style_endpoints(self) -> None:
@@ -98,6 +98,7 @@ class TestObservabilityConfig:
             enabled=True,
             trace_endpoint="https://eitri.grpc-tempo.example:443",
             metric_endpoint="https://mimir.example/eitri/otlp/v1/metrics",
+            log_endpoint="https://loki.example/eitri/otlp/v1/logs",
             capture_content=True,
             content_max_chars=20_000,
         )
