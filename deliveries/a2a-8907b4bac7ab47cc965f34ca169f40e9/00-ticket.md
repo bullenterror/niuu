@@ -32,3 +32,28 @@ Volundr REST server and its PostgreSQL session repository. The test creates an
 isolated workflow and drives `SendMessage`, `GetTask`, and `CancelTask` on its
 returned task id, then verifies the persisted cancellation marker and stopped
 Forge session. The target remains `regin` only.
+
+## Inherited Ravn formatting debt (operator-approved scope hold)
+
+Before the formatting commit, `src/ravn/adapters/tool_build/a2a.py` was
+byte-identical to clean `origin/regin` (`git diff --exit-code origin/regin --
+src/ravn/adapters/tool_build/a2a.py`); NIU-1110 did not otherwise modify this
+file. The exact inherited-debt proof was:
+
+```console
+git show origin/regin:src/ravn/adapters/tool_build/a2a.py > /tmp/a2a-regin-NIU1110.py
+uv run ruff format --check --diff /tmp/a2a-regin-NIU1110.py
+```
+
+Ruff reported only removal of the extra blank line before
+`_skill_capability` (line 1242). Commit `11bbd386` (`style(ravn): format A2A
+adapter`) contains that exact one-line deletion and no other file. The
+post-change verification was:
+
+```console
+uv run ruff format --check src/ravn/adapters/tool_build/a2a.py
+```
+
+This is the single inherited `regin` format defect blocking PR #1150; no
+broader repository formatting was performed. PR #1150 remains targeted only
+at `regin`.

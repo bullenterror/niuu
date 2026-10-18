@@ -69,3 +69,17 @@ persistence/transport and the endpoint's telemetry exporters.
 - Passed: `uv run ruff format --check tests/integration/volundr/test_a2a_workflow_task_lifecycle.py`.
 - Passed: `uv run python -m compileall -q tests/integration/volundr/test_a2a_workflow_task_lifecycle.py`.
 - Local integration execution was attempted with `uv run --extra otel pytest -q -s -m integration tests/integration/volundr/test_a2a_workflow_task_lifecycle.py --no-cov`, but this worker has no `volundr_test` PostgreSQL role (`InvalidAuthorizationSpecificationError`). The repository's `Forge PostgreSQL boundaries` CI job supplies that disposable role and executes `tests/integration/volundr/`; its result is required before merge.
+
+## Inherited Ravn formatting gate remediation
+
+The required Python formatting gate also evaluated unchanged
+`src/ravn/adapters/tool_build/a2a.py`. Before commit `11bbd386`, it was
+byte-identical to `origin/regin`; `git show
+origin/regin:src/ravn/adapters/tool_build/a2a.py > /tmp/a2a-regin-NIU1110.py`
+followed by `uv run ruff format --check --diff /tmp/a2a-regin-NIU1110.py`
+reported exactly one deletion: the additional blank line before
+`_skill_capability` at line 1242. `11bbd386` is a dedicated
+`style(ravn): format A2A adapter` commit containing only that deletion.
+`uv run ruff format --check src/ravn/adapters/tool_build/a2a.py` passes after
+the change. No gate configuration changed and no other `regin` formatting debt
+was remediated.
