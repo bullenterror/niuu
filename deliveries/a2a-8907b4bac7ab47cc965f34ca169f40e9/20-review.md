@@ -2,16 +2,26 @@
 
 ## Verdict
 
-**pass** — the branch adds a focused, end-to-end JSON-RPC regression that
-launches one workflow through `SendMessage`, reads the returned task through
-`GetTask`, and cancels that same task through `CancelTask`. The test verifies
-the canceled task state, persisted cancellation marker, and stopped session.
-The accompanying Ravn edit is the single whitespace-only change required by
-Ruff formatting.
+**needs_changes** — the focused JSON-RPC regression is useful, and the
+format-only Ravn edit is correct, but the ticket's required non-fixture
+end-to-end proof is still absent.
 
 ## Findings
 
-No blocking findings in `origin/regin..11bbd386`.
+### Major
+
+- **`tests/test_ting/test_a2a_tasks.py:742`** — The only new lifecycle proof
+  constructs its route with `InMemoryWorkflowRepository`,
+  `InMemoryCampaignRepository`, `InMemoryA2ALaunchRepository`, and the
+  `RecordingVolundrPort` supplied by `_make_client`. It therefore never
+  launches or stops a real A2A-backed runtime task, nor verifies the persisted
+  state through the production repository adapters. This does not satisfy the
+  ticket's explicit requirement that one *real* A2A task exercise
+  `SendMessage`, `GetTask`, and `CancelTask`, rather than a fixture-only path.
+  Fix: add and run an integration/deployment proof against the production
+  Ting/Volundr adapters (with an isolated real workflow and session), invoke
+  all three JSON-RPC methods on the returned task ID, and commit the resulting
+  trace/metric/log evidence in the delivery record.
 
 ## Verification
 
@@ -26,11 +36,12 @@ No blocking findings in `origin/regin..11bbd386`.
 - Passed: `uv run ruff check src/ting/api/a2a.py tests/test_ting/test_a2a_tasks.py src/ravn/adapters/tool_build/a2a.py`.
 - Passed: `uv run ruff format --check tests/test_ting/test_a2a_tasks.py src/ravn/adapters/tool_build/a2a.py`.
 - Passed: `git diff --check origin/regin..HEAD`.
-- At review time, PR #1150 CI run `39163945454` was still in progress; no
-  failed check was observed.
+- At review time, the new head had no completed PR checks; the earlier CI run
+  `39163945454` was associated with the preceding head and was still in
+  progress before this review record was pushed.
 
 ## Recommendation
 
-Code review is approved. Merge only into `regin` after all required PR checks
-are green and the authorized operator approves the merge. Do not merge to
-`dev` or `main`.
+Do not merge. Supply the required real end-to-end A2A lifecycle evidence, then
+rerun the focused checks and wait for green PR CI. The only permitted merge
+target remains `regin`; never merge to `dev` or `main`.
