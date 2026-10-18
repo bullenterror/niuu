@@ -54,3 +54,9 @@ Added config-gated OpenTelemetry support for Ting and completed the A2A observab
 - Focused verification passed: `PATH="$PWD/.local/bin:$PATH" uv run pytest -q -s ... -k 'observability or a2a_otlp_export'` reported **30 passed, 138 deselected**. `uv run ruff check src/ tests/` and changed-file formatting checks passed.
 - Full-suite attempt: `PATH="$PWD/.local/bin:$PATH" uv run pytest -q` completed in 23m33s with **26,796 passed, 88 failed, 46 skipped, 230 deselected, 1 xfailed**. The failures are outside the changed observability path (for example, missing testserver workload-token exchange endpoints, unavailable Docker, a chart namespace assertion, and existing resident-learning/persona failures); this delivery does not claim the full suite is green.
 - The equivalent-proof implementation is committed and pushed directly to `origin/regin` as `596255cf` (`feat(niuu): export correlated logs over otlp`). There is no hosted PR because the required delivery path is direct integration to `regin`; tracker status remains `In Progress` until an operator decides how to resolve the unrelated full-suite failures.
+
+## Operator disposition
+
+- The operator approved the focused OTLP exporter proof and authorized moving NIU-1119 to `In Review`; the tracker status is now `In Review`.
+- The full-suite result remains **26,796 passed, 88 failed, 46 skipped, 230 deselected, 1 xfailed**. Per operator direction, the 88 failures are outside this change's blast radius and must be tracked as pre-existing issues separately rather than blocking this ticket.
+- **Branch target confirmation:** the approved delivery is direct integration on `regin`, and `origin/regin` was confirmed at `f2f94756` before this handoff update. There is no hosted PR for this direct-regin delivery; no PR targets `dev` or `main`. If a hosted review artifact is required later, its target must be `regin`.
