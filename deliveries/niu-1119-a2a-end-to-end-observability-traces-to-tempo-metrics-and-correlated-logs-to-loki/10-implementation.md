@@ -74,12 +74,3 @@ Added config-gated OpenTelemetry support for Ting and completed the A2A observab
   available query capability, which returned an internal error; no Mímir write
   capability is exposed in this worker, so this checked-in delivery record is
   the durable handoff.
-
-
-## Review revision — enabled resident configurations
-
-- Added `observability.log_endpoint: https://loki.proxy.glitnir.alfheim.niuu.world/eitri/otlp/v1/logs` to both `scripts/setups/configs/eitri-local-valkyrie.yaml` and `scripts/setups/configs/ivaldi-local-workshop.yaml`.
-- Added `test_enabled_ravn_setup_config_parses`, parameterized over every checked-in `scripts/setups/configs/*.yaml` whose `observability.enabled` is true. It loads each through `Settings`, thereby exercising the configuration validator that requires trace, metric, and log endpoints.
-- Focused verification passed: `uv run pytest -q -s tests/test_ting/test_a2a_tasks.py::TestSendMessage::test_a2a_otlp_export_reaches_tempo_and_loki_receivers tests/test_ravn/test_config.py::TestObservabilityConfig tests/test_ravn/test_config.py::test_enabled_ravn_setup_config_parses tests/test_ting/test_config.py::TestSettings::test_observability_requires_trace_metric_and_log_endpoints tests/test_skuld/test_config.py::TestSkuldSettings::test_observability_partial_env_keeps_skuld_service_name` (**8 passed**). The OTLP proof observed the Tempo `ting.a2a.SendMessage` trace plus Loki-received `a2a_requests_total`, `a2a_request_duration_seconds`, and the correlated completion log.
-- Direct `RAVN_CONFIG=<setup> uv run python` validation passed for both enabled resident setup files. `uv run ruff check tests/test_ravn/test_config.py` and `git diff --check` passed.
-- The repository has no hosted PR for this direct `regin` integration; no branch or PR targets `dev` or `main`.

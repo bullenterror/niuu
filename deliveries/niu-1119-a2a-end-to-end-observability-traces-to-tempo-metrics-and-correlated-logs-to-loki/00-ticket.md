@@ -32,10 +32,3 @@ The review found that the enabled Eitri and Ivaldi local Ravn configurations wer
 
 The correction is integrated on `origin/regin` through `04630211`; NIU-1119 was
 then set to `Done`. There is no hosted PR for this direct-regin delivery.
-
-
-## Review revision — enabled resident configurations
-
-The review finding was reproduced against the pre-revision `regin` revision: both enabled Ravn setup files lacked `observability.log_endpoint`, which is required whenever observability is enabled. Both now configure their Eitri OTLP/HTTP Loki collector endpoint at `/eitri/otlp/v1/logs`. The regression test discovers and parses every checked-in Ravn setup config that enables observability, so a missing required endpoint fails before a resident startup attempt.
-
-The tracker was returned to `In Progress` while this revision is prepared for re-review.
