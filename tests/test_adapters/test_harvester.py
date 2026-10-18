@@ -251,6 +251,38 @@ async def test_missing_authentication_port_header_fails_before_request(provider,
     await provider.close()
 
 
+async def test_auth_refresh_must_return_a_new_authorization_header(provider):
+    class RefreshingAuth:
+        def __init__(self):
+            self.header_calls = 0
+            self.invalidate_calls = 0
+
+        def headers(self) -> dict[str, str]:
+            self.header_calls += 1
+            if self.header_calls == 1:
+                return {"Authorization": "Bearer expired"}
+            return {}
+
+        def invalidate(self) -> bool:
+            self.invalidate_calls += 1
+            return True
+
+    auth = RefreshingAuth()
+    provider._auth = auth
+    await provider.close()
+    provider._client = httpx.AsyncClient(
+        base_url="https://harvester.test/proxy/",
+        transport=httpx.MockTransport(lambda request: httpx.Response(401)),
+    )
+
+    with pytest.raises(MachineProviderError, match="refresh returned no credential"):
+        await provider.get(uuid4())
+
+    assert auth.header_calls == 2
+    assert auth.invalidate_calls == 1
+    await provider.close()
+
+
 @pytest.mark.parametrize(
     ("response", "message"),
     [
@@ -361,6 +393,35 @@ async def test_create_conflict_resolves_same_owned_request(provider, api):
     await provider.close()
 
 
+async def test_create_rejects_an_unresolved_resource_conflict(provider, api):
+    original_handle = api.handle
+
+    def conflict_without_resource(request):
+        if request.method == "POST":
+            return httpx.Response(409, json={})
+        return original_handle(request)
+
+    await provider.close()
+    provider._client = httpx.AsyncClient(
+        base_url="https://harvester.test/proxy/",
+        transport=httpx.MockTransport(conflict_without_resource),
+    )
+
+    with pytest.raises(MachineProviderError, match="conflicted but the resource is unavailable"):
+        await provider.create(MachineRequest(allocation_id=uuid4(), profile="small"))
+
+    assert not api.objects
+    await provider.close()
+
+
+async def test_create_rejects_unknown_profile_before_calling_harvester(provider, api):
+    with pytest.raises(ValueError, match="Unknown Harvester machine profile: unavailable"):
+        await provider.create(MachineRequest(allocation_id=uuid4(), profile="unavailable"))
+
+    assert not api.requests
+    await provider.close()
+
+
 async def test_create_requires_ready_image_storage_and_existing_network(provider, api):
     api.image_storage_class = None
     request = MachineRequest(allocation_id=uuid4(), profile="small")
@@ -445,6 +506,18 @@ async def test_list_follows_inventory_pagination(provider, api):
     ]
     assert len(inventory_requests) == 6
     assert all(request.url.params["limit"] == "100" for request in inventory_requests)
+    await provider.close()
+
+
+async def test_list_rejects_managed_resources_without_an_allocation_id(provider, api):
+    request = MachineRequest(allocation_id=uuid4(), profile="small")
+    await provider.create(request)
+    vm = next(value for path, value in api.objects.items() if "/virtualmachines/" in path)
+    vm["metadata"]["labels"].pop(ALLOCATION_LABEL)
+
+    with pytest.raises(MachineOwnershipError, match="lacks an allocation ID"):
+        await provider.list()
+
     await provider.close()
 
 
