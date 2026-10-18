@@ -13,7 +13,7 @@ uv run --extra dev ruff check tests/test_adapters/test_harvester.py
 uv run --extra dev pytest -q tests/test_adapters/test_harvester.py --cov=volundr.adapters.outbound.harvester --cov-report=term-missing
 ```
 
-The focused suite passes `42 passed` with `97%` coverage for `src/volundr/adapters/outbound/harvester.py`.
+Final review-gate run on `test/niu-295-harvester-adapter-followup` passes `42 passed` with `97%` coverage for `src/volundr/adapters/outbound/harvester.py`.
 
 ## Pre-existing environment failures on clean `regin`
 
