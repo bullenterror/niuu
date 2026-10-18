@@ -3,7 +3,7 @@
 - Tracker: https://linear.app/niuu/issue/NIU-295/tests-for-harvesteradapter
 - Status at implementation start: In Progress
 - Base and target branch: `regin`
-- Working branch: `test/niu-295-harvester-adapter`
+- Working branch: `test/niu-295-harvester-adapter-regin`
 
 ## Scope
 
