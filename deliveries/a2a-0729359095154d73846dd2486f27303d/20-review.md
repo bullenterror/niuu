@@ -2,46 +2,38 @@
 
 ## Verdict
 
-`needs_changes`
+`pass`
 
 ## Findings
 
-### Major
+No blocking or non-blocking findings.
 
-1. **`web-next/packages/plugin-realms/src/application/useRealmView.ts:37`** —
-   The delivery's only new frontend test exercises the HTTP adapter and calls
-   its unsubscribe function directly; it never mounts `useRealmView`, delivers
-   an event through the subscription callback, or unmounts the hook.  The
-   acceptance criterion specifically requires a focused regression test proving
-   live cache updates and React-effect disposal.  Add a `useRealmView` hook test
-   that captures the fake service listener, asserts that a `realm.detail`
-   snapshot replaces the realm and trust-grant query entries, then unmounts and
-   asserts the returned unsubscribe function is called exactly once.
-
-### Minor
-
-1. **`src/niuu/adapters/inbound/rest_realms.py:26`** — The stream polling and
-   keepalive interval is a hard-coded timing value.  Project rules require
-   timing values in the package configuration.  Move the interval into Niuu
-   settings and thread it to the router/composition root (including deployed
-   config rendering) rather than fixing it at 15 seconds in the adapter.
+The previous review request is satisfied: `useRealmView.test.tsx` mounts the
+hook, delivers a `realm.detail` snapshot through the captured subscription
+listener, verifies both affected React Query entries, then unmounts and asserts
+that the returned unsubscribe function runs exactly once. The configured stream
+interval is validated by the Volundr settings model, threaded through both
+realm-router composition roots, rendered in the Volundr chart, and exercised by
+the REST stream test.
 
 ## Verification
 
-- Reviewed the merged `regin` change `cbecf1fc` (`feat(realms): stream realm
-  detail updates`) and its merge/closure commits at `24b65ddc` and `cb88f53a`.
-- Confirmed `regin` and `origin/regin` both resolve to `cb88f53a`; reviewed the
-  declared delivery ticket and implementation handoff.
-- Passed: `uv run pytest -q tests/test_niuu/test_rest_realms.py` (24 passed;
-  one pre-existing Starlette TestClient deprecation warning).
-- Passed: `corepack pnpm --filter @niuulabs/plugin-valkyrie typecheck` and
-  `corepack pnpm --filter @niuulabs/plugin-realms typecheck`.
-- Passed: `corepack pnpm exec vitest run apps/niuu/src/services.test.ts
-  packages/plugin-valkyrie/src/adapters/http.test.ts --coverage.enabled=false`
-  (2 files, 101 tests).
+- Re-checked the declared repository root on `regin`, reviewing the follow-up
+  range `a66d56e1..7d74b6b7` and the current file contents. The prior requested
+  hook lifecycle regression and configuration-owned timing are both present.
+- Passed: `uv run ruff check tests/test_niuu/test_rest_realms.py
+  src/niuu/adapters/inbound/rest_realms.py src/volundr/config.py
+  src/volundr/main.py src/cli/shared_host.py`.
+- Passed: `uv run pytest -q tests/test_niuu/test_rest_realms.py
+  tests/test_volundr/test_resident_runtime_config.py` (30 passed).
+- Passed: `corepack pnpm --filter @niuulabs/plugin-realms typecheck`.
+- Passed: `corepack pnpm exec vitest run
+  packages/plugin-realms/src/application/useRealmView.test.tsx
+  --coverage.enabled=false` from `web-next/` (1 passed).
+- Helm chart rendering was not run because `helm` is unavailable in this environment; the
+  chart template and values change were inspected in the reviewed diff.
+- Passed: `git diff --check a66d56e1..7d74b6b7`.
 
 ## Recommendation
 
-Add the hook-level live-update/unmount regression test before approval.  The
-interval configuration cleanup can be included in the same follow-up or a
-separate non-blocking change.
+Approve NIU-300 for merge on `regin`.
