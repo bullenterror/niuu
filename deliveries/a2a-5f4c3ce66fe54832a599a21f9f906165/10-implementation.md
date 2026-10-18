@@ -19,6 +19,7 @@ the stream during cleanup.
 - Passed: `uv run pytest -q tests/test_niuu/test_rest_realms.py tests/test_volundr/test_resident_runtime_config.py` — 30 passed.
 - Passed: `corepack pnpm --filter @niuulabs/plugin-realms typecheck`.
 - Passed: `corepack pnpm exec vitest run packages/plugin-realms/src/application/useRealmView.test.tsx packages/plugin-valkyrie/src/adapters/http.test.ts --coverage.enabled=false` — 23 passed.
+- Passed: the [PR #1147 check rollup](https://github.com/niuulabs/niuu/pull/1147) is complete and successful, including `ci-gate`.
 
 ## Hosted delivery
 
