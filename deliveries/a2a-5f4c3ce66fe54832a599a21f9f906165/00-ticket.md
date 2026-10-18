@@ -12,3 +12,9 @@ The requested implementation is already landed on `regin`: implementation
 commit `cbecf1fc598ca91f00c0ff630d6b3b2291a077ec` is an ancestor of the current
 head, through merge commit `85447e63`. This pass revalidated the landed server
 contract and browser subscription rather than duplicating source changes.
+
+## Review revision
+
+On 2026-10-18, the reviewer requested coverage of the changed-detail emission
+branch. The ticket was returned to `In Progress` and a focused regression test
+was added before re-verification.

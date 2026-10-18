@@ -391,3 +391,41 @@ async def test_realm_detail_stream_emits_complete_named_snapshot(
     assert detail["capabilities"][0]["name"] == "search"
     assert keepalive == ": keepalive\n\n"
     sleep.assert_awaited_once_with(stream_interval_seconds)
+
+
+@pytest.mark.asyncio
+async def test_realm_detail_stream_emits_changed_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The stream emits a replacement frame after realm detail changes."""
+    app = FastAPI()
+    service = RealmService(InMemoryRealmRepository())
+    app.state.realm_service = service
+    realm = await service.create_realm("forge", "Forge")
+
+    async def extract_principal() -> Principal:
+        return _make_principal()
+
+    stream_interval_seconds = 3.25
+    sleep = AsyncMock()
+    monkeypatch.setattr(rest_realms.asyncio, "sleep", sleep)
+    router = create_realms_router(
+        extract_principal,
+        stream_interval_seconds=stream_interval_seconds,
+    )
+    route = next(route for route in router.routes if route.path == "/api/v1/realms/{slug}/stream")
+    request = Request({"type": "http", "app": app, "headers": []})
+    response = await route.endpoint(request, "forge")
+    initial_frame = await anext(response.body_iterator)
+
+    await service.record_capability(realm.id, "search", "tool", status="present")
+    changed_frame = await anext(response.body_iterator)
+    await response.body_iterator.aclose()
+
+    assert initial_frame.startswith("event: realm.detail\n")
+    assert changed_frame.startswith("event: realm.detail\n")
+    assert changed_frame != initial_frame
+    payload = changed_frame.removeprefix("event: realm.detail\ndata: ").removesuffix("\n\n")
+    detail = json.loads(payload)
+    assert [capability["name"] for capability in detail["capabilities"]] == ["search"]
+    sleep.assert_awaited_once_with(stream_interval_seconds)

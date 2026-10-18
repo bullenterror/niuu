@@ -25,3 +25,17 @@ the stream during cleanup.
 
 The implementation was merged through [PR #1147](https://github.com/niuulabs/niuu/pull/1147). This pass records fresh verification only; no additional PR is
 needed because the target branch already contains the implementation.
+
+## Review revision
+
+`test_realm_detail_stream_emits_changed_snapshot` now consumes the initial
+`realm.detail` frame, records a capability in the same in-memory realm, then
+asserts the next frame is a second named `realm.detail` snapshot containing the
+new capability. This exercises the changed-state branch without timing sleeps.
+
+Focused verification passed:
+
+- `uv run ruff check tests/test_niuu/test_rest_realms.py src/niuu/adapters/inbound/rest_realms.py`
+- `uv run pytest -q tests/test_niuu/test_rest_realms.py` — 25 passed.
+
+The canonical implementation PR remains [PR #1147](https://github.com/niuulabs/niuu/pull/1147), which is merged into `regin`. This review-only regression-test commit is being delivered directly on the configured `regin` branch; no separate hosted PR is created.
