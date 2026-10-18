@@ -14,7 +14,7 @@ The tracker was resolved with the required shim from the repository root:
 ./.skuld-tools/bin/tracker_issue update-status "a8939934-dc0d-4d0e-b89e-6ca5d3089055" "In Progress"
 ```
 
-NIU-300 is `Subscribe ODIN realm detail to SSE stream`; status is `In Progress`.
+NIU-300 is `Subscribe ODIN realm detail to SSE stream`; status is `Done` after merge `24b65ddc` into `regin`.
 
 ## Operator-directed scope
 
