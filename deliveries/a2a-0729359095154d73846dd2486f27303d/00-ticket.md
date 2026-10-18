@@ -4,16 +4,20 @@
 - Required base and target: `regin`
 - Working branch: `feat/niu-300-realm-detail-sse`, cut from `regin` (`f88bd733`)
 
-## Tracker lookup
+## Tracker
 
-The required tracker command was run from the repository root:
+The tracker was resolved with the required shim from the repository root:
 
 ```sh
 ./.skuld-tools/bin/tracker_issue search "NIU-300"
+./.skuld-tools/bin/tracker_issue get "a8939934-dc0d-4d0e-b89e-6ca5d3089055"
+./.skuld-tools/bin/tracker_issue update-status "a8939934-dc0d-4d0e-b89e-6ca5d3089055" "In Progress"
 ```
 
-It returned `{"detail":"Not Found"}` (exit 1), so no issue UUID was available to read or move to In Progress. The configured Linear connector also required reauthentication when queried for `NIU-300`.
+NIU-300 is `Subscribe ODIN realm detail to SSE stream`; status is `In Progress`.
 
 ## Operator-directed scope
 
-The realm-detail surface belongs to this ticket. It has not been treated as a prerequisite from another branch.
+The realm-detail SSE surface is the delivery. The implementation defines the
+server contract and client adapter rather than treating the surface as a
+prerequisite.

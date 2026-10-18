@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
 from niuu.adapters.inbound.rest_realms import create_realms_router
@@ -346,3 +348,33 @@ def test_upsert_realm_by_id_rejects_invalid_slug() -> None:
     )
 
     assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_realm_detail_stream_emits_complete_named_snapshot() -> None:
+    """The authenticated realm-detail stream starts with a usable snapshot."""
+    app = FastAPI()
+    service = RealmService(InMemoryRealmRepository())
+    app.state.realm_service = service
+    realm = await service.create_realm("forge", "Forge")
+    await service.grant_trust(realm.id, "build", level=2)
+    await service.record_capability(realm.id, "search", "tool", status="present")
+
+    async def extract_principal() -> Principal:
+        return _make_principal()
+
+    router = create_realms_router(extract_principal)
+    route = next(route for route in router.routes if route.path == "/api/v1/realms/{slug}/stream")
+    request = Request({"type": "http", "app": app, "headers": []})
+    response = await route.endpoint(request, "forge")
+    frame = await anext(response.body_iterator)
+    await response.body_iterator.aclose()
+
+    assert response.media_type == "text/event-stream"
+    assert response.headers["x-accel-buffering"] == "no"
+    assert frame.startswith("event: realm.detail\n")
+    payload = frame.removeprefix("event: realm.detail\ndata: ").removesuffix("\n\n")
+    detail = json.loads(payload)
+    assert detail["realm"]["slug"] == "forge"
+    assert detail["trust_grants"][0]["action_class"] == "build"
+    assert detail["capabilities"][0]["name"] == "search"

@@ -1690,6 +1690,9 @@ export function createMockRealmGovernanceService(
   }
 
   return {
+    subscribeRealmDetail() {
+      return () => {};
+    },
     async listRealms() {
       return realms.map((realm) => ({ ...realm }));
     },

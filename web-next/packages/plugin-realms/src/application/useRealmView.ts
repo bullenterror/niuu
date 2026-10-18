@@ -1,11 +1,12 @@
-import { useMemo } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useEffect, useMemo } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useService } from '@niuulabs/plugin-sdk';
 import type { IMimirService } from '@niuulabs/plugin-mimir';
 import type { IBudgetStream } from '@niuulabs/plugin-ravn';
 import type { ITrackerBrowserService } from '@niuulabs/plugin-ting';
-import type { IValkyrieService } from '@niuulabs/plugin-valkyrie';
+import type { IRealmGovernanceService, IValkyrieService } from '@niuulabs/plugin-valkyrie';
 import {
+  REALMS_QUERY_KEY,
   useRealmTrustGrants,
   useRealms,
   useReviewList,
@@ -22,6 +23,7 @@ import { useRavens, useVolundrSessions } from './useRealmsHome';
 
 /** Everything the realm page shows, joined by the naming conventions. */
 export function useRealmView(slug: string) {
+  const queryClient = useQueryClient();
   const realms = useRealms();
   const realm = useMemo(
     () => realms.data?.find((entry) => entry.slug === slug) ?? null,
@@ -29,7 +31,19 @@ export function useRealmView(slug: string) {
   );
   const dashboard = useValkyrieDashboard();
   const ravens = useRavens();
+  const valkyrieRealms = useService<IRealmGovernanceService>('valkyrie.realms');
   const grants = useRealmTrustGrants(slug, realm !== null);
+
+  useEffect(() => {
+    if (realm === null) return;
+    return valkyrieRealms.subscribeRealmDetail(slug, (detail) => {
+      queryClient.setQueryData(REALMS_QUERY_KEY, (current: typeof realms.data) =>
+        current?.map((entry) => (entry.slug === slug ? detail.realm : entry)),
+      );
+      queryClient.setQueryData([...REALMS_QUERY_KEY, slug, 'trust-grants'], detail.trust_grants);
+    });
+  }, [queryClient, realm, slug, valkyrieRealms]);
+
   const reviews = useReviewList({});
   const sessions = useVolundrSessions();
   const valkyrie = useService<IValkyrieService>('valkyrie');

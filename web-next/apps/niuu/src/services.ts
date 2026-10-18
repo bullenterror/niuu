@@ -1556,6 +1556,7 @@ export function buildServices(config: NiuuConfig): ServicesMap {
     ? buildRealmGovernanceHttpAdapter(
         createApiClient(realmGovernanceBases.realmsBase),
         createApiClient(realmGovernanceBases.workflowsBase),
+        realmGovernanceBases.realmsBase,
       )
     : demoService(config, 'valkyrie.realms', createMockRealmGovernanceService);
   const featureCatalogService = buildSharedFeatureCatalogService(config);
