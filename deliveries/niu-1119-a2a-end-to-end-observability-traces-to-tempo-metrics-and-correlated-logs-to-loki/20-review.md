@@ -8,17 +8,17 @@ needs_changes
 
 ### Major
 
-- `scripts/setups/configs/eitri-local-valkyrie.yaml:208` and `scripts/setups/configs/ivaldi-local-workshop.yaml:209` enable observability but do not provide the newly required `observability.log_endpoint`. The changed `ObservabilityConfig` now rejects any enabled configuration without it, so both documented local resident setup configurations fail during `ravn.config.Settings()` validation before the runtime can start. Add the appropriate OTLP/HTTP Loki collector `/v1/logs` endpoint to both configurations and add a regression test that parses every checked-in enabled Ravn setup configuration.
+- `scripts/setups/configs/eitri-local-valkyrie.yaml:208` and `scripts/setups/configs/ivaldi-local-workshop.yaml:209` enable observability but still omit the required `observability.log_endpoint`. `ObservabilityConfig` now requires trace, metric, and log endpoints whenever observability is enabled, so both checked-in resident setup configurations fail validation before their runtime can start. Add each setup's OTLP/HTTP Loki collector `/v1/logs` endpoint and add a regression test that parses every checked-in enabled Ravn setup configuration.
 
 ## Re-check verification
 
-- This is a re-check of the prior review request, not a first pass. The prior request to remove duplicate public `ravn_tool_build_*` emissions is satisfied: `src/ravn/adapters/tool_build/a2a.py` now emits only the backend-local `ravn.tool_build.operations`, while `src/ravn/adapters/tools/build_tool.py` is the single owner of the public count/duration pair. The lifecycle regression test passes.
-- Confirmed the live review ref is `regin` at `052c3b21` and reviewed `git diff 196f7129..HEAD`; `origin/regin` matches HEAD. The delivery contains no target branch or PR to `dev` or `main`.
-- Reproduced the configuration failure directly with `RAVN_CONFIG=<each setup file> uv run python -c 'from ravn.config import Settings; Settings()'`; each raises `Value error, observability requires trace_endpoint, metric_endpoint, and log_endpoint when enabled`.
-- `PATH="$PWD/.local/bin:$PATH" uv run pytest -q -s tests/test_ting/test_a2a_tasks.py tests/test_niuu/test_observability_no_fallback.py tests/test_ravn/test_observability.py tests/test_ravn/test_tool_build_backends.py tests/test_ravn/test_build_tool_verify.py tests/test_ravn/test_config.py tests/test_ting/test_config.py tests/test_charts/test_ting_chart.py tests/test_adapters/test_contributors/test_ravn_flock.py -k 'observability or a2a_otlp_export or commissioned_build_public_metrics'` passed: 30 passed, 452 deselected. Its real in-process OTLP proof observed the same A2A task trace in Tempo, the two metrics, and a trace-correlated log in the Loki receiver.
-- Targeted `uv run ruff check` over all changed source and relevant test files passed, as did `git diff --check`.
+- This is a re-check of the prior review request. The prior request to remove duplicate public `ravn_tool_build_*` emissions remains satisfied: `src/ravn/adapters/tool_build/a2a.py` emits only backend-local diagnostics and `src/ravn/adapters/tools/build_tool.py` owns the public lifecycle count/duration pair.
+- The prior requested configuration follow-up is **not** satisfied. At `regin` commit `b693eaa2`, neither setup file changed from the delivery base, and `RAVN_CONFIG=<each setup file> uv run python -c 'from ravn.config import Settings; Settings()'` reproducibly raises `Value error, observability requires trace_endpoint, metric_endpoint, and log_endpoint when enabled` for both files.
+- Reviewed the committed delivery diff `git diff 4ca7dfab^..b693eaa2` on `regin`; `origin/regin` matched the pre-review HEAD. The direct integration does not target `dev` or `main`.
+- Focused verification passed: `PATH="$PWD/.local/bin:$PATH" uv run pytest -q -s tests/test_ting/test_a2a_tasks.py::TestSendMessage::test_a2a_otlp_export_reaches_tempo_and_loki_receivers tests/test_ravn/test_config.py::TestObservabilityConfig tests/test_ting/test_config.py::TestSettings::test_observability_requires_trace_metric_and_log_endpoints tests/test_skuld/test_config.py::TestSkuldSettings::test_observability_partial_env_keeps_skuld_service_name` — 6 passed. The OTLP proof observed `ting.a2a.SendMessage` at the local Tempo receiver and correlated `a2a_requests_total`, `a2a_request_duration_seconds`, and log data at the local Loki receiver.
+- Targeted `uv run ruff check` over the changed observability source passed, as did `git diff --check 4ca7dfab^..b693eaa2`.
 - Tracker NIU-1119 remains `In Review`.
 
 ## Recommendation
 
-Add the two missing `log_endpoint` values and a configuration-parse regression test, then rerun the focused observability suite and re-request review.
+Add the two missing endpoint values and a parse regression test, rerun the focused observability suite, then re-request review.
