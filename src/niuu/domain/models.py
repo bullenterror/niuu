@@ -312,6 +312,30 @@ class PersonalAccessToken:
 
 
 @dataclass(frozen=True)
+class WorkloadDelegation:
+    """A workload (e.g. a resident's ServiceAccount) allowed to act for one owner.
+
+    The workload exchange admits a caller through a mapping with
+    ``owner_from: delegation`` only while an active record names the caller's
+    verifier and subject: the token then speaks for ``owner_id`` with the workload
+    as its actor (``act.sub``). The verifier, not the issuer, keys the record:
+    several clusters can share one issuer string, but each verifier pins its own
+    cluster's signing keys.
+    """
+
+    id: UUID
+    verifier: str
+    subject: str
+    owner_id: str
+    tenant_id: str
+    created_by: str
+    created_at: datetime
+    name: str = ""
+    resident_id: str = ""
+    revoked_at: datetime | None = None
+
+
+@dataclass(frozen=True)
 class Realm:
     """A Valkyrie's domain — the governance root for its build capability.
 

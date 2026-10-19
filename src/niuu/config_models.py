@@ -318,6 +318,15 @@ class WorkloadIdentityMappingConfig(BaseModel):
             "configured pattern is rejected, not passed through unstripped."
         ),
     )
+    owner_from: str = Field(
+        default="",
+        description=(
+            "Where the owner comes from. Empty: owner_id or owner_id_claim. 'delegation': "
+            "the caller is admitted only while an active workload delegation names its "
+            "verifier and subject, and its token speaks for that record's owner and tenant "
+            "with the workload as actor (owner_id, owner_id_claim and tenant_id are unused)."
+        ),
+    )
     tenant_id: str = Field(default="default", description="Tenant/org id for isolation.")
     email: str = Field(default="", description="Optional owner/workload email claim.")
     roles: list[str] = Field(

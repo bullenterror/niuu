@@ -20,13 +20,14 @@ from cryptography.hazmat.primitives.serialization import (
     load_pem_private_key,
 )
 
-from niuu.domain.models import Principal
+from niuu.domain.models import Principal, WorkloadDelegation
 from niuu.domain.services.token_scope import (
     VALKYRIE_BUILD_SCOPES,
     VALKYRIE_BUILD_TOKEN_USE,
     bound_workload_scopes,
 )
 from niuu.ports.owner_tenant_resolver import OwnerTenantResolverPort
+from niuu.ports.workload_delegations import WorkloadDelegationRepository
 from niuu.ports.workload_identity import (
     IssuedWorkloadToken,
     WorkloadIdentityVerifier,
@@ -81,6 +82,9 @@ def _claim(claims: dict[str, Any], path: str) -> Any:
     return current
 
 
+#: ``owner_from`` value: the caller acts for the owner its delegation record names.
+OWNER_FROM_DELEGATION = "delegation"
+
 #: Characters a ``subject_prefix`` must end on, so it names a whole segment of the
 #: subject: "...:resident-" admits "...:resident-<id>", while a bare "...:muninn" would
 #: also admit "...:muninn-anything" (a different ServiceAccount).
@@ -105,7 +109,14 @@ def _mapping_problem(mapping: Any) -> str:
             f"Workload identity mapping {name!r} subject_prefix {subject_prefix!r} must end "
             f"on one of {' '.join(_PREFIX_SEPARATORS)} (use subject for one exact identity)"
         )
+    owner_from = str(getattr(mapping, "owner_from", "") or "").strip()
+    if owner_from and owner_from != OWNER_FROM_DELEGATION:
+        return f"Workload identity mapping {name!r} has unknown owner_from {owner_from!r}"
     return ""
+
+
+def _owner_from(mapping: Any) -> str:
+    return str(getattr(mapping, "owner_from", "") or "").strip()
 
 
 def _specificity(mapping: Any) -> tuple[int, int]:
@@ -125,6 +136,7 @@ class WorkloadIdentityService(WorkloadTokenIssuer):
         signing_key_pem: str = "",
         verifiers: dict[str, WorkloadIdentityVerifier] | None = None,
         tenant_resolver: OwnerTenantResolverPort | None = None,
+        delegations: WorkloadDelegationRepository | None = None,
     ) -> None:
         self._config = config
         configured_pem = signing_key_pem or str(getattr(config, "signing_key_pem", "") or "")
@@ -132,6 +144,7 @@ class WorkloadIdentityService(WorkloadTokenIssuer):
         self._private_key = self._load_or_generate_key(configured_pem)
         self._verifiers = dict(verifiers or {})
         self._tenant_resolver = tenant_resolver
+        self._delegations = delegations
 
     @property
     def enabled(self) -> bool:
@@ -187,7 +200,9 @@ class WorkloadIdentityService(WorkloadTokenIssuer):
         last_error: Exception | None = None
         # Each verifier checks the proof once; several mappings usually share one.
         verified: dict[str, dict[str, Any] | Exception] = {}
-        candidates: list[tuple[tuple[int, int], Any, dict[str, Any]]] = []
+        candidates: list[
+            tuple[tuple[int, int], Any, dict[str, Any], WorkloadDelegation | None]
+        ] = []
         for mapping in getattr(self._config, "mappings", []) or []:
             problem = _mapping_problem(mapping)
             if problem:
@@ -207,12 +222,23 @@ class WorkloadIdentityService(WorkloadTokenIssuer):
             if isinstance(claims, Exception):
                 last_error = claims
                 continue
-            if self._matches(mapping, claims):
-                candidates.append((_specificity(mapping), mapping, claims))
+            if not self._matches(mapping, claims):
+                continue
+            delegation = None
+            if _owner_from(mapping) == OWNER_FROM_DELEGATION:
+                # Admit only a workload some owner has delegated to: without an
+                # active record this mapping does not apply to the caller at all.
+                delegation = await self._active_delegation(verifier_name, claims)
+                if delegation is None:
+                    last_error = WorkloadIdentityError(
+                        f"No active delegation for {claims.get('sub')!r} on {verifier_name!r}"
+                    )
+                    continue
+            candidates.append((_specificity(mapping), mapping, claims, delegation))
 
         if candidates:
             candidates.sort(key=lambda candidate: candidate[0], reverse=True)
-            best, mapping, claims = candidates[0]
+            best, mapping, claims, delegation = candidates[0]
             tied = [str(getattr(c[1], "name", "") or "?") for c in candidates if c[0] == best]
             if len(tied) > 1:
                 raise WorkloadIdentityError(
@@ -224,10 +250,35 @@ class WorkloadIdentityService(WorkloadTokenIssuer):
                 claims,
                 audiences=self._resolve_audiences(audiences),
                 build_scopes=build_scopes,
+                delegation=delegation,
             )
 
         detail = f": {last_error}" if last_error else ""
         raise WorkloadIdentityError(f"No workload identity mapping matched{detail}")
+
+    async def _active_delegation(
+        self, verifier_name: str, claims: dict[str, Any]
+    ) -> WorkloadDelegation | None:
+        subject = str(claims.get("sub") or "")
+        if self._delegations is None or not subject:
+            return None
+        return await self._delegations.get_active(verifier_name, subject)
+
+    def delegation_mapping_for(self, verifier: str, subject: str) -> str | None:
+        """The ``owner_from: delegation`` mapping that would admit this workload, if any.
+
+        Lets the delegation API refuse a record no mapping could ever use.
+        """
+        for mapping in getattr(self._config, "mappings", []) or []:
+            if _mapping_problem(mapping) or _owner_from(mapping) != OWNER_FROM_DELEGATION:
+                continue
+            if str(getattr(mapping, "verifier", "kubernetes")) != verifier:
+                continue
+            exact = str(getattr(mapping, "subject", "") or "").strip()
+            prefix = str(getattr(mapping, "subject_prefix", "") or "").strip()
+            if (exact and subject == exact) or (prefix and subject.startswith(prefix)):
+                return str(getattr(mapping, "name", "") or "?")
+        return None
 
     def _resolve_audiences(self, requested: list[str] | None) -> list[str]:
         allowed = [str(aud) for aud in (getattr(self._config, "audiences", []) or ["volundr-api"])]
@@ -360,12 +411,21 @@ class WorkloadIdentityService(WorkloadTokenIssuer):
         *,
         audiences: list[str],
         build_scopes: list[str] | None = None,
+        delegation: WorkloadDelegation | None = None,
     ) -> WorkloadExchangeResult:
-        owner_id = self._resolve_owner_id(mapping, claims)
-        tenant_id = await self._resolve_tenant_id(mapping, owner_id)
+        if delegation is not None:
+            owner_id = delegation.owner_id
+            tenant_id = delegation.tenant_id or "default"
+        else:
+            owner_id = self._resolve_owner_id(mapping, claims)
+            tenant_id = await self._resolve_tenant_id(mapping, owner_id)
         roles = [str(role) for role in (getattr(mapping, "roles", []) or ["volundr:developer"])]
         workload_subject = str(claims.get("sub") or "")
-        workload_name = str(getattr(mapping, "name", "") or workload_subject)
+        workload_name = str(
+            (delegation.name if delegation else "")
+            or getattr(mapping, "name", "")
+            or workload_subject
+        )
         email = str(getattr(mapping, "email", "") or "")
         principal = Principal(
             user_id=owner_id,
@@ -402,6 +462,11 @@ class WorkloadIdentityService(WorkloadTokenIssuer):
                 **({"scopes": list(build_scopes)} if build_scopes else {}),
                 "issuer": str(claims.get("iss") or ""),
                 "owner_scoped": owner_scoped,
+                **(
+                    {"delegation_id": str(delegation.id), "resident_id": delegation.resident_id}
+                    if delegation is not None
+                    else {}
+                ),
             },
         )
         return WorkloadExchangeResult(
