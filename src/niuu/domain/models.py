@@ -18,6 +18,10 @@ class Principal:
     ``token_use``, ``scopes`` and ``bound_session_id`` are set only for a scoped
     credential (e.g. a Forge ``forge_session`` token): what it may do and the one
     session it is bound to. Human and PAT principals leave them empty.
+
+    ``actor`` names the workload acting on behalf of ``user_id`` (the RFC 8693
+    ``act.sub`` of an exchanged workload token, e.g. a resident's ServiceAccount);
+    empty when the caller speaks for itself. It is attribution only: it grants nothing.
     """
 
     user_id: str
@@ -27,6 +31,7 @@ class Principal:
     token_use: str = ""
     scopes: tuple[str, ...] = ()
     bound_session_id: str | None = None
+    actor: str = ""
 
 
 class IntegrationType(StrEnum):
