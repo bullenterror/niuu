@@ -1300,7 +1300,7 @@ def test_a_delegated_caller_deploying_a_resident_records_nothing() -> None:
     record = respx.post(_DELEGATIONS)
     token = jwt.encode(
         {"sub": "user-a", "act": {"sub": "system:serviceaccount:nats:regin"}},
-        "unused-secret",
+        "test-only-hmac-key-at-least-32-bytes-long",
         algorithm="HS256",
     )
 
