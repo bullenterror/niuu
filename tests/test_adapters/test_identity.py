@@ -167,7 +167,7 @@ def _actor_app():
 def _bearer(claims: dict) -> str:
     import jwt
 
-    return jwt.encode(claims, "unused-secret", algorithm="HS256")
+    return jwt.encode(claims, "test-only-hmac-key-at-least-32-bytes-long", algorithm="HS256")
 
 
 def test_principal_names_the_workload_acting_for_the_caller():

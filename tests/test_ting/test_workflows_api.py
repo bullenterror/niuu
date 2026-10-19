@@ -1518,7 +1518,7 @@ class TestWorkflowCatalogAPI:
         )
         token = jwt.encode(
             {"sub": "user-1", "act": {"sub": "system:serviceaccount:skuld:resident-ravn"}},
-            "unused-secret",
+            "test-only-hmac-key-at-least-32-bytes-long",
             algorithm="HS256",
         )
 
