@@ -13,7 +13,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from niuu.domain.models import Principal, WorkloadDelegation
@@ -99,12 +99,16 @@ def create_workload_delegations_router(
 
     @router.get("/workload/delegations", response_model=list[WorkloadDelegationResponse])
     async def list_delegations(
-        request: Request, principal: Principal = Depends(owner_principal)
+        request: Request,
+        principal: Principal = Depends(owner_principal),
+        resident_id: str | None = Query(default=None, alias="residentId"),
     ) -> list[WorkloadDelegationResponse]:
         records = await repository(request).list(
             tenant_id=principal.tenant_id,
             owner_id=None if is_admin(principal) else principal.user_id,
         )
+        if resident_id:
+            records = [record for record in records if record.resident_id == resident_id]
         return [WorkloadDelegationResponse.of(record) for record in records]
 
     @router.post(
