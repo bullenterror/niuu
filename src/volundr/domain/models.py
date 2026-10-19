@@ -456,6 +456,13 @@ class Session(BaseModel):
         default=None,
         description="User ID of the session owner (IDP sub claim)",
     )
+    actor_id: str | None = Field(
+        default=None,
+        description=(
+            "Workload that created the session on the owner's behalf (an exchanged "
+            "token's act.sub, e.g. a resident's ServiceAccount); None when the owner did"
+        ),
+    )
     tenant_id: str | None = Field(
         default=None,
         description="Tenant ID for multi-tenant isolation",
