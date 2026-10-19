@@ -26,7 +26,7 @@ selector resolution, and provenance.
 
 ## Verification
 
-- Passed: `uv run pytest -q --no-cov tests/test_ravn/test_tool_build_backends.py` — **120 passed** (Ting A2A task and Ravn backend suites; one pre-existing Starlette/httpx deprecation warning).
+- Passed: `uv run pytest -q --no-cov tests/test_ravn/test_tool_build_backends.py` — **57 passed** (Ravn backend suite; one pre-existing Starlette/httpx deprecation warning).
 - Passed: `uv run ruff check tests/integration/volundr/test_a2a_workflow_task_lifecycle.py src/ravn/adapters/tool_build/a2a.py`.
 - Passed: `uv run ruff format --check tests/integration/volundr/test_a2a_workflow_task_lifecycle.py src/ravn/adapters/tool_build/a2a.py`.
 - Passed: `git diff --check`.
