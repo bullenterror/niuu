@@ -2621,6 +2621,16 @@ class Settings(BaseSettings):
             "handshake that fetches a pinned instance's live certificate."
         ),
     )
+    guild_workload_delegation_url: str = Field(
+        default="",
+        description=(
+            "Platform URL serving /api/v1/tokens/workload/delegations (niuu-shared, e.g. "
+            "https://yggdrasil.niuu.world). When set, the Guild records the delegation that "
+            "lets a resident's own ServiceAccount act for the person deploying it, and "
+            "revokes it when the resident is deleted, for instances whose config names a "
+            "workload_verifier. Empty: no delegation is recorded."
+        ),
+    )
     guild_owner_probe_timeout_seconds: float = Field(
         default=15.0,
         gt=0,

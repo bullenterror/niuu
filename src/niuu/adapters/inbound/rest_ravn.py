@@ -66,6 +66,7 @@ from niuu.adapters.outbound.guild_transport import (
     build_guild_httpx_client,
     resolve_guild_ws_ssl,
 )
+from niuu.adapters.outbound.http_workload_delegations import HttpResidentDelegationRegistrar
 from niuu.domain.models import Principal, RegisteredInstance
 from niuu.domain.services.instances import InstanceService
 from niuu.session_proxy import (
@@ -424,8 +425,14 @@ def create_ravn_router(
     service: InstanceService,
     *,
     embedded_forge_app: ASGIApp | None = None,
+    delegations: HttpResidentDelegationRegistrar | None = None,
 ) -> APIRouter:
-    """Create a registry-aware aggregate router for the ravn read endpoints."""
+    """Create a registry-aware aggregate router for the ravn read endpoints.
+
+    With ``delegations``, deploying a resident also records the workload delegation
+    that lets its own ServiceAccount act for the deploying owner, and deleting it
+    revokes that record (``workload_delegation`` in the deploy response says which).
+    """
     router = APIRouter(prefix="/api/v1/ravn", tags=["Ravn"])
 
     async def _aggregate_list(
@@ -584,7 +591,14 @@ def create_ravn_router(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail="Unexpected response from target Ravn instance",
             )
-        return _with_instance(payload, instance, rebase_chat_endpoint=False)
+        result = _with_instance(payload, instance, rebase_chat_endpoint=False)
+        if delegations is not None and not principal.actor:
+            result["workload_delegation"] = await delegations.record(
+                authorization=request.headers.get("authorization", ""),
+                instance=instance,
+                resident=payload,
+            )
+        return result
 
     @router.get("/sessions")
     async def list_ravn_sessions(
@@ -818,6 +832,13 @@ def create_ravn_router(
             timeout=_RESIDENT_COMMAND_TIMEOUT_SECONDS,
         )
         _ensure_remote_success(response)
+        if delegations is not None and not principal.actor:
+            # A deleted resident's ServiceAccount must not keep acting for its owner.
+            await delegations.revoke(
+                authorization=request.headers.get("authorization", ""),
+                instance=instance,
+                resident_id=ravn_id,
+            )
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @router.get("/sessions/{session_id}")
