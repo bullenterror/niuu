@@ -977,6 +977,10 @@ class SessionResponse(BaseModel):
         default=None,
         description="User ID of the session owner",
     )
+    actor_id: str | None = Field(
+        default=None,
+        description="Workload that created the session on the owner's behalf, if any",
+    )
     tenant_id: str | None = Field(
         default=None,
         description="Tenant ID for multi-tenant isolation",
@@ -1124,6 +1128,7 @@ class SessionResponse(BaseModel):
             launch_spec_id=session.launch_spec_id,
             archived_at=(session.archived_at.isoformat() if session.archived_at else None),
             owner_id=session.owner_id,
+            actor_id=session.actor_id,
             tenant_id=session.tenant_id,
             activity_state=(session.activity_state.value if session.activity_state else None),
             activity_state_since=(

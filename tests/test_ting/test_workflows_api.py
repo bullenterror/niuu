@@ -1503,6 +1503,35 @@ class TestWorkflowCatalogAPI:
         assert campaign.workflow_version == "1.0.0"
         assert campaign.workflow_snapshot["workflow_revision"].startswith("sha256:")
         assert campaign.metadata["surface"] == "ting.workflow-launch"
+        assert "actor_id" not in campaign.metadata
+
+    def test_launch_by_a_resident_records_it_as_the_campaign_actor(self) -> None:
+        """A resident's exchanged token launches as its owner and names itself (act.sub)."""
+        import jwt
+
+        workflow = _make_research_workflow()
+        campaign_repo = RecordingCampaignRepository()
+        client = _make_client(
+            InMemoryWorkflowRepository([workflow]),
+            volundr_factory=RecordingVolundrFactory([RecordingVolundrPort()]),
+            campaign_repo=campaign_repo,
+        )
+        token = jwt.encode(
+            {"sub": "user-1", "act": {"sub": "system:serviceaccount:skuld:resident-ravn"}},
+            "test-only-hmac-key-at-least-32-bytes-long",
+            algorithm="HS256",
+        )
+
+        response = client.post(
+            f"/api/v1/ting/workflows/{workflow.id}/launch",
+            headers={**_headers(roles="ting:admin"), "Authorization": f"Bearer {token}"},
+            json={"prompt": "Research the question.", "sessionName": "resident-launch"},
+        )
+
+        assert response.status_code == 201, response.text
+        [campaign] = campaign_repo.items.values()
+        assert campaign.owner_id == "user-1"
+        assert campaign.metadata["actor_id"] == "system:serviceaccount:skuld:resident-ravn"
 
     def _launch_claude_workflow_executor(self, settings: Settings) -> dict:
         workflow = _make_research_workflow()

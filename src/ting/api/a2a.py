@@ -345,6 +345,8 @@ class WorkflowTaskHandler(RequestHandler):
                 _WORKFLOW_SLUG_KEY: _slugify(_optional_str(metadata, "sessionName") or prompt),
                 **({"repo": str(metadata["repo"])} if metadata.get("repo") else {}),
                 **({"branch": str(metadata["branch"])} if metadata.get("branch") else {}),
+                # The workload that sent this task for its owner (attribution only).
+                **({"actor_id": self._principal.actor} if self._principal.actor else {}),
             },
             created_at=now,
             updated_at=now,
@@ -486,6 +488,7 @@ class WorkflowTaskHandler(RequestHandler):
                 # artifact is the branch the session pushes, not a Mimir page.
                 **({"repo": launch.repo} if launch.repo else {}),
                 **({"branch": launch.branch} if launch.branch else {}),
+                **({"actor_id": self._principal.actor} if self._principal.actor else {}),
             },
             created_at=now,
             updated_at=now,

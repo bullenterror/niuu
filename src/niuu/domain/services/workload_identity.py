@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import logging
 import re
 import time
 from dataclasses import dataclass
@@ -32,6 +33,8 @@ from niuu.ports.workload_identity import (
     WorkloadTokenIssuer,
     WorkloadTokenVerificationError,
 )
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_ISSUER = "niuu-workload"
 #: Claims every token this service mints carries; verification requires them.
@@ -377,6 +380,17 @@ class WorkloadIdentityService(WorkloadTokenIssuer):
         # workload_owner_scoped on the issued token rather than silently
         # trusting a possibly-shared owner_id.
         owner_scoped = bool(str(getattr(mapping, "owner_id_claim", "") or "").strip())
+        # The exchange is the one place that knows which workload a token speaks for:
+        # record it, so a request made "as" the owner can be traced to its actor.
+        logger.info(
+            "Workload exchange: mapping=%s workload=%s owner=%s tenant=%s roles=%s audiences=%s",
+            workload_name,
+            workload_subject,
+            owner_id,
+            tenant_id,
+            ",".join(roles),
+            ",".join(audiences),
+        )
         issued = self.issue_token(
             principal=principal,
             workload_subject=workload_subject,
@@ -441,6 +455,10 @@ class WorkloadIdentityService(WorkloadTokenIssuer):
             "workload_name": workload_name,
             "resource_access": resource_access,
         }
+        # RFC 8693 actor claim: the workload acting on behalf of ``sub``. Absent when the
+        # token speaks for its subject directly (the subject is its own actor).
+        if workload_subject and workload_subject != principal.user_id:
+            payload["act"] = {"sub": workload_subject}
         extra_claims = dict(claims or {})
         workload_issuer = str(extra_claims.pop("issuer", ""))
         payload["workload_issuer"] = workload_issuer

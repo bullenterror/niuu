@@ -126,6 +126,7 @@ async def test_workload_identity_exchange_mints_owner_scoped_token() -> None:
     assert claims["sub"] == OWNER_ID
     assert claims["tenant_id"] == "default"
     assert claims["workload_sub"] == WORKLOAD_SUBJECT
+    assert claims["act"] == {"sub": WORKLOAD_SUBJECT}
     assert claims["workload_cluster"] == "ymir"
     assert claims["resource_access"]["volundr"]["roles"] == ["admin", "volundr:developer"]
     assert result.principal.user_id == OWNER_ID
@@ -1113,3 +1114,33 @@ async def test_prefix_must_end_on_a_separator() -> None:
 
     with pytest.raises(WorkloadIdentityError, match="must end on one of"):
         await service.exchange(_workload_token(proof_key))
+
+
+def test_token_that_speaks_for_its_own_subject_carries_no_actor() -> None:
+    """``act`` names a different party acting for ``sub``; a self-issued token has none."""
+    proof_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    service = _service(proof_key)
+
+    issued = service.issue_token(
+        principal=Principal(user_id="node-owner", email="", tenant_id="default", roles=[]),
+        workload_subject="node-owner",
+        workload_name="guild-node-pairing",
+        audiences=["guild"],
+    )
+
+    assert "act" not in service.verify_token(issued.token)
+
+
+@pytest.mark.asyncio
+async def test_exchange_logs_which_workload_it_spoke_for(caplog: pytest.LogCaptureFixture) -> None:
+    proof_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    service = _service(proof_key)
+
+    with caplog.at_level("INFO", logger="niuu.domain.services.workload_identity"):
+        result = await service.exchange(_workload_token(proof_key))
+
+    line = next(r.getMessage() for r in caplog.records if "Workload exchange" in r.getMessage())
+    assert "mapping=ravn-valkyrie" in line
+    assert f"workload={WORKLOAD_SUBJECT}" in line
+    assert f"owner={OWNER_ID}" in line
+    assert result.token not in line

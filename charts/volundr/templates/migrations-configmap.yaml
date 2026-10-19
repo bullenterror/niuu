@@ -2293,6 +2293,15 @@ data:
         ON forge_notification_reads (notification_id);
   000086_forge_notification_reads.down.sql: |
     DROP TABLE IF EXISTS forge_notification_reads;
+  000087_session_actor.up.sql: |
+    -- The workload that created a session on its owner's behalf (an exchanged token's act.sub).
+    ALTER TABLE sessions ADD COLUMN IF NOT EXISTS actor_id TEXT;
+    CREATE INDEX IF NOT EXISTS idx_sessions_owner_actor
+        ON sessions (owner_id, actor_id)
+        WHERE actor_id IS NOT NULL;
+  000087_session_actor.down.sql: |
+    DROP INDEX IF EXISTS idx_sessions_owner_actor;
+    ALTER TABLE sessions DROP COLUMN IF EXISTS actor_id;
   lineage-aliases.json: |
     {
       "000050_session_definition.up.sql": [

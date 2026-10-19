@@ -531,6 +531,8 @@ def create_workflows_router() -> APIRouter:
                     execution.workflow.document_revision
                     or workflow_document_revision(execution.workflow)
                 ),
+                # The workload that launched this for its owner (attribution only).
+                **({"actor_id": principal.actor} if principal.actor else {}),
             },
             created_at=now,
             updated_at=now,
