@@ -20,16 +20,20 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from identity.adapters.authorization import AllowAllAuthorizationAdapter
+from ravn.adapters.tool_build.a2a import A2AToolBuildBackend
+from ravn.adapters.tool_build.http import HttpxJsonClient
+from ravn.ports.tool_build_backend import ToolBuildError, ToolBuildRequest
 from tests.integration.helpers.sse import start_server
 from ting.adapters.postgres_a2a_launches import PostgresA2ALaunchReservationRepository
 from ting.adapters.postgres_workflow_campaigns import PostgresWorkflowCampaignRepository
 from ting.adapters.postgres_workflows import PostgresWorkflowRepository
 from ting.adapters.volundr_factory import LocalVolundrAdapterFactory
 from ting.api.a2a import create_a2a_router, resolve_a2a_launch_repo
+from ting.api.a2a_card import create_agent_card_router
 from ting.api.dispatch import resolve_volundr_factory
 from ting.api.research import resolve_workflow_campaign_repo
 from ting.api.workflows import resolve_workflow_repo
-from ting.config import AuthConfig, Settings
+from ting.config import A2AConfig, AuthConfig, Settings
 from ting.domain.models import WorkflowDefinition, WorkflowScope
 from volundr.adapters.outbound.postgres import PostgresSessionRepository
 from volundr.domain.models import SessionStatus
@@ -193,4 +197,80 @@ async def test_a2a_task_lifecycle_uses_postgres_and_volundr_http(
         assert session is not None
         assert session.status is SessionStatus.STOPPED
     finally:
+        await _stop_server(volundr_server)
+
+
+async def test_ravn_a2a_tool_build_backend_commissions_real_workflow_task(
+    txn_pool,
+    volundr_app: FastAPI,
+) -> None:
+    """The concrete Ravn client launches a persisted Ting A2A build task.
+
+    The backend crosses real loopback HTTP to Ting's card and JSON-RPC
+    endpoints.  Ting then persists the campaign and launches its session over
+    its normal HTTP adapter to Volundr.  The workflow deliberately stays
+    active, so the backend's bounded polling fails loudly rather than
+    inventing a completed artifact.
+    """
+
+    @volundr_app.get("/api/v1/integrations")
+    async def integrations() -> list[dict[str, str]]:
+        return []
+
+    volundr_server, volundr_url = await start_server(volundr_app)
+    workflow_repo = PostgresWorkflowRepository(txn_pool)
+    campaign_repo = PostgresWorkflowCampaignRepository(txn_pool)
+    launch_repo = PostgresA2ALaunchReservationRepository(txn_pool)
+    workflow = await workflow_repo.save_workflow(_workflow())
+
+    ting_app = FastAPI()
+    ting_app.state.authorization = AllowAllAuthorizationAdapter()
+    ting_app.state.settings = Settings(
+        auth=AuthConfig(
+            allow_anonymous_dev=True,
+            default_user_id="a2a-tool-build-client",
+        ),
+        a2a=A2AConfig(),
+    )
+    ting_app.include_router(create_a2a_router())
+    ting_app.include_router(create_agent_card_router(ting_app.state.settings.a2a))
+    ting_app.dependency_overrides[resolve_workflow_repo] = lambda: workflow_repo
+    ting_app.dependency_overrides[resolve_workflow_campaign_repo] = lambda: campaign_repo
+    ting_app.dependency_overrides[resolve_a2a_launch_repo] = lambda: launch_repo
+    ting_app.dependency_overrides[resolve_volundr_factory] = lambda: LocalVolundrAdapterFactory(
+        volundr_url
+    )
+    ting_server, ting_url = await start_server(ting_app)
+
+    backend = A2AToolBuildBackend(
+        card_url=f"{ting_url}/.well-known/agent-card.json",
+        workflow_id=str(workflow.id),
+        client=HttpxJsonClient(allowed_origins=[ting_url]),
+        max_poll_attempts=1,
+        poll_interval_seconds=0,
+    )
+    request = ToolBuildRequest(
+        name="integration_tool",
+        description="Exercise the A2A tool-build client.",
+        build_request="Build an integration tool.",
+        input_schema={"type": "object"},
+        required_permission="mimir:read",
+        operation_id="a2a-tool-build-integration",
+    )
+
+    try:
+        with pytest.raises(ToolBuildError, match="did not finish within 1 polls"):
+            await backend.build(request)
+
+        campaigns = await campaign_repo.list_campaigns(owner_id="a2a-tool-build-client")
+        assert len(campaigns) == 1
+        campaign = campaigns[0]
+        assert campaign.workflow_id == workflow.id
+        assert campaign.metadata["surface"] == "a2a"
+        assert campaign.metadata["prompt"]
+        session = await PostgresSessionRepository(txn_pool).get(UUID(campaign.session_id))
+        assert session is not None
+        assert session.status is not SessionStatus.STOPPED
+    finally:
+        await _stop_server(ting_server)
         await _stop_server(volundr_server)
