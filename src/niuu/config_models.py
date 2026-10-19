@@ -276,9 +276,16 @@ class WorkloadIdentityMappingConfig(BaseModel):
     subject: str = Field(default="", description="Exact subject claim to match.")
     subject_prefix: str = Field(
         default="",
-        description="Subject claim prefix to match for dynamic workload identities.",
+        description=(
+            "Subject claim prefix to match for dynamic workload identities. It must end on a "
+            "separator (: - / . _ @) so it names whole segments; an exact subject outranks "
+            "any prefix, and a longer prefix outranks a shorter one."
+        ),
     )
-    issuer: str = Field(default="", description="Optional exact issuer claim to match.")
+    issuer: str = Field(
+        default="",
+        description="Exact issuer claim to match. Required: a mapping without one admits no one.",
+    )
     claims: dict[str, Any] = Field(
         default_factory=dict,
         description="Additional exact-match claim selectors. Dot notation is supported.",

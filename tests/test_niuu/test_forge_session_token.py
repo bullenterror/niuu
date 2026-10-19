@@ -243,7 +243,15 @@ class TestWorkloadIssuerAdditions:
             enabled=True,
             issuer="",
             audiences=["volundr-api"],
-            mappings=[SimpleNamespace(verifier="kubernetes", owner_id="owner-1", name="b")],
+            mappings=[
+                SimpleNamespace(
+                    verifier="kubernetes",
+                    subject="system:serviceaccount:ns:builder",
+                    issuer="k8s",
+                    owner_id="owner-1",
+                    name="b",
+                )
+            ],
         )
         service = WorkloadIdentityService(config, verifiers={"kubernetes": Verifier()})
         result = await service.exchange(

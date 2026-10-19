@@ -78,6 +78,40 @@ def _claim(claims: dict[str, Any], path: str) -> Any:
     return current
 
 
+#: Characters a ``subject_prefix`` must end on, so it names a whole segment of the
+#: subject: "...:resident-" admits "...:resident-<id>", while a bare "...:muninn" would
+#: also admit "...:muninn-anything" (a different ServiceAccount).
+_PREFIX_SEPARATORS = (":", "-", "/", ".", "_", "@")
+
+
+def _mapping_problem(mapping: Any) -> str:
+    """Why a mapping can never admit a caller, or '' when it is well formed.
+
+    A malformed mapping is skipped (fail closed) rather than matched loosely: the
+    exchange can only be as narrow as its loosest mapping.
+    """
+    name = str(getattr(mapping, "name", "") or "?")
+    subject = str(getattr(mapping, "subject", "") or "").strip()
+    subject_prefix = str(getattr(mapping, "subject_prefix", "") or "").strip()
+    if not str(getattr(mapping, "issuer", "") or "").strip():
+        return f"Workload identity mapping {name!r} has no issuer"
+    if not subject and not subject_prefix:
+        return f"Workload identity mapping {name!r} names neither subject nor subject_prefix"
+    if subject_prefix and not subject_prefix.endswith(_PREFIX_SEPARATORS):
+        return (
+            f"Workload identity mapping {name!r} subject_prefix {subject_prefix!r} must end "
+            f"on one of {' '.join(_PREFIX_SEPARATORS)} (use subject for one exact identity)"
+        )
+    return ""
+
+
+def _specificity(mapping: Any) -> tuple[int, int]:
+    """Rank a matching mapping: an exact subject beats any prefix, a longer prefix a shorter."""
+    if str(getattr(mapping, "subject", "") or "").strip():
+        return (2, 0)
+    return (1, len(str(getattr(mapping, "subject_prefix", "") or "").strip()))
+
+
 class WorkloadIdentityService(WorkloadTokenIssuer):
     """Validate workload proofs and mint short-lived Volundr JWTs."""
 
@@ -148,24 +182,46 @@ class WorkloadIdentityService(WorkloadTokenIssuer):
 
         build_scopes = bound_workload_scopes(scopes, allowed=VALKYRIE_BUILD_SCOPES)
         last_error: Exception | None = None
+        # Each verifier checks the proof once; several mappings usually share one.
+        verified: dict[str, dict[str, Any] | Exception] = {}
+        candidates: list[tuple[tuple[int, int], Any, dict[str, Any]]] = []
         for mapping in getattr(self._config, "mappings", []) or []:
+            problem = _mapping_problem(mapping)
+            if problem:
+                last_error = WorkloadIdentityError(problem)
+                continue
             verifier_name = getattr(mapping, "verifier", "kubernetes")
             verifier = self._verifiers.get(verifier_name)
             if verifier is None:
                 last_error = WorkloadIdentityError(f"Verifier not configured: {verifier_name}")
                 continue
-            try:
-                claims = await verifier.verify(token)
-            except Exception as exc:
-                last_error = exc
+            if verifier_name not in verified:
+                try:
+                    verified[verifier_name] = await verifier.verify(token)
+                except Exception as exc:
+                    verified[verifier_name] = exc
+            claims = verified[verifier_name]
+            if isinstance(claims, Exception):
+                last_error = claims
                 continue
             if self._matches(mapping, claims):
-                return await self._issue(
-                    mapping,
-                    claims,
-                    audiences=self._resolve_audiences(audiences),
-                    build_scopes=build_scopes,
+                candidates.append((_specificity(mapping), mapping, claims))
+
+        if candidates:
+            candidates.sort(key=lambda candidate: candidate[0], reverse=True)
+            best, mapping, claims = candidates[0]
+            tied = [str(getattr(c[1], "name", "") or "?") for c in candidates if c[0] == best]
+            if len(tied) > 1:
+                raise WorkloadIdentityError(
+                    "Workload proof matches several equally specific identity mappings: "
+                    + ", ".join(tied)
                 )
+            return await self._issue(
+                mapping,
+                claims,
+                audiences=self._resolve_audiences(audiences),
+                build_scopes=build_scopes,
+            )
 
         detail = f": {last_error}" if last_error else ""
         raise WorkloadIdentityError(f"No workload identity mapping matched{detail}")
