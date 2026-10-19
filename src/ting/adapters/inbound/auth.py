@@ -73,9 +73,12 @@ async def extract_principal(request: Request) -> Principal:
             tenant_id=settings.auth.default_tenant_id if settings else "",
             roles=["volundr:developer"],
         )
+    from identity.adapters.http_auth import presented_actor
+
     return Principal(
         user_id=user_id,
         email=request.headers.get("x-auth-email", ""),
         tenant_id=request.headers.get("x-auth-tenant", ""),
         roles=parse_roles_header(request.headers.get("x-auth-roles", "")),
+        actor=presented_actor(request),
     )

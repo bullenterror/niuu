@@ -624,6 +624,45 @@ class TestSendMessage:
         assert campaign.metadata["a2a_message_id"] == "msg-1"
         assert campaign.metadata["a2a_workflow_slug"] == "build-the-widget-tool"
 
+    def test_campaign_names_the_workload_that_sent_the_task(self) -> None:
+        """A resident's exchanged token (act.sub) is recorded on the campaign it launches."""
+        workflow = _make_workflow()
+        client, campaigns, _ = _make_client(
+            workflow_repo=InMemoryWorkflowRepository([workflow]),
+        )
+        token = jwt.encode(
+            {"sub": "user-1", "act": {"sub": "system:serviceaccount:nats:regin"}},
+            "unused-secret",
+            algorithm="HS256",
+        )
+
+        response = _rpc(
+            client, "SendMessage", _send_params(str(workflow.id)), headers=_headers(token=token)
+        )
+
+        import asyncio
+
+        task_id = response.json()["result"]["task"]["id"]
+        campaign = asyncio.run(campaigns.get_campaign_by_slug(task_id))
+        assert campaign is not None
+        assert campaign.owner_id == "user-1"
+        assert campaign.metadata["actor_id"] == "system:serviceaccount:nats:regin"
+
+    def test_campaign_sent_by_its_owner_has_no_actor(self) -> None:
+        workflow = _make_workflow()
+        client, campaigns, _ = _make_client(
+            workflow_repo=InMemoryWorkflowRepository([workflow]),
+        )
+
+        response = _rpc(client, "SendMessage", _send_params(str(workflow.id)))
+
+        import asyncio
+
+        task_id = response.json()["result"]["task"]["id"]
+        campaign = asyncio.run(campaigns.get_campaign_by_slug(task_id))
+        assert campaign is not None
+        assert "actor_id" not in campaign.metadata
+
     def test_reuses_task_when_message_is_retried(self) -> None:
         workflow = _make_workflow()
         client, _, port = _make_client(
