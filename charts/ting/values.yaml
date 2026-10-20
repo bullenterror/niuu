@@ -419,6 +419,9 @@ envoy:
       - /api/v1/tokens/workload/jwks
       - /health
       - /api/v1/ting/health
+      # Agent Cards are a discovery document: external A2A clients resolve it
+      # before they have any platform credential.
+      - /.well-known/agent-card.json
     # -- Additional JWT provider for short-lived Niuu workload tokens.
     # When enabled, Envoy accepts either Keycloak user tokens or workload tokens.
     workload:
