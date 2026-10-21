@@ -22,9 +22,16 @@ from niuu.domain.health_paths import DEFAULT_HEALTH_PATHS
 from niuu.ports.identity import HeaderAuthenticationPort, InvalidTokenError
 
 #: Exact paths served without identity: the root and per-service health
-#: checks Guild probes (see DEFAULT_HEALTH_PATHS) and the workload JWKS.
+#: checks Guild probes (see DEFAULT_HEALTH_PATHS), the workload JWKS, and the
+#: A2A Agent Card — a discovery document clients resolve before they hold any
+#: platform credential (Envoy's jwt_authn bypass lists it for the same reason).
 _UNAUTHENTICATED_READ_PATHS = frozenset(
-    {"/health", "/api/v1/tokens/workload/jwks", *DEFAULT_HEALTH_PATHS.values()}
+    {
+        "/health",
+        "/api/v1/tokens/workload/jwks",
+        "/.well-known/agent-card.json",
+        *DEFAULT_HEALTH_PATHS.values(),
+    }
 )
 #: Node-originated Guild endpoints carry no bearer JWT at all — they are
 #: authenticated by an Ed25519 signature over the request instead (see
