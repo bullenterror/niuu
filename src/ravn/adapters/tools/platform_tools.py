@@ -28,7 +28,11 @@ _DEFAULT_TIMEOUT = 30.0
 _DEFAULT_WORKLOAD_TOKEN_FILE = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 _DEFAULT_WORKLOAD_AUDIENCES = ["volundr-api", "forge", "ting", "mimir", "guild"]
 _FORGE_SESSIONS_PATH = "/api/v1/forge/sessions"
+# Session-scoped: a PR is opened from a Forge session, so it goes through the
+# Forge surface, which routes to the instance that owns that session.
 _FORGE_REPOS_PATH = "/api/v1/forge/repos"
+# Repository reads and PR read/merge/CI need no session; the Git host is the
+# source of truth, served by the shared Niuu repos surface.
 _NIUU_REPOS_PATH = "/api/v1/niuu/repos"
 _TRACKER_ISSUES_PATH = "/api/v1/tracker/issues"
 _TING_WORKFLOWS_PATH = "/api/v1/ting/workflows"
@@ -142,6 +146,25 @@ def _ok(data: object) -> ToolResult:
 
 def _err(message: str) -> ToolResult:
     return ToolResult(tool_call_id="", content=message, is_error=True)
+
+
+def _http_failure(exc: Exception) -> str:
+    """Describe a failed call, including the server's own explanation.
+
+    The bare ``raise_for_status`` text names only the status and URL; the
+    server's ``detail`` is what says whether the address, the credentials or
+    the host was wrong, and an agent that cannot see it guesses.
+    """
+    if not isinstance(exc, httpx.HTTPStatusError):
+        return str(exc)
+    try:
+        payload = exc.response.json()
+    except ValueError:
+        return str(exc)
+    detail = payload.get("detail") if isinstance(payload, dict) else None
+    if not detail:
+        return str(exc)
+    return f"{exc} — {detail}"
 
 
 # ---------------------------------------------------------------------------
@@ -465,18 +488,18 @@ class VolundrGitTool(_PlatformAuthMixin, ToolPort):
             resp.raise_for_status()
             return _ok(resp.json())
         except Exception as exc:
-            return _err(f"Failed to list repositories: {exc}")
+            return _err(f"Failed to list repositories: {_http_failure(exc)}")
 
     async def _list_branches(self, client: httpx.AsyncClient, input: dict) -> ToolResult:
         repo_url = input.get("repo_url", "")
         if not repo_url:
             return _err("repo_url is required for list_branches")
         try:
-            resp = await client.get(f"{_FORGE_REPOS_PATH}/branches", params={"repo_url": repo_url})
+            resp = await client.get(f"{_NIUU_REPOS_PATH}/branches", params={"repo_url": repo_url})
             resp.raise_for_status()
             return _ok(resp.json())
         except Exception as exc:
-            return _err(f"Failed to list branches: {exc}")
+            return _err(f"Failed to list branches: {_http_failure(exc)}")
 
     async def _create_pr(self, client: httpx.AsyncClient, input: dict) -> ToolResult:
         session_id = input.get("session_id", "")
@@ -492,7 +515,7 @@ class VolundrGitTool(_PlatformAuthMixin, ToolPort):
             resp.raise_for_status()
             return _ok(resp.json())
         except Exception as exc:
-            return _err(f"Failed to create PR: {exc}")
+            return _err(f"Failed to create PR: {_http_failure(exc)}")
 
     async def _list_prs(self, client: httpx.AsyncClient, input: dict) -> ToolResult:
         repo_url = input.get("repo_url", "")
@@ -502,11 +525,11 @@ class VolundrGitTool(_PlatformAuthMixin, ToolPort):
         if status := input.get("status"):
             params["status"] = status
         try:
-            resp = await client.get(f"{_FORGE_REPOS_PATH}/prs", params=params)
+            resp = await client.get(f"{_NIUU_REPOS_PATH}/prs", params=params)
             resp.raise_for_status()
             return _ok(resp.json())
         except Exception as exc:
-            return _err(f"Failed to list PRs: {exc}")
+            return _err(f"Failed to list PRs: {_http_failure(exc)}")
 
     async def _get_pr(self, client: httpx.AsyncClient, input: dict) -> ToolResult:
         pr_number = input.get("pr_number")
@@ -515,13 +538,13 @@ class VolundrGitTool(_PlatformAuthMixin, ToolPort):
             return _err("pr_number and repo_url are required for get_pr")
         try:
             resp = await client.get(
-                f"{_FORGE_REPOS_PATH}/prs/{pr_number}",
+                f"{_NIUU_REPOS_PATH}/prs/{pr_number}",
                 params={"repo_url": repo_url},
             )
             resp.raise_for_status()
             return _ok(resp.json())
         except Exception as exc:
-            return _err(f"Failed to get PR #{pr_number}: {exc}")
+            return _err(f"Failed to get PR #{pr_number}: {_http_failure(exc)}")
 
     async def _merge_pr(self, client: httpx.AsyncClient, input: dict) -> ToolResult:
         pr_number = input.get("pr_number")
@@ -533,14 +556,14 @@ class VolundrGitTool(_PlatformAuthMixin, ToolPort):
             body["merge_method"] = method
         try:
             resp = await client.post(
-                f"{_FORGE_REPOS_PATH}/prs/{pr_number}/merge",
+                f"{_NIUU_REPOS_PATH}/prs/{pr_number}/merge",
                 params={"repo_url": repo_url},
                 json=body,
             )
             resp.raise_for_status()
             return _ok(resp.json())
         except Exception as exc:
-            return _err(f"Failed to merge PR #{pr_number}: {exc}")
+            return _err(f"Failed to merge PR #{pr_number}: {_http_failure(exc)}")
 
     async def _ci_status(self, client: httpx.AsyncClient, input: dict) -> ToolResult:
         pr_number = input.get("pr_number")
@@ -550,13 +573,13 @@ class VolundrGitTool(_PlatformAuthMixin, ToolPort):
             return _err("pr_number, repo_url, and branch are required for ci_status")
         try:
             resp = await client.get(
-                f"{_FORGE_REPOS_PATH}/prs/{pr_number}/ci",
+                f"{_NIUU_REPOS_PATH}/prs/{pr_number}/ci",
                 params={"repo_url": repo_url, "branch": branch},
             )
             resp.raise_for_status()
             return _ok(resp.json())
         except Exception as exc:
-            return _err(f"Failed to get CI status: {exc}")
+            return _err(f"Failed to get CI status: {_http_failure(exc)}")
 
 
 # ---------------------------------------------------------------------------

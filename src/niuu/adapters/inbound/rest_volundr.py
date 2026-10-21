@@ -723,6 +723,12 @@ async def _find_runtime_owner(
         instances = [await _resolve_target_instance(service, principal, selected)]
     else:
         instances = await _visible_instances(service, principal)
+    if not instances:
+        # With nothing to search, "not found" would be a guess; say why.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No enabled Volundr instances are registered for this user",
+        )
     tasks = [asyncio.create_task(probe(instance)) for instance in instances]
     failure: HTTPException | None = None
     try:
@@ -1900,6 +1906,49 @@ def create_volundr_router(
                 detail="Unexpected response from target Volundr instance",
             )
         return _with_instance(payload, instance)
+
+    @router.post("/repos/prs", status_code=status.HTTP_201_CREATED)
+    async def create_pull_request(
+        request: Request,
+        body: dict[str, Any] = Body(...),
+        principal: Principal = Depends(extract_principal),
+    ) -> dict[str, Any]:
+        """Open a pull request from a session on the Forge that owns it.
+
+        The PR is built from that instance's session branch and chronicle, so
+        only the owning instance can serve it. Reading, merging and CI status
+        of PRs need no session and live at ``/api/v1/niuu/repos/prs``.
+        """
+        raw_session_id = body.get("session_id")
+        try:
+            session_id = str(UUID(str(raw_session_id)))
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=f"create_pr needs the UUID of a Forge session, got {raw_session_id!r}",
+            ) from exc
+        owner, _ = await _find_runtime_owner(
+            service,
+            principal,
+            request,
+            f"/sessions/{session_id}",
+            (
+                f"Session {session_id} is not owned by any Forge instance visible to you; "
+                "create_pr needs the id of an existing session that has a repository"
+            ),
+            embedded_app=embedded_forge_app,
+            local_scope=_local_session_scope(request),
+        )
+        response = await _request_remote(
+            owner,
+            request,
+            method="POST",
+            path="/repos/prs",
+            json_body=_strip_instance_hints(body),
+            embedded_app=embedded_forge_app,
+        )
+        _ensure_remote_success(response)
+        return _with_instance(response.json(), owner, rebase_chat_endpoint=False)
 
     @router.get("/stats")
     async def get_stats(
