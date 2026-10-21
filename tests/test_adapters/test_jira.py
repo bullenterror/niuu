@@ -224,3 +224,62 @@ async def test_direct_issue_reads_hide_issues_outside_label_scope() -> None:
         assert await adapter.get_issue("PROJ-42") is None
     finally:
         await adapter.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_issue_requests_and_renders_the_adf_description() -> None:
+    issue = _issue()
+    issue["fields"]["description"] = {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            {
+                "type": "heading",
+                "attrs": {"level": 2},
+                "content": [{"type": "text", "text": "Acceptance criteria"}],
+            },
+            {
+                "type": "bulletList",
+                "content": [
+                    {
+                        "type": "listItem",
+                        "content": [
+                            {
+                                "type": "paragraph",
+                                "content": [{"type": "text", "text": "Sign-in succeeds"}],
+                            }
+                        ],
+                    }
+                ],
+            },
+        ],
+    }
+    route = respx.get(f"{DIRECT_API}/issue/PROJ-42").mock(
+        return_value=httpx.Response(200, json=issue)
+    )
+    adapter = JiraAdapter(site_url=SITE_URL, email="ada@example.com", api_token="secret")
+    try:
+        result = await adapter.get_issue("PROJ-42")
+    finally:
+        await adapter.close()
+
+    assert result is not None
+    assert result.description == "## Acceptance criteria\n\n- Sign-in succeeds"
+    assert "description" in route.calls.last.request.url.params["fields"].split(",")
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_search_omits_the_description_field() -> None:
+    route = respx.get(f"{DIRECT_API}/search/jql").mock(
+        return_value=httpx.Response(200, json={"issues": [_issue()], "isLast": True})
+    )
+    adapter = JiraAdapter(site_url=SITE_URL, email="ada@example.com", api_token="secret")
+    try:
+        issues = await adapter.search_issues("login")
+    finally:
+        await adapter.close()
+
+    assert issues[0].description is None
+    assert "description" not in route.calls.last.request.url.params["fields"].split(",")

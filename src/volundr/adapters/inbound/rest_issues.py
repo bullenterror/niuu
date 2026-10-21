@@ -27,6 +27,27 @@ class StatusUpdateRequest(BaseModel):
     )
 
 
+def _tracker_failure(connection_id: str, operation: str, exc: Exception) -> HTTPException:
+    """Turn a tracker connection failure into a 502 naming the connection and cause.
+
+    A broken connection must never read as "issue not found" or "no results":
+    the caller gets the connection id and the upstream error instead.
+    """
+    logger.error(
+        "Issue tracker connection %s failed to %s",
+        connection_id,
+        operation,
+        exc_info=exc,
+    )
+    return HTTPException(
+        status_code=status.HTTP_502_BAD_GATEWAY,
+        detail=(
+            f"Issue tracker connection {connection_id} failed to {operation}: "
+            f"{type(exc).__name__}: {exc}"
+        ),
+    )
+
+
 def create_issues_router(
     integration_repo: IntegrationRepository,
     tracker_factory: TrackerFactory,
@@ -91,13 +112,9 @@ def _build_issues_router(
             try:
                 adapter = await tracker_factory.create(conn)
                 issues = await adapter.search_issues(q)
-                results.extend(issues)
-            except Exception:
-                logger.warning(
-                    "Issue search failed for connection %s",
-                    conn.id,
-                    exc_info=True,
-                )
+            except Exception as exc:
+                raise _tracker_failure(conn.id, "search issues", exc) from exc
+            results.extend(issues)
         if deprecated:
             warn_on_legacy_route(
                 request,
@@ -132,14 +149,10 @@ def _build_issues_router(
             try:
                 adapter = await tracker_factory.create(conn)
                 issue = await adapter.get_issue(issue_id)
-                if issue is not None:
-                    return issue
-            except Exception:
-                logger.warning(
-                    "Issue get failed for connection %s",
-                    conn.id,
-                    exc_info=True,
-                )
+            except Exception as exc:
+                raise _tracker_failure(conn.id, f"get issue {issue_id}", exc) from exc
+            if issue is not None:
+                return issue
         if deprecated:
             warn_on_legacy_route(
                 request,
@@ -179,18 +192,19 @@ def _build_issues_router(
         for conn in connections:
             if not conn.enabled:
                 continue
+            # Connections backed by other packages' adapters (e.g. Ting's) are
+            # served by those packages' APIs, not this router.
+            if not conn.adapter.startswith("volundr."):
+                continue
             try:
                 adapter = await tracker_factory.create(conn)
                 issue = await adapter.get_issue(issue_id)
-                if issue is not None:
-                    updated = await adapter.update_issue_status(issue_id, data.status)
-                    return updated
-            except Exception:
-                logger.warning(
-                    "Issue status update failed for connection %s",
-                    conn.id,
-                    exc_info=True,
-                )
+                if issue is None:
+                    continue
+                updated = await adapter.update_issue_status(issue_id, data.status)
+            except Exception as exc:
+                raise _tracker_failure(conn.id, f"update issue {issue_id}", exc) from exc
+            return updated
         if deprecated:
             warn_on_legacy_route(
                 request,

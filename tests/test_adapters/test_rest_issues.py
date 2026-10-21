@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 
@@ -146,14 +147,14 @@ class TestSearchIssues:
         assert resp.status_code == 200
         assert len(resp.json()) == 2
 
-    def test_search_continues_on_adapter_error(self):
+    def test_search_fails_with_502_naming_the_broken_connection(self):
         app, integration_repo, tracker_factory = _make_app()
         conn1 = _make_connection(conn_id="conn-1")
         conn2 = _make_connection(conn_id="conn-2")
         integration_repo.list_connections.return_value = [conn1, conn2]
 
         adapter1 = AsyncMock()
-        adapter1.search_issues.side_effect = Exception("network error")
+        adapter1.search_issues.side_effect = RuntimeError("network error")
         adapter2 = AsyncMock()
         adapter2.search_issues.return_value = [_make_issue(issue_id="i2")]
         tracker_factory.create.side_effect = [adapter1, adapter2]
@@ -161,10 +162,37 @@ class TestSearchIssues:
 
         resp = client.get(f"{PREFIX}/issues?q=bug", headers=AUTH)
 
+        assert resp.status_code == 502
+        assert resp.json()["detail"] == (
+            "Issue tracker connection conn-1 failed to search issues: RuntimeError: network error"
+        )
+        adapter2.search_issues.assert_not_called()
+
+    def test_search_fails_with_502_when_adapter_cannot_be_built(self):
+        app, integration_repo, tracker_factory = _make_app()
+        integration_repo.list_connections.return_value = [_make_connection()]
+        tracker_factory.create.side_effect = ValueError("credential linear-token missing")
+        client = TestClient(app)
+
+        resp = client.get(f"{PREFIX}/issues?q=bug", headers=AUTH)
+
+        assert resp.status_code == 502
+        assert "conn-1" in resp.json()["detail"]
+        assert "credential linear-token missing" in resp.json()["detail"]
+
+    def test_search_skips_non_volundr_adapters(self):
+        app, integration_repo, tracker_factory = _make_app()
+        connection = replace(
+            _make_connection(), adapter="ting.adapters.linear.LinearTrackerAdapter"
+        )
+        integration_repo.list_connections.return_value = [connection]
+        client = TestClient(app)
+
+        resp = client.get(f"{PREFIX}/issues?q=bug", headers=AUTH)
+
         assert resp.status_code == 200
-        data = resp.json()
-        assert len(data) == 1
-        assert data[0]["id"] == "i2"
+        assert resp.json() == []
+        tracker_factory.create.assert_not_called()
 
 
 class TestGetIssue:
@@ -183,6 +211,58 @@ class TestGetIssue:
 
         assert resp.status_code == 200
         assert resp.json()["id"] == "issue-99"
+
+    def test_returns_issue_description(self):
+        app, integration_repo, tracker_factory = _make_app()
+        integration_repo.list_connections.return_value = [_make_connection()]
+
+        mock_adapter = AsyncMock()
+        issue = _make_issue(issue_id="issue-99")
+        issue.description = "## Acceptance criteria\n- [ ] works"
+        mock_adapter.get_issue.return_value = issue
+        tracker_factory.create.return_value = mock_adapter
+        client = TestClient(app)
+
+        resp = client.get(f"{PREFIX}/issues/NIU-1092", headers=AUTH)
+
+        assert resp.status_code == 200
+        assert resp.json()["description"] == "## Acceptance criteria\n- [ ] works"
+
+    def test_checks_next_connection_when_first_has_no_match(self):
+        app, integration_repo, tracker_factory = _make_app()
+        integration_repo.list_connections.return_value = [
+            _make_connection(conn_id="conn-1", enabled=False),
+            _make_connection(conn_id="conn-2"),
+            _make_connection(conn_id="conn-3"),
+        ]
+        adapter2 = AsyncMock()
+        adapter2.get_issue.return_value = None
+        adapter3 = AsyncMock()
+        adapter3.get_issue.return_value = _make_issue(issue_id="issue-3")
+        tracker_factory.create.side_effect = [adapter2, adapter3]
+        client = TestClient(app)
+
+        resp = client.get(f"{PREFIX}/issues/issue-3", headers=AUTH)
+
+        assert resp.status_code == 200
+        assert resp.json()["id"] == "issue-3"
+
+    def test_broken_connection_fails_with_502_not_404(self):
+        app, integration_repo, tracker_factory = _make_app()
+        integration_repo.list_connections.return_value = [_make_connection()]
+
+        mock_adapter = AsyncMock()
+        mock_adapter.get_issue.side_effect = RuntimeError("401 Unauthorized")
+        tracker_factory.create.return_value = mock_adapter
+        client = TestClient(app)
+
+        resp = client.get(f"{PREFIX}/issues/NIU-1092", headers=AUTH)
+
+        assert resp.status_code == 502
+        assert resp.json()["detail"] == (
+            "Issue tracker connection conn-1 failed to get issue NIU-1092: "
+            "RuntimeError: 401 Unauthorized"
+        )
 
     def test_returns_404_when_not_found(self):
         app, integration_repo, tracker_factory = _make_app()
@@ -250,6 +330,53 @@ class TestUpdateIssueStatus:
         )
 
         assert resp.status_code == 404
+
+    def test_update_failure_fails_with_502(self):
+        app, integration_repo, tracker_factory = _make_app()
+        integration_repo.list_connections.return_value = [_make_connection()]
+
+        mock_adapter = AsyncMock()
+        mock_adapter.get_issue.return_value = _make_issue(issue_id="issue-1")
+        mock_adapter.update_issue_status.side_effect = RuntimeError("Status 'Shipped' not found")
+        tracker_factory.create.return_value = mock_adapter
+        client = TestClient(app)
+
+        resp = client.patch(
+            f"{PREFIX}/issues/issue-1",
+            json={"status": "Shipped"},
+            headers=AUTH,
+        )
+
+        assert resp.status_code == 502
+        assert resp.json()["detail"] == (
+            "Issue tracker connection conn-1 failed to update issue issue-1: "
+            "RuntimeError: Status 'Shipped' not found"
+        )
+
+    def test_update_skips_disabled_foreign_and_unmatched_connections(self):
+        app, integration_repo, tracker_factory = _make_app()
+        integration_repo.list_connections.return_value = [
+            _make_connection(conn_id="conn-1", enabled=False),
+            replace(
+                _make_connection(conn_id="conn-ting"),
+                adapter="ting.adapters.linear.LinearTrackerAdapter",
+            ),
+            _make_connection(conn_id="conn-2"),
+            _make_connection(conn_id="conn-3"),
+        ]
+        adapter2 = AsyncMock()
+        adapter2.get_issue.return_value = None
+        adapter3 = AsyncMock()
+        adapter3.get_issue.return_value = _make_issue(issue_id="issue-1")
+        adapter3.update_issue_status.return_value = _make_issue(issue_id="issue-1", status="Done")
+        tracker_factory.create.side_effect = [adapter2, adapter3]
+        client = TestClient(app)
+
+        resp = client.patch(f"{PREFIX}/issues/issue-1", json={"status": "Done"}, headers=AUTH)
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "Done"
+        adapter2.update_issue_status.assert_not_called()
 
     def test_rejects_empty_status(self):
         app, _, _ = _make_app()

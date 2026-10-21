@@ -15,6 +15,7 @@ import httpx
 
 from tracker.models import TrackerConnectionStatus, TrackerIssue
 from tracker.ports import IssueTrackerProvider
+from volundr.adapters.outbound.jira_adf import adf_to_markdown
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,9 @@ _ACCESSIBLE_RESOURCES_URL = "https://api.atlassian.com/oauth/token/accessible-re
 _ATLASSIAN_API_ROOT = "https://api.atlassian.com/ex/jira"
 _DEFAULT_TIMEOUT_SECONDS = 15.0
 _ISSUE_FIELDS = "summary,status,assignee,labels,priority,project"
+# Single-issue fetches also return the body; search and recent lists omit it
+# to keep payloads small (callers fetch the issue by key to read it).
+_ISSUE_DETAIL_FIELDS = f"{_ISSUE_FIELDS},description"
 
 # Priority mapping: Jira priority names to numeric values
 _PRIORITY_MAP: dict[str, int] = {
@@ -204,7 +208,7 @@ class JiraAdapter(IssueTrackerProvider):
             response = await self._request(
                 "GET",
                 f"/issue/{issue_id}",
-                params={"fields": _ISSUE_FIELDS},
+                params={"fields": _ISSUE_DETAIL_FIELDS},
             )
             if response.status_code == 404:
                 return None
@@ -325,6 +329,7 @@ class JiraAdapter(IssueTrackerProvider):
             id=issue["id"],
             identifier=issue.get("key", issue["id"]),
             title=fields.get("summary", ""),
+            description=adf_to_markdown(fields.get("description")),
             status=(fields.get("status") or {}).get("name", "Unknown"),
             assignee=assignee.get("displayName") if assignee else None,
             labels=fields.get("labels", []),

@@ -388,6 +388,24 @@ class TestTrackerIssueTool:
     def test_required_permission(self):
         assert self.tool.required_permission == "platform:api"
 
+    def test_description_says_get_returns_the_issue_body(self):
+        description = self.tool.description
+        assert "get (issue_id) — full issue including its description" in description
+        assert "acceptance criteria" in description
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_get_issue_returns_description(self):
+        respx.get(f"{TRACKER_ISSUES_URL}/NIU-1092").mock(
+            return_value=httpx.Response(
+                200,
+                json={"id": "NIU-1092", "description": "## Acceptance criteria\n- [ ] done"},
+            )
+        )
+        result = await self.tool.execute({"action": "get", "issue_id": "NIU-1092"})
+        assert not result.is_error
+        assert json.loads(result.content)["description"] == "## Acceptance criteria\n- [ ] done"
+
     @pytest.mark.asyncio
     @respx.mock
     async def test_search_issues(self):

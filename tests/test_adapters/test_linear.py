@@ -9,6 +9,10 @@ import httpx
 import pytest
 
 from volundr.adapters.outbound.linear import (
+    _GET_ISSUE_QUERY,
+    _RECENT_ISSUES_QUERY,
+    _SEARCH_ISSUES_QUERY,
+    _UPDATE_ISSUE_STATUS_QUERY,
     LinearAdapter,
     LinearAPIError,
     _CacheEntry,
@@ -78,6 +82,23 @@ class TestNodeToIssue:
         assert issue.assignee == "Test User"
         assert issue.labels == ["bug"]
         assert issue.priority == 2
+        assert issue.description is None
+
+    def test_maps_description(self):
+        node = _issue_node(description="## Acceptance criteria\n- [ ] it works")
+        issue = LinearAdapter._node_to_issue(node)
+
+        assert issue.description == "## Acceptance criteria\n- [ ] it works"
+
+
+class TestQueryFields:
+    def test_single_issue_queries_request_description(self):
+        assert "description" in _GET_ISSUE_QUERY
+        assert "description" in _UPDATE_ISSUE_STATUS_QUERY
+
+    def test_list_queries_omit_description(self):
+        assert "description" not in _SEARCH_ISSUES_QUERY
+        assert "description" not in _RECENT_ISSUES_QUERY
 
     def test_handles_missing_assignee(self):
         node = _issue_node(assignee=None)
@@ -233,11 +254,14 @@ class TestGetIssue:
     async def test_get_existing(self):
         adapter = _make_adapter()
         adapter._gql._client = AsyncMock()
-        adapter._gql._client.post.return_value = _mock_response({"data": {"issue": _issue_node()}})
+        adapter._gql._client.post.return_value = _mock_response(
+            {"data": {"issue": _issue_node(description="Body with acceptance criteria")}}
+        )
 
         issue = await adapter.get_issue("issue-1")
         assert issue is not None
         assert issue.identifier == "TEST-1"
+        assert issue.description == "Body with acceptance criteria"
 
     async def test_get_missing(self):
         adapter = _make_adapter()
@@ -247,15 +271,25 @@ class TestGetIssue:
         issue = await adapter.get_issue("nonexistent")
         assert issue is None
 
-    async def test_get_api_error(self):
+    async def test_get_entity_not_found_error_returns_none(self):
         adapter = _make_adapter()
         adapter._gql._client = AsyncMock()
         adapter._gql._client.post.return_value = _mock_response(
-            {"errors": [{"message": "Not found"}]}
+            {"errors": [{"message": "Entity not found: Issue"}]}
         )
 
         issue = await adapter.get_issue("bad-id")
         assert issue is None
+
+    async def test_get_other_graphql_error_raises(self):
+        adapter = _make_adapter()
+        adapter._gql._client = AsyncMock()
+        adapter._gql._client.post.return_value = _mock_response(
+            {"errors": [{"message": "Cannot query field 'bogus' on type 'Issue'"}]}
+        )
+
+        with pytest.raises(LinearAPIError, match="Cannot query field"):
+            await adapter.get_issue("issue-1")
 
 
 class TestUpdateIssueStatus:

@@ -19,6 +19,11 @@ __all__ = ["LinearAdapter", "_CacheEntry"]
 logger = logging.getLogger(__name__)
 
 # --- GraphQL queries ---
+#
+# Only the single-issue queries (GetIssue, UpdateIssueStatus) request
+# ``description``. Search and recent-issue lists return up to 25 issues and
+# deliberately omit bodies to keep payloads small; callers that need the body
+# fetch the issue by id.
 
 _VIEWER_QUERY = """
 query {
@@ -78,6 +83,7 @@ query GetIssue($id: String!) {
     id
     identifier
     title
+    description
     state { name }
     assignee { name }
     labels { nodes { name } }
@@ -94,6 +100,7 @@ mutation UpdateIssueStatus($issueId: String!, $stateId: String!) {
       id
       identifier
       title
+      description
       state { name }
       assignee { name }
       labels { nodes { name } }
@@ -167,6 +174,7 @@ class LinearAdapter(IssueTrackerProvider):
             id=node["id"],
             identifier=node["identifier"],
             title=node["title"],
+            description=node.get("description"),
             status=node.get("state", {}).get("name", "Unknown"),
             assignee=(node.get("assignee") or {}).get("name"),
             labels=[n["name"] for n in (node.get("labels") or {}).get("nodes", [])],
@@ -250,12 +258,17 @@ class LinearAdapter(IssueTrackerProvider):
                 _GET_ISSUE_QUERY,
                 {"id": issue_id},
             )
-            node = data.get("issue")
-            if node is None:
+        except GraphQLError as exc:
+            # Linear reports an unknown issue id as a GraphQL "Entity not found"
+            # error; that is the expected "no such issue" answer. Every other
+            # GraphQL error is a real failure and propagates.
+            if "not found" in str(exc).lower():
                 return None
-            return self._node_to_issue(node)
-        except GraphQLError:
+            raise
+        node = data.get("issue")
+        if node is None:
             return None
+        return self._node_to_issue(node)
 
     async def update_issue_status(
         self,

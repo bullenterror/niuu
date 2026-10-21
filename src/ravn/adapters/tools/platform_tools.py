@@ -1488,8 +1488,10 @@ class TrackerIssueTool(_PlatformAuthMixin, ToolPort):
     """Search, view, and update issues via Volundr's tracker integration.
 
     Actions:
-    - ``search``        — search issues across connected trackers (requires ``query``).
-    - ``get``           — get issue details (requires ``issue_id``).
+    - ``search``        — search issues across connected trackers (requires ``query``);
+      results omit issue bodies (``description`` is null).
+    - ``get``           — get issue details including the ``description`` body with
+      acceptance criteria (requires ``issue_id``).
     - ``update_status`` — update issue status (requires ``issue_id``, ``status``).
     """
 
@@ -1519,8 +1521,9 @@ class TrackerIssueTool(_PlatformAuthMixin, ToolPort):
     def description(self) -> str:
         return (
             "Search, view, and update issues in connected trackers (Linear, Jira, etc.) "
-            "via Volundr. Actions: search (query), get (issue_id), "
-            "update_status (issue_id + status)."
+            "via Volundr. Actions: search (query) — matching issues without their bodies; "
+            "get (issue_id) — full issue including its description (the ticket body with "
+            "acceptance criteria, as Markdown); update_status (issue_id + status)."
         )
 
     @property
