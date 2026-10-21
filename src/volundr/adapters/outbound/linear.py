@@ -12,7 +12,7 @@ from niuu.adapters.linear import GraphQLError, LinearGraphQLClient
 from niuu.domain.models import LINEAR_API_URL
 from niuu.domain.models import CacheEntry as _CacheEntry  # noqa: F401 — re-exported for tests
 from tracker.models import TrackerConnectionStatus, TrackerIssue
-from tracker.ports import IssueTrackerProvider
+from tracker.ports import IssueTrackerProvider, TrackerRequestError
 
 __all__ = ["LinearAdapter", "_CacheEntry"]
 
@@ -96,6 +96,48 @@ query GetIssue($id: String!) {
 _UPDATE_ISSUE_STATUS_QUERY = """
 mutation UpdateIssueStatus($issueId: String!, $stateId: String!) {
   issueUpdate(id: $issueId, input: { stateId: $stateId }) {
+    issue {
+      id
+      identifier
+      title
+      description
+      state { name }
+      assignee { name }
+      labels { nodes { name } }
+      priority
+      url
+    }
+  }
+}
+"""
+
+_TEAM_BY_KEY_QUERY = """
+query TeamByKey($key: String!) {
+  teams(filter: { key: { eqIgnoreCase: $key } }) {
+    nodes {
+      id
+      key
+    }
+  }
+}
+"""
+
+_LABELS_BY_NAME_QUERY = """
+query LabelsByName($filter: IssueLabelFilter!) {
+  issueLabels(filter: $filter, first: 250) {
+    nodes {
+      id
+      name
+      team { id }
+    }
+  }
+}
+"""
+
+_CREATE_ISSUE_QUERY = """
+mutation CreateIssue($input: IssueCreateInput!) {
+  issueCreate(input: $input) {
+    success
     issue {
       id
       identifier
@@ -320,6 +362,84 @@ class LinearAdapter(IssueTrackerProvider):
         self._gql.invalidate_cache("recent:")
 
         return self._node_to_issue(updated)
+
+    async def create_issue(
+        self,
+        title: str,
+        description: str,
+        *,
+        team: str,
+        labels: list[str] | None = None,
+        priority: int | None = None,
+    ) -> TrackerIssue:
+        """Create a Linear issue in the team with key ``team``.
+
+        Labels resolve by name (case-insensitive) among the team's labels and
+        workspace labels; an unknown team or label raises
+        :class:`TrackerRequestError`.
+        """
+        team_id = await self._resolve_team_id(team)
+        payload: dict[str, object] = {
+            "teamId": team_id,
+            "title": title,
+            "description": description,
+        }
+        if labels:
+            payload["labelIds"] = await self._resolve_label_ids(team, team_id, labels)
+        if priority is not None:
+            payload["priority"] = priority
+
+        data = await self._gql.query(_CREATE_ISSUE_QUERY, {"input": payload})
+        result = data.get("issueCreate") or {}
+        created = result.get("issue")
+        if not result.get("success") or created is None:
+            raise GraphQLError(f"Linear did not create the issue in team {team}: {result}")
+
+        self._gql.invalidate_cache("search:")
+        self._gql.invalidate_cache("recent:")
+        return self._node_to_issue(created)
+
+    async def _resolve_team_id(self, team_key: str) -> str:
+        data = await self._gql.query(_TEAM_BY_KEY_QUERY, {"key": team_key})
+        teams = (data.get("teams") or {}).get("nodes") or []
+        if not teams:
+            raise TrackerRequestError(f"Linear team not found: {team_key}")
+        return teams[0]["id"]
+
+    async def _resolve_label_ids(self, team_key: str, team_id: str, names: list[str]) -> list[str]:
+        # Label names are case-insensitive in Linear: "bug" and "Bug" are one label.
+        wanted: dict[str, str] = {}
+        for name in names:
+            wanted.setdefault(name.casefold(), name)
+        label_filter = {"or": [{"name": {"eqIgnoreCase": name}} for name in wanted.values()]}
+        data = await self._gql.query(_LABELS_BY_NAME_QUERY, {"filter": label_filter})
+        nodes = (data.get("issueLabels") or {}).get("nodes") or []
+        # Workspace labels (no team) and the target team's labels apply.
+        usable = [n for n in nodes if (n.get("team") or {}).get("id") in (None, team_id)]
+
+        label_ids: list[str] = []
+        missing: list[str] = []
+        ambiguous: list[str] = []
+        for folded, name in wanted.items():
+            matches = [n for n in usable if n["name"].casefold() == folded]
+            if not matches:
+                missing.append(name)
+                continue
+            if len(matches) > 1:
+                ambiguous.append(name)
+                continue
+            label_ids.append(matches[0]["id"])
+        if missing:
+            raise TrackerRequestError(
+                f"Linear label(s) not found in team {team_key} or the workspace: "
+                f"{', '.join(missing)}"
+            )
+        if ambiguous:
+            raise TrackerRequestError(
+                f"Linear label name(s) match more than one label in team {team_key}: "
+                f"{', '.join(ambiguous)}"
+            )
+        return label_ids
 
     async def close(self) -> None:
         """Close the HTTP client."""

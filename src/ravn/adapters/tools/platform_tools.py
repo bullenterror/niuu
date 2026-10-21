@@ -1485,13 +1485,15 @@ def _with_default_workflow_alias(
 
 
 class TrackerIssueTool(_PlatformAuthMixin, ToolPort):
-    """Search, view, and update issues via Volundr's tracker integration.
+    """Search, view, create, and update issues via Volundr's tracker integration.
 
     Actions:
     - ``search``        — search issues across connected trackers (requires ``query``);
       results omit issue bodies (``description`` is null).
     - ``get``           — get issue details including the ``description`` body with
       acceptance criteria (requires ``issue_id``).
+    - ``create``        — create an issue (requires ``title``, ``description``,
+      ``team``; optional ``labels``, ``priority``, ``connection_id``).
     - ``update_status`` — update issue status (requires ``issue_id``, ``status``).
     """
 
@@ -1520,10 +1522,12 @@ class TrackerIssueTool(_PlatformAuthMixin, ToolPort):
     @property
     def description(self) -> str:
         return (
-            "Search, view, and update issues in connected trackers (Linear, Jira, etc.) "
-            "via Volundr. Actions: search (query) — matching issues without their bodies; "
-            "get (issue_id) — full issue including its description (the ticket body with "
-            "acceptance criteria, as Markdown); update_status (issue_id + status)."
+            "Search, view, create, and update issues in connected trackers (Linear, Jira, "
+            "etc.) via Volundr. Actions: search (query) — matching issues without their "
+            "bodies; get (issue_id) — full issue including its description (the ticket body "
+            "with acceptance criteria, as Markdown); create (title + description + team, "
+            "optional labels, priority, connection_id) — files a new issue and returns it; "
+            "labels must already exist in the tracker; update_status (issue_id + status)."
         )
 
     @property
@@ -1533,7 +1537,7 @@ class TrackerIssueTool(_PlatformAuthMixin, ToolPort):
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["search", "get", "update_status"],
+                    "enum": ["search", "get", "create", "update_status"],
                     "description": "Operation to perform.",
                 },
                 "issue_id": {
@@ -1547,6 +1551,42 @@ class TrackerIssueTool(_PlatformAuthMixin, ToolPort):
                 "status": {
                     "type": "string",
                     "description": "New status value (required for update_status).",
+                },
+                "title": {
+                    "type": "string",
+                    "description": "Issue title (required for create).",
+                },
+                "description": {
+                    "type": "string",
+                    "description": (
+                        "Issue body as Markdown, including acceptance criteria "
+                        "(required for create)."
+                    ),
+                },
+                "team": {
+                    "type": "string",
+                    "description": (
+                        "Team key (Linear, e.g. NIU) or Jira project key to create the "
+                        "issue in (required for create)."
+                    ),
+                },
+                "labels": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Existing label names to apply (optional, create).",
+                },
+                "priority": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 4,
+                    "description": "Priority 0=none, 1=urgent … 4=low (optional, create).",
+                },
+                "connection_id": {
+                    "type": "string",
+                    "description": (
+                        "Tracker connection to create in; required when more than one "
+                        "issue tracker is connected (optional, create)."
+                    ),
                 },
             },
             "required": ["action"],
@@ -1564,6 +1604,8 @@ class TrackerIssueTool(_PlatformAuthMixin, ToolPort):
                     return await self._search(client, input.get("query", ""))
                 case "get":
                     return await self._get(client, input.get("issue_id", ""))
+                case "create":
+                    return await self._create(client, input)
                 case "update_status":
                     return await self._update_status(
                         client, input.get("issue_id", ""), input.get("status", "")
@@ -1591,6 +1633,27 @@ class TrackerIssueTool(_PlatformAuthMixin, ToolPort):
             return _ok(resp.json())
         except Exception as exc:
             return _err(f"Failed to get issue {issue_id}: {exc}")
+
+    async def _create(self, client: httpx.AsyncClient, input: dict) -> ToolResult:
+        missing = [key for key in ("title", "description", "team") if not input.get(key)]
+        if missing:
+            return _err(f"{', '.join(missing)} required for create action")
+        body: dict[str, object] = {
+            "title": input["title"],
+            "description": input["description"],
+            "team": input["team"],
+        }
+        for key in ("labels", "priority", "connection_id"):
+            if input.get(key) is not None:
+                body[key] = input[key]
+        try:
+            resp = await client.post(_TRACKER_ISSUES_PATH, json=body)
+            resp.raise_for_status()
+            return _ok(resp.json())
+        except httpx.HTTPStatusError as exc:
+            return _err(f"Failed to create issue: {exc.response.status_code} {exc.response.text}")
+        except Exception as exc:
+            return _err(f"Failed to create issue: {exc}")
 
     async def _update_status(
         self, client: httpx.AsyncClient, issue_id: str, status: str

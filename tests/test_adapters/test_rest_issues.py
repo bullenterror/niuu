@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from tracker.ports import TrackerRequestError
 from volundr.adapters.inbound.rest_issues import create_issues_router
 from volundr.domain.models import (
     IntegrationConnection,
@@ -389,3 +390,161 @@ class TestUpdateIssueStatus:
         )
 
         assert resp.status_code == 422
+
+
+class TestCreateIssue:
+    BODY = {
+        "title": "Tracker API lacks create",
+        "description": "## Acceptance criteria\n- [ ] POST works",
+        "team": "NIU",
+        "labels": ["platform-defect"],
+        "priority": 2,
+    }
+
+    def test_creates_in_the_only_connection(self):
+        app, integration_repo, tracker_factory = _make_app()
+        integration_repo.list_connections.return_value = [
+            _make_connection(conn_id="conn-1"),
+            _make_connection(conn_id="conn-off", enabled=False),
+            replace(
+                _make_connection(conn_id="conn-ting"),
+                adapter="ting.adapters.linear.LinearTrackerAdapter",
+            ),
+        ]
+        mock_adapter = AsyncMock()
+        created = _make_issue(issue_id="new-1")
+        created.description = self.BODY["description"]
+        mock_adapter.create_issue.return_value = created
+        tracker_factory.create.return_value = mock_adapter
+        client = TestClient(app)
+
+        resp = client.post(f"{PREFIX}/issues", json=self.BODY, headers=AUTH)
+
+        assert resp.status_code == 201
+        assert resp.json()["id"] == "new-1"
+        assert resp.json()["description"] == self.BODY["description"]
+        mock_adapter.create_issue.assert_awaited_once_with(
+            "Tracker API lacks create",
+            "## Acceptance criteria\n- [ ] POST works",
+            team="NIU",
+            labels=["platform-defect"],
+            priority=2,
+        )
+
+    def test_omitted_labels_and_priority_pass_none(self):
+        app, integration_repo, tracker_factory = _make_app()
+        integration_repo.list_connections.return_value = [_make_connection()]
+        mock_adapter = AsyncMock()
+        mock_adapter.create_issue.return_value = _make_issue()
+        tracker_factory.create.return_value = mock_adapter
+        client = TestClient(app)
+
+        body = {"title": "T", "description": "B", "team": "NIU"}
+        resp = client.post(f"{PREFIX}/issues", json=body, headers=AUTH)
+
+        assert resp.status_code == 201
+        mock_adapter.create_issue.assert_awaited_once_with(
+            "T", "B", team="NIU", labels=None, priority=None
+        )
+
+    def test_requires_connection_id_when_several_could_take_it(self):
+        app, integration_repo, tracker_factory = _make_app()
+        integration_repo.list_connections.return_value = [
+            _make_connection(conn_id="conn-1"),
+            _make_connection(conn_id="conn-2"),
+        ]
+        client = TestClient(app)
+
+        resp = client.post(f"{PREFIX}/issues", json=self.BODY, headers=AUTH)
+
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == (
+            "More than one issue tracker connection could take this issue; "
+            "set connection_id to one of: conn-1 (linear), conn-2 (linear)"
+        )
+        tracker_factory.create.assert_not_called()
+
+    def test_connection_id_selects_the_target(self):
+        app, integration_repo, tracker_factory = _make_app()
+        conn2 = _make_connection(conn_id="conn-2")
+        integration_repo.list_connections.return_value = [
+            _make_connection(conn_id="conn-1"),
+            conn2,
+        ]
+        mock_adapter = AsyncMock()
+        mock_adapter.create_issue.return_value = _make_issue()
+        tracker_factory.create.return_value = mock_adapter
+        client = TestClient(app)
+
+        resp = client.post(
+            f"{PREFIX}/issues", json={**self.BODY, "connection_id": "conn-2"}, headers=AUTH
+        )
+
+        assert resp.status_code == 201
+        tracker_factory.create.assert_awaited_once_with(conn2)
+
+    def test_unknown_connection_id_is_rejected(self):
+        app, integration_repo, tracker_factory = _make_app()
+        integration_repo.list_connections.return_value = [_make_connection(conn_id="conn-1")]
+        client = TestClient(app)
+
+        resp = client.post(
+            f"{PREFIX}/issues", json={**self.BODY, "connection_id": "conn-9"}, headers=AUTH
+        )
+
+        assert resp.status_code == 400
+        assert "connection_id conn-9 is not one of your enabled" in resp.json()["detail"]
+        tracker_factory.create.assert_not_called()
+
+    def test_no_connection_is_rejected(self):
+        app, integration_repo, _ = _make_app()
+        integration_repo.list_connections.return_value = []
+        client = TestClient(app)
+
+        resp = client.post(f"{PREFIX}/issues", json=self.BODY, headers=AUTH)
+
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == "No enabled issue tracker connection to create the issue in"
+
+    def test_unknown_team_or_label_is_a_400_with_the_cause(self):
+        app, integration_repo, tracker_factory = _make_app()
+        integration_repo.list_connections.return_value = [_make_connection()]
+        mock_adapter = AsyncMock()
+        mock_adapter.create_issue.side_effect = TrackerRequestError("Linear team not found: NOPE")
+        tracker_factory.create.return_value = mock_adapter
+        client = TestClient(app)
+
+        resp = client.post(f"{PREFIX}/issues", json={**self.BODY, "team": "NOPE"}, headers=AUTH)
+
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == (
+            "Issue tracker connection conn-1 cannot create the issue: Linear team not found: NOPE"
+        )
+
+    def test_tracker_failure_is_a_502_with_the_cause(self):
+        app, integration_repo, tracker_factory = _make_app()
+        integration_repo.list_connections.return_value = [_make_connection()]
+        mock_adapter = AsyncMock()
+        mock_adapter.create_issue.side_effect = RuntimeError("upstream timeout")
+        tracker_factory.create.return_value = mock_adapter
+        client = TestClient(app)
+
+        resp = client.post(f"{PREFIX}/issues", json=self.BODY, headers=AUTH)
+
+        assert resp.status_code == 502
+        assert resp.json()["detail"] == (
+            "Issue tracker connection conn-1 failed to create an issue in NIU: "
+            "RuntimeError: upstream timeout"
+        )
+
+    def test_validates_body(self):
+        app, _, _ = _make_app()
+        client = TestClient(app)
+
+        for body in (
+            {**self.BODY, "priority": 5},
+            {**self.BODY, "title": ""},
+            {k: v for k, v in self.BODY.items() if k != "team"},
+        ):
+            resp = client.post(f"{PREFIX}/issues", json=body, headers=AUTH)
+            assert resp.status_code == 422

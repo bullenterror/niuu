@@ -393,6 +393,69 @@ class TestTrackerIssueTool:
         assert "get (issue_id) — full issue including its description" in description
         assert "acceptance criteria" in description
 
+    def test_input_schema_offers_create(self):
+        schema = self.tool.input_schema
+        assert "create" in schema["properties"]["action"]["enum"]
+        for field in ("title", "description", "team", "labels", "priority", "connection_id"):
+            assert field in schema["properties"]
+        assert "create (title + description + team" in self.tool.description
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_create_issue_posts_the_body(self):
+        route = respx.post(TRACKER_ISSUES_URL).mock(
+            return_value=httpx.Response(201, json={"identifier": "NIU-2000"})
+        )
+        result = await self.tool.execute(
+            {
+                "action": "create",
+                "title": "Tracker API lacks create",
+                "description": "## Acceptance criteria",
+                "team": "NIU",
+                "labels": ["platform-defect"],
+                "priority": 2,
+                "connection_id": None,
+            }
+        )
+        assert not result.is_error
+        assert json.loads(result.content)["identifier"] == "NIU-2000"
+        assert json.loads(route.calls.last.request.content) == {
+            "title": "Tracker API lacks create",
+            "description": "## Acceptance criteria",
+            "team": "NIU",
+            "labels": ["platform-defect"],
+            "priority": 2,
+        }
+
+    @pytest.mark.asyncio
+    async def test_create_issue_requires_title_description_team(self):
+        result = await self.tool.execute({"action": "create", "title": "T"})
+        assert result.is_error
+        assert "description, team required for create action" in result.content
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_create_issue_error_includes_the_api_detail(self):
+        respx.post(TRACKER_ISSUES_URL).mock(
+            return_value=httpx.Response(400, json={"detail": "Linear team not found: NOPE"})
+        )
+        result = await self.tool.execute(
+            {"action": "create", "title": "T", "description": "B", "team": "NOPE"}
+        )
+        assert result.is_error
+        assert "400" in result.content
+        assert "Linear team not found: NOPE" in result.content
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_create_issue_transport_error(self):
+        respx.post(TRACKER_ISSUES_URL).mock(side_effect=httpx.ConnectError("refused"))
+        result = await self.tool.execute(
+            {"action": "create", "title": "T", "description": "B", "team": "NIU"}
+        )
+        assert result.is_error
+        assert "Failed to create issue: refused" in result.content
+
     @pytest.mark.asyncio
     @respx.mock
     async def test_get_issue_returns_description(self):

@@ -1758,7 +1758,8 @@ def _default_integration_definitions() -> list[IntegrationDefinitionConfig]:
                         "label": "Issue type for new work",
                         "type": "string",
                         "description": (
-                            "Issue type used when Ting creates Jira work. Defaults to Task."
+                            "Issue type used when Ting or the tracker API creates Jira "
+                            "work. Defaults to Task."
                         ),
                     },
                 },

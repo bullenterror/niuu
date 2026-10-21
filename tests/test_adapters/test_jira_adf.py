@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from volundr.adapters.outbound.jira_adf import adf_to_markdown
+from volundr.adapters.outbound.jira_adf import adf_to_markdown, text_to_adf
 
 
 def _doc(*content: dict) -> dict:
@@ -219,3 +219,20 @@ class TestInline:
         assert adf_to_markdown(doc) == (
             "@Ada @u2 :tada:❌ <https://card> [BLOCKED] 1700000000000 type here!"
         )
+
+
+class TestTextToAdf:
+    def test_one_paragraph_per_line_round_trips(self):
+        text = "## Criteria\n\n- [ ] works"
+        doc = text_to_adf(text)
+
+        assert doc["type"] == "doc"
+        assert len(doc["content"]) == 3
+        assert adf_to_markdown(doc) == text
+
+    def test_empty_text_is_one_empty_paragraph(self):
+        assert text_to_adf("") == {
+            "type": "doc",
+            "version": 1,
+            "content": [{"type": "paragraph", "content": []}],
+        }

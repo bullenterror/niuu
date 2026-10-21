@@ -17,6 +17,20 @@ from typing import Any
 _BULLET = "- "
 
 
+def text_to_adf(text: str) -> dict[str, Any]:
+    """Wrap plain text (or Markdown source) as an ADF document, one paragraph per line.
+
+    Jira API v3 accepts rich-text fields only as ADF. The text is kept
+    verbatim, so Markdown syntax stays readable and round-trips through
+    :func:`adf_to_markdown` unchanged.
+    """
+    paragraphs = [
+        {"type": "paragraph", "content": [{"type": "text", "text": line}] if line else []}
+        for line in text.splitlines() or [""]
+    ]
+    return {"type": "doc", "version": 1, "content": paragraphs}
+
+
 def adf_to_markdown(value: Any) -> str | None:
     """Render an ADF document (or a plain string) to Markdown.
 

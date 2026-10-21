@@ -8,6 +8,7 @@ from uuid import uuid4
 import httpx
 import pytest
 
+from tracker.ports import TrackerRequestError
 from volundr.adapters.outbound.linear import (
     _GET_ISSUE_QUERY,
     _RECENT_ISSUES_QUERY,
@@ -391,3 +392,152 @@ class TestClose:
         await adapter.close()
 
         adapter._gql._client.aclose.assert_called_once()
+
+
+class TestCreateIssue:
+    @staticmethod
+    def _posted(adapter, call: int) -> dict:
+        return adapter._gql._client.post.call_args_list[call].kwargs["json"]
+
+    async def test_create_resolves_team_and_labels(self):
+        adapter = _make_adapter()
+        adapter._gql._client = AsyncMock()
+        adapter._gql._client.post.side_effect = [
+            _mock_response({"data": {"teams": {"nodes": [{"id": "team-niu", "key": "NIU"}]}}}),
+            _mock_response(
+                {
+                    "data": {
+                        "issueLabels": {
+                            "nodes": [
+                                {"id": "l-bug", "name": "Bug", "team": None},
+                                {
+                                    "id": "l-plat",
+                                    "name": "platform-defect",
+                                    "team": {"id": "team-niu"},
+                                },
+                                {"id": "l-other", "name": "Bug", "team": {"id": "team-other"}},
+                            ]
+                        }
+                    }
+                }
+            ),
+            _mock_response(
+                {
+                    "data": {
+                        "issueCreate": {
+                            "success": True,
+                            "issue": _issue_node(identifier="NIU-2000", description="Body"),
+                        }
+                    }
+                }
+            ),
+        ]
+        adapter._set_cached("search:x:None", [], ttl=60.0)
+
+        issue = await adapter.create_issue(
+            "Tracker API lacks create",
+            "Body",
+            team="niu",
+            labels=["bug", "platform-defect", "Bug"],
+            priority=2,
+        )
+
+        assert issue.identifier == "NIU-2000"
+        assert issue.description == "Body"
+        assert self._posted(adapter, 0)["variables"] == {"key": "niu"}
+        assert self._posted(adapter, 1)["variables"] == {
+            "filter": {
+                "or": [
+                    {"name": {"eqIgnoreCase": "bug"}},
+                    {"name": {"eqIgnoreCase": "platform-defect"}},
+                ]
+            }
+        }
+        create_vars = self._posted(adapter, 2)["variables"]["input"]
+        assert create_vars == {
+            "teamId": "team-niu",
+            "title": "Tracker API lacks create",
+            "description": "Body",
+            "labelIds": ["l-bug", "l-plat"],
+            "priority": 2,
+        }
+        assert adapter._get_cached("search:x:None") is None
+
+    async def test_create_without_labels_or_priority_skips_label_lookup(self):
+        adapter = _make_adapter()
+        adapter._gql._client = AsyncMock()
+        adapter._gql._client.post.side_effect = [
+            _mock_response({"data": {"teams": {"nodes": [{"id": "team-niu", "key": "NIU"}]}}}),
+            _mock_response({"data": {"issueCreate": {"success": True, "issue": _issue_node()}}}),
+        ]
+
+        await adapter.create_issue("T", "B", team="NIU")
+
+        assert self._posted(adapter, 1)["variables"]["input"] == {
+            "teamId": "team-niu",
+            "title": "T",
+            "description": "B",
+        }
+
+    async def test_unknown_team_raises_request_error(self):
+        adapter = _make_adapter()
+        adapter._gql._client = AsyncMock()
+        adapter._gql._client.post.return_value = _mock_response({"data": {"teams": {"nodes": []}}})
+
+        with pytest.raises(TrackerRequestError, match="Linear team not found: NOPE"):
+            await adapter.create_issue("T", "B", team="NOPE")
+
+    async def test_unknown_label_raises_request_error(self):
+        adapter = _make_adapter()
+        adapter._gql._client = AsyncMock()
+        adapter._gql._client.post.side_effect = [
+            _mock_response({"data": {"teams": {"nodes": [{"id": "team-niu", "key": "NIU"}]}}}),
+            _mock_response(
+                {
+                    "data": {
+                        "issueLabels": {
+                            "nodes": [
+                                {"id": "l-x", "name": "missing", "team": {"id": "team-other"}}
+                            ]
+                        }
+                    }
+                }
+            ),
+        ]
+
+        with pytest.raises(TrackerRequestError, match="not found in team NIU.*: missing"):
+            await adapter.create_issue("T", "B", team="NIU", labels=["missing"])
+        assert adapter._gql._client.post.call_count == 2
+
+    async def test_ambiguous_label_raises_request_error(self):
+        adapter = _make_adapter()
+        adapter._gql._client = AsyncMock()
+        adapter._gql._client.post.side_effect = [
+            _mock_response({"data": {"teams": {"nodes": [{"id": "team-niu", "key": "NIU"}]}}}),
+            _mock_response(
+                {
+                    "data": {
+                        "issueLabels": {
+                            "nodes": [
+                                {"id": "l-1", "name": "dup", "team": None},
+                                {"id": "l-2", "name": "Dup", "team": {"id": "team-niu"}},
+                            ]
+                        }
+                    }
+                }
+            ),
+        ]
+
+        with pytest.raises(TrackerRequestError, match="more than one label.*: dup"):
+            await adapter.create_issue("T", "B", team="NIU", labels=["dup"])
+
+    async def test_unsuccessful_create_raises(self):
+        adapter = _make_adapter()
+        adapter._gql._client = AsyncMock()
+        adapter._gql._client.post.side_effect = [
+            _mock_response({"data": {"teams": {"nodes": [{"id": "team-niu", "key": "NIU"}]}}}),
+            _mock_response({"data": {"issueCreate": {"success": False, "issue": None}}}),
+        ]
+
+        with pytest.raises(LinearAPIError, match="did not create the issue in team NIU"):
+            await adapter.create_issue("T", "B", team="NIU")
