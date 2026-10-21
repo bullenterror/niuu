@@ -56,7 +56,7 @@ from ting.adapters.tracker_factory import TrackerAdapterFactory
 from ting.adapters.volundr_factory import GuildRegistryUnavailableError, VolundrAdapterFactory
 from ting.adapters.workflow_execution_worker import ExecutionReconciler, WorkflowExecutionWorker
 from ting.api.a2a import create_a2a_router, resolve_a2a_launch_repo
-from ting.api.a2a_card import create_agent_card_router
+from ting.api.a2a_card import create_agent_card_router, resolve_card_workflow_repo
 from ting.api.audit import create_audit_router
 from ting.api.dispatch import (
     create_dispatch_router,
@@ -894,6 +894,9 @@ def create_app(
                 )
 
             app.dependency_overrides[resolve_workflow_repo] = _resolve_workflow_repo
+            # The Agent Card is public discovery: it reads system workflows
+            # without a principal (see resolve_card_workflow_repo).
+            app.dependency_overrides[resolve_card_workflow_repo] = lambda: workflow_repo
 
             workflow_campaign_repo = PostgresWorkflowCampaignRepository(pool)
             app.state.workflow_campaign_repo = workflow_campaign_repo
