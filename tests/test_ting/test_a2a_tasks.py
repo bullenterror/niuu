@@ -888,6 +888,9 @@ class TestSendMessage:
         previous_level = a2a_logger.level
         a2a_logger.setLevel(logging.INFO)
         traceparent = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"
+        # The OTLP pipeline is process-global; another test on this worker may
+        # have left one active with a different fingerprint. Start clean.
+        shutdown_observability()
         try:
             telemetry = configure_observability(
                 ObservabilityConfig(

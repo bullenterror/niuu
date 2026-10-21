@@ -229,6 +229,8 @@ async def test_ravn_a2a_tool_build_backend_commissions_real_workflow_task(
         auth=AuthConfig(
             allow_anonymous_dev=True,
             default_user_id="a2a-tool-build-client",
+            # Align with the Forge identity: sessions.tenant_id is a foreign key.
+            default_tenant_id="default",
         ),
         a2a=A2AConfig(),
     )
