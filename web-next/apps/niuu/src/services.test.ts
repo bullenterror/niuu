@@ -2008,6 +2008,7 @@ describe('buildServices', () => {
     expect(valkyrieMocks.buildRealmGovernanceHttpAdapter).toHaveBeenCalledWith(
       { basePath: 'http://localhost:8080/api/v1' },
       { basePath: 'http://localhost:8080/api/v1/ting' },
+      'http://localhost:8080/api/v1',
     );
     expect(services['valkyrie.realms']).toMatchObject({ kind: 'valkyrie-realms' });
   });

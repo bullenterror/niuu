@@ -15,6 +15,7 @@ import mimetypes
 import posixpath
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
+from time import monotonic
 from typing import Any
 from urllib.parse import quote
 from uuid import UUID, uuid4
@@ -178,6 +179,31 @@ def campaign_to_task(campaign: WorkflowCampaign) -> Task:
             },
         }
     return task
+
+
+def _record_a2a_state_transition(campaign: WorkflowCampaign) -> None:
+    task = campaign_to_task(campaign)
+    attributes = {"state": TaskState.Name(task.status.state)}
+    telemetry = get_observability()
+    telemetry.count(
+        "a2a_task_state_transitions_total",
+        attributes=attributes,
+        description="A2A task state transitions observed by Ting.",
+    )
+    if task.status.state not in {
+        TaskState.TASK_STATE_COMPLETED,
+        TaskState.TASK_STATE_FAILED,
+        TaskState.TASK_STATE_CANCELED,
+        TaskState.TASK_STATE_REJECTED,
+    }:
+        return
+    finished_at = campaign.completed_at or campaign.updated_at
+    telemetry.duration(
+        "a2a_send_to_terminal_duration_seconds",
+        max(0.0, (finished_at - campaign.created_at).total_seconds()),
+        attributes=attributes,
+        description="Time from A2A SendMessage campaign creation to terminal state.",
+    )
 
 
 class WorkflowTaskHandler(RequestHandler):
@@ -355,6 +381,7 @@ class WorkflowTaskHandler(RequestHandler):
         )
         if existing is None:
             pending = await self._campaign_repo.save_campaign(pending)
+            _record_a2a_state_transition(pending)
 
         telemetry = get_observability()
         trace_context = _trace_context(metadata)
@@ -515,6 +542,7 @@ class WorkflowTaskHandler(RequestHandler):
             lease_token=lease_token,
             session_id=execution.session.id,
         )
+        _record_a2a_state_transition(saved)
         await _emit_campaign_event(self._request, "workflow.campaign.created", saved)
         await self._queue_push(saved)
         return campaign_to_task(saved)
@@ -1541,6 +1569,87 @@ def _trace_context(metadata: dict[str, Any]) -> dict[str, str]:
     return {key: str(raw[key]) for key in ("traceparent", "tracestate", "baggage") if raw.get(key)}
 
 
+def _trace_context_from_headers(headers: Any) -> dict[str, str]:
+    """Extract W3C trace propagation fields from HTTP request headers."""
+    return {
+        key: str(value)
+        for key in ("traceparent", "tracestate", "baggage")
+        if (value := headers.get(key))
+    }
+
+
+def _jsonrpc_observability_attributes(payload: Any) -> dict[str, Any]:
+    """Return low-cardinality A2A request attributes from a JSON-RPC body."""
+    if not isinstance(payload, dict):
+        return {"rpc.system": "jsonrpc", "rpc.method": "unknown"}
+    method = str(payload.get("method") or "unknown")
+    params = payload.get("params")
+    params = params if isinstance(params, dict) else {}
+    message = params.get("message")
+    message = message if isinstance(message, dict) else {}
+    metadata = message.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    attributes: dict[str, Any] = {"rpc.system": "jsonrpc", "rpc.method": method}
+    task_id = (
+        params.get("id")
+        or params.get("taskId")
+        or params.get("task_id")
+        or message.get("taskId")
+        or message.get("task_id")
+    )
+    workflow_id = metadata.get("skillId") or metadata.get("skill_id")
+    if task_id:
+        attributes["taskId"] = str(task_id)
+        attributes["a2a.task.id"] = str(task_id)
+    if workflow_id:
+        attributes["workflowId"] = str(workflow_id)
+        attributes["a2a.skill.id"] = str(workflow_id)
+    if message.get("messageId"):
+        attributes["a2a.message.id"] = str(message["messageId"])
+    return attributes
+
+
+def _jsonrpc_response_outcome(response: Response) -> str:
+    if response.status_code >= 400:
+        return "error"
+    raw_body = getattr(response, "body", b"")
+    if not raw_body:
+        return "ok"
+    try:
+        payload = json.loads(raw_body)
+    except (TypeError, ValueError):
+        return "ok"
+    if isinstance(payload, dict) and payload.get("error"):
+        return "error"
+    return "ok"
+
+
+def _jsonrpc_response_attributes(response: Response) -> dict[str, Any]:
+    raw_body = getattr(response, "body", b"")
+    if not raw_body:
+        return {}
+    try:
+        payload = json.loads(raw_body)
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    result = payload.get("result")
+    result = result if isinstance(result, dict) else {}
+    task = result.get("task") or result
+    task = task if isinstance(task, dict) else {}
+    metadata = task.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    attrs: dict[str, Any] = {}
+    if task.get("id"):
+        attrs["taskId"] = str(task["id"])
+        attrs["a2a.task.id"] = str(task["id"])
+    if metadata.get("skillId"):
+        attrs["workflowId"] = str(metadata["skillId"])
+        attrs["a2a.skill.id"] = str(metadata["skillId"])
+    return attrs
+
+
 def create_a2a_router() -> APIRouter:
     router = APIRouter(prefix=A2A_ENDPOINT_PREFIX, tags=["A2A"])
 
@@ -1554,16 +1663,63 @@ def create_a2a_router() -> APIRouter:
         launch_repo: A2ALaunchReservationRepository = Depends(resolve_a2a_launch_repo),
         volundr_factory: VolundrFactory = Depends(resolve_volundr_factory),
     ) -> Response:
-        handler = WorkflowTaskHandler(
-            request=request,
-            principal=principal,
-            bearer_token=bearer_token,
-            workflow_repo=workflow_repo,
-            campaign_repo=campaign_repo,
-            launch_repo=launch_repo,
-            volundr_factory=volundr_factory,
-        )
-        dispatcher = JsonRpcDispatcher(request_handler=handler)
-        return await dispatcher.handle_requests(request)
+        telemetry = get_observability()
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        attributes = _jsonrpc_observability_attributes(payload)
+        started = monotonic()
+        with telemetry.span(
+            f"ting.a2a.{attributes['rpc.method']}",
+            attributes=attributes,
+            carrier=_trace_context_from_headers(request.headers),
+        ) as span:
+            try:
+                handler = WorkflowTaskHandler(
+                    request=request,
+                    principal=principal,
+                    bearer_token=bearer_token,
+                    workflow_repo=workflow_repo,
+                    campaign_repo=campaign_repo,
+                    launch_repo=launch_repo,
+                    volundr_factory=volundr_factory,
+                )
+                dispatcher = JsonRpcDispatcher(request_handler=handler)
+                response = await dispatcher.handle_requests(request)
+            except Exception as exc:
+                telemetry.mark_error(span, type(exc).__name__, str(exc))
+                telemetry.count(
+                    "a2a_requests_total",
+                    attributes={"method": str(attributes["rpc.method"]), "outcome": "error"},
+                    description="A2A JSON-RPC requests handled by Ting.",
+                )
+                raise
+            outcome = _jsonrpc_response_outcome(response)
+            response_attributes = _jsonrpc_response_attributes(response)
+            for key, value in response_attributes.items():
+                span.set_attribute(key, value)
+            span.set_attribute("a2a.request.outcome", outcome)
+            span.set_attribute("http.response.status_code", response.status_code)
+            metric_attributes = {"method": str(attributes["rpc.method"]), "outcome": outcome}
+            telemetry.count(
+                "a2a_requests_total",
+                attributes=metric_attributes,
+                description="A2A JSON-RPC requests handled by Ting.",
+            )
+            telemetry.duration(
+                "a2a_request_duration_seconds",
+                monotonic() - started,
+                attributes=metric_attributes,
+                description="Duration of A2A JSON-RPC requests handled by Ting.",
+            )
+            logger.info(
+                "A2A JSON-RPC %s finished outcome=%s task_id=%s workflow_id=%s",
+                attributes["rpc.method"],
+                outcome,
+                str(response_attributes.get("taskId") or attributes.get("taskId") or ""),
+                str(response_attributes.get("workflowId") or attributes.get("workflowId") or ""),
+            )
+            return response
 
     return router

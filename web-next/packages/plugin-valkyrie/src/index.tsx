@@ -181,6 +181,8 @@ export type {
   LearningRecord,
   LearningScope,
   LearningStatus,
+  RealmCapability,
+  RealmDetail,
   RealmSummary,
   RealmTrustGrant,
   ReviewItem,
@@ -210,5 +212,6 @@ export type {
   ReviewSummaryFilters,
   SignalHistoryFilters,
   RealmCreate,
+  RealmDetailListener,
   TrustGrantCreate,
 } from './ports';

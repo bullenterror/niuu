@@ -276,6 +276,20 @@ def test_ting_gateway_admits_its_a2a_card_and_endpoint(method, path, admitted):
     assert any(method in route.methods and route.matches(path) for route in routes) is admitted
 
 
+def test_ting_agent_card_bypasses_jwt_validation():
+    """A2A discovery occurs before a caller has a platform credential."""
+    envoy = envoy_config(render_cedar(chart=CHART.parent / "ting"))
+    filters = envoy["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0][
+        "typed_config"
+    ]["http_filters"]
+    jwt_authn = next(
+        filter_ for filter_ in filters if filter_["name"] == "envoy.filters.http.jwt_authn"
+    )
+    rules = jwt_authn["typed_config"]["rules"]
+
+    assert {"match": {"prefix": "/.well-known/agent-card.json"}} in rules
+
+
 @pytest.mark.parametrize("path,prefix", [("/api/{id}/launch", True), ("/api/item-{id}", False)])
 def test_ambiguous_route_templates_rejected(path, prefix):
     from identity.authz_config import GatewayRoute

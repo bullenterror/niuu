@@ -104,6 +104,7 @@ _OBSERVABILITY_FIELDS = {
     "enabled",
     "trace_endpoint",
     "metric_endpoint",
+    "log_endpoint",
     "insecure",
     "metric_export_interval_milliseconds",
     "capture_content",

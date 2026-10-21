@@ -8,11 +8,14 @@ passes its own ``extract_principal`` auth dependency.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+import asyncio
+import json
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from datetime import datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from niuu.domain.models import Capability, Principal, Realm, TrustGrant
@@ -22,6 +25,12 @@ from niuu.domain.services.realm import RealmService
 # bypassing the owner check below. Matches the convention used across
 # src/niuu/adapters/inbound/*.py (rest_setup.py, rest_credentials_settings.py).
 ADMIN_ROLE = "volundr:admin"
+REALM_DETAIL_STREAM_EVENT = "realm.detail"
+
+
+def _to_sse(payload: object, *, event: str) -> str:
+    """Serialize a named realm-detail event as an SSE frame."""
+    return f"event: {event}\ndata: {json.dumps(payload, default=str)}\n\n"
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +190,8 @@ class RecordCapabilityRequest(BaseModel):
 def create_realms_router(
     extract_principal: Callable[..., Awaitable[object]],
     prefix: str = "/api/v1/realms",
+    *,
+    stream_interval_seconds: float,
 ) -> APIRouter:
     """Create the realm governance router.
 
@@ -191,12 +202,46 @@ def create_realms_router(
         every route so the caller is authenticated.
     prefix:
         URL prefix for the router (default ``/api/v1/realms``).
+    stream_interval_seconds:
+        Configured polling and keepalive interval for realm-detail streams.
     """
     router = APIRouter(
         prefix=prefix,
         tags=["Realms"],
         dependencies=[Depends(extract_principal)],
     )
+
+    async def _realm_detail(service: RealmService, slug: str) -> dict[str, object] | None:
+        realm = await service.get_realm(slug)
+        if realm is None:
+            return None
+        grants = await service.list_trust_grants(realm.id)
+        capabilities = await service.list_capabilities(realm.id)
+        return {
+            "realm": RealmResponse.from_domain(realm).model_dump(mode="json"),
+            "trust_grants": [
+                TrustGrantResponse.from_domain(grant).model_dump(mode="json") for grant in grants
+            ],
+            "capabilities": [
+                CapabilityResponse.from_domain(capability).model_dump(mode="json")
+                for capability in capabilities
+            ],
+        }
+
+    async def _realm_detail_stream(service: RealmService, slug: str) -> AsyncGenerator[str, None]:
+        """Emit complete realm-detail snapshots when its persisted state changes."""
+        previous: str | None = None
+        while True:
+            detail = await _realm_detail(service, slug)
+            if detail is None:
+                return
+            marker = json.dumps(detail, sort_keys=True, default=str)
+            if marker != previous:
+                previous = marker
+                yield _to_sse(detail, event=REALM_DETAIL_STREAM_EVENT)
+            else:
+                yield ": keepalive\n\n"
+            await asyncio.sleep(stream_interval_seconds)
 
     def _service(request: Request) -> RealmService:
         service: RealmService | None = getattr(request.app.state, "realm_service", None)
@@ -289,6 +334,20 @@ def create_realms_router(
         realm = await _require_realm(request, slug)
         return RealmResponse.from_domain(realm)
 
+    @router.get("/{slug}/stream", summary="Stream live realm detail")
+    async def stream_realm_detail(request: Request, slug: str) -> StreamingResponse:
+        """Stream the realm, trust grants, and capabilities as ``realm.detail`` events."""
+        await _require_realm(request, slug)
+        return StreamingResponse(
+            _realm_detail_stream(_service(request), slug),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     @router.delete("/{slug}", status_code=status.HTTP_204_NO_CONTENT)
     async def delete_realm(request: Request, slug: str) -> Response:
         """Delete a realm with its trust grants and capabilities.
@@ -368,6 +427,7 @@ __all__ = [
     "CapabilityResponse",
     "CreateRealmRequest",
     "CreateTrustGrantRequest",
+    "REALM_DETAIL_STREAM_EVENT",
     "RealmResponse",
     "RecordCapabilityRequest",
     "TrustGrantResponse",

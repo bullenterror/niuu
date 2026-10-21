@@ -52,6 +52,10 @@ class TestSettings:
         settings = Settings(database=DatabaseConfig(host="custom-host"))
         assert settings.database.host == "custom-host"
 
+    def test_observability_requires_trace_metric_and_log_endpoints(self) -> None:
+        with pytest.raises(ValueError, match="trace_endpoint, metric_endpoint, and log_endpoint"):
+            Settings(observability={"enabled": True, "trace_endpoint": "http://tempo:4317"})
+
     def test_shared_integrations_accepts_platform_env_name(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

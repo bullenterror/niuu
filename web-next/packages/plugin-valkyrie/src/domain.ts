@@ -1178,6 +1178,27 @@ export interface RealmTrustGrant {
   granted_at: string;
 }
 
+/** Capability as returned in a realm-detail stream snapshot. */
+export interface RealmCapability {
+  id: string;
+  realm_id: string;
+  name: string;
+  kind: string;
+  status: string;
+  trust_level: number;
+  mimir_page_path: string | null;
+  notes: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Complete event payload for ``realm.detail`` SSE frames. */
+export interface RealmDetail {
+  realm: RealmSummary;
+  trust_grants: RealmTrustGrant[];
+  capabilities: RealmCapability[];
+}
+
 /** The subset of GET /api/v1/ting/workflows the picker reads. */
 export interface TingWorkflowSummary {
   id: string;

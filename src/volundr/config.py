@@ -2607,6 +2607,11 @@ class Settings(BaseSettings):
         gt=0,
         description="Idle interval before the merged session stream sends a keepalive comment.",
     )
+    realm_detail_stream_interval_seconds: float = Field(
+        default=15.0,
+        gt=0,
+        description="Polling and keepalive interval for authenticated realm-detail SSE streams.",
+    )
     forge_stream_queue_maxsize: int = Field(
         default=256,
         gt=0,

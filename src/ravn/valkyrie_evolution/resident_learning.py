@@ -1556,6 +1556,7 @@ class ResidentLearningRuntime:
         verification it already earned, or require_verified_artifact would
         refuse to ever run the tool a rollback just restored.
         """
+        telemetry = get_observability()
         if request is None or build is None:
             request, build = review_inputs(artifact, self.identity)
         self_built = artifact.source_valkyrie_id == self.identity.valkyrie_id
@@ -1575,6 +1576,11 @@ class ResidentLearningRuntime:
                 relevant=True,
             )
             await self._publish_adoption(artifact, decision)
+            telemetry.count(
+                "ravn_learned_tool_installs_total",
+                attributes={"outcome": "rejected"},
+                description="Learned-tool install attempts by outcome.",
+            )
             return decision
         if not allowed and operator_item is None:
             decision = ResidentLearningDecision(
@@ -1597,10 +1603,20 @@ class ResidentLearningRuntime:
                 urgency=0.6,
             )
             await self._file_install_review(artifact, build, review, signal)
+            telemetry.count(
+                "ravn_learned_tool_installs_total",
+                attributes={"outcome": "held"},
+                description="Learned-tool install attempts by outcome.",
+            )
             return decision
 
         verify_rejection, verification = await self._verify_peer_artifact(artifact, review)
         if verify_rejection is not None:
+            telemetry.count(
+                "ravn_learned_tool_installs_total",
+                attributes={"outcome": verify_rejection.status},
+                description="Learned-tool install attempts by outcome.",
+            )
             return verify_rejection
         if verification is None:
             verification = verification_override
@@ -1629,6 +1645,11 @@ class ResidentLearningRuntime:
                     artifact.correlation_id or artifact.learning_id,
                     urgency=0.6,
                 )
+                telemetry.count(
+                    "ravn_learned_tool_installs_total",
+                    attributes={"outcome": "canary_failed"},
+                    description="Learned-tool install attempts by outcome.",
+                )
                 return ResidentLearningDecision(
                     "held",
                     f"Canary execution failed before install: {canary.error}",
@@ -1646,6 +1667,11 @@ class ResidentLearningRuntime:
                 canary_error=canary.error,
             )
             await self._publish_adoption(artifact, decision)
+            telemetry.count(
+                "ravn_learned_tool_installs_total",
+                attributes={"outcome": "canary_failed"},
+                description="Learned-tool install attempts by outcome.",
+            )
             return decision
 
         skill_name = await self._install_skill(artifact, build, verification=verification)
@@ -1669,6 +1695,11 @@ class ResidentLearningRuntime:
         )
         await self._publish_activation(artifact, skill_name, review)
         await self._publish_adoption(artifact, decision)
+        telemetry.count(
+            "ravn_learned_tool_installs_total",
+            attributes={"outcome": "installed"},
+            description="Learned-tool install attempts by outcome.",
+        )
         # Refresh the dashboard's inventory the moment a new skill lands.
         await self._refresh_skill_inventory()
         if self_built and artifact.flock_id:

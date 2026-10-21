@@ -10,6 +10,14 @@ from pydantic import ValidationError
 from volundr.config import ResidentRuntimesConfig, Settings
 
 
+def test_realm_detail_stream_interval_requires_a_positive_value() -> None:
+    settings = Settings.model_validate({"realm_detail_stream_interval_seconds": 7.5})
+
+    assert settings.realm_detail_stream_interval_seconds == 7.5
+    with pytest.raises(ValidationError):
+        Settings.model_validate({"realm_detail_stream_interval_seconds": 0})
+
+
 def test_settings_parse_resident_profiles() -> None:
     settings = Settings.model_validate(
         {

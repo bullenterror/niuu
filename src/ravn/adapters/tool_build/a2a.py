@@ -158,9 +158,19 @@ class A2AToolBuildBackend(ToolBuildBackend):
             "ravn.tool_build.backend": self.name,
             "ravn.tool_build.name": request.name,
             "ravn.tool_build.operation.id": request.operation_id,
+            "ravn.environment.id": request.environment_id,
+            "ravn.valkyrie.id": request.valkyrie_id,
+            "a2a.skill.id": self._workflow_id,
+            "ting.workflow.id": self._workflow_id,
+            "ting.connection.id": self._connection_id,
+            "tool.name": request.name,
+            "environment_id": request.environment_id,
+            "valkyrie_id": request.valkyrie_id,
+            "workflow_id": self._workflow_id,
+            "connection_id": self._connection_id,
             "a2a.card.url": self._card_url,
         }
-        with telemetry.span("ravn.a2a.tool_build", attributes=attributes) as span:
+        with telemetry.span("tool_build", attributes=attributes) as span:
             telemetry.event("ravn.tool_build.requested", attributes=attributes, content=request)
             try:
                 result = await self._build_observed(request)
@@ -175,6 +185,13 @@ class A2AToolBuildBackend(ToolBuildBackend):
                         "ravn.tool_build.outcome": "pending",
                         "a2a.task.id": exc.task_id,
                         "a2a.push.registered": exc.push_registered,
+                    },
+                )
+                telemetry.count(
+                    "ravn.tool_build.operations",
+                    attributes={
+                        "ravn.tool_build.backend": self.name,
+                        "ravn.tool_build.outcome": "pending",
                     },
                 )
                 raise
@@ -290,6 +307,10 @@ class A2AToolBuildBackend(ToolBuildBackend):
             {
                 "a2a.task.id": task_id,
                 "a2a.skill.id": workflow_id,
+                "ting.workflow.id": workflow_id,
+                "ting.connection.id": self._connection_id,
+                "workflow_id": workflow_id,
+                "connection_id": self._connection_id,
                 "a2a.endpoint": endpoint,
             }
         )
@@ -937,22 +958,30 @@ class A2AToolBuildBackend(ToolBuildBackend):
             # Target a specific Volundr connection (e.g. the resident's own
             # cluster) instead of the principal's default.
             metadata["connectionId"] = self._connection_id
-        trace_context = get_observability().inject()
-        if trace_context:
-            metadata["traceContext"] = trace_context
-        result = await self._rpc(
-            endpoint,
-            "SendMessage",
-            {
-                "message": {
-                    "messageId": operation_id,
-                    "contextId": operation_id,
-                    "role": "ROLE_USER",
-                    "parts": [{"text": prompt}],
-                    "metadata": metadata,
-                }
-            },
-        )
+        telemetry = get_observability()
+        attributes = {
+            "a2a.endpoint": endpoint,
+            "a2a.skill.id": workflow_id,
+            "ravn.tool_build.operation.id": operation_id,
+            "ravn.tool_build.name": request.name,
+        }
+        with telemetry.span("ravn.a2a.SendMessage", attributes=attributes):
+            trace_context = telemetry.inject()
+            if trace_context:
+                metadata["traceContext"] = trace_context
+            result = await self._rpc(
+                endpoint,
+                "SendMessage",
+                {
+                    "message": {
+                        "messageId": operation_id,
+                        "contextId": operation_id,
+                        "role": "ROLE_USER",
+                        "parts": [{"text": prompt}],
+                        "metadata": metadata,
+                    }
+                },
+            )
         task = result.get("task")
         if not isinstance(task, dict):
             raise ToolBuildError("A2A SendMessage returned no task")

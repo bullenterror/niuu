@@ -59,6 +59,11 @@ config:
   # and loaded via RAVN_CONFIG. Canonical YAML settings are preferred;
   # documented legacy environment aliases remain supported. Example:
   #   settings:
+  #     observability:
+  #       enabled: true
+  #       trace_endpoint: "http://otel-collector:4317"
+  #       metric_endpoint: "http://otel-collector:4318/v1/metrics"
+  #       log_endpoint: "http://otel-collector:4318/v1/logs"
   #     gateway:
   #       platform:
   #         base_url: "http://niuu-volundr.volundr.svc.cluster.local:80"

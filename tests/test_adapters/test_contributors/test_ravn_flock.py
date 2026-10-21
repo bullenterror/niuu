@@ -892,6 +892,7 @@ class TestMountedConfig:
                     "enabled": True,
                     "trace_endpoint": "https://tempo.example:443",
                     "metric_endpoint": "https://mimir.example/v1/metrics",
+                    "log_endpoint": "https://loki.example/v1/logs",
                     "capture_content": True,
                 },
             },
@@ -905,6 +906,7 @@ class TestMountedConfig:
             "enabled": True,
             "trace_endpoint": "https://tempo.example:443",
             "metric_endpoint": "https://mimir.example/v1/metrics",
+            "log_endpoint": "https://loki.example/v1/logs",
             "capture_content": True,
             "service_name": "ravn",
         }
@@ -914,6 +916,7 @@ class TestMountedConfig:
         assert skuld_env["SKULD__OBSERVABILITY__METRIC_ENDPOINT"] == (
             "https://mimir.example/v1/metrics"
         )
+        assert skuld_env["SKULD__OBSERVABILITY__LOG_ENDPOINT"] == "https://loki.example/v1/logs"
 
     async def test_ravn_sidecars_use_unique_service_ports(self, session, flock_template):
         """Each Ravn API server must bind its own port inside the shared pod netns."""

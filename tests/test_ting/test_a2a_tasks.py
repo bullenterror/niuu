@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import gzip
+import logging
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Thread
 from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
@@ -13,6 +19,7 @@ import jwt
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from grpc import server as grpc_server
 
 from identity.adapters.authorization import AllowAllAuthorizationAdapter
 from identity.adapters.identity import EnvoyHeaderAuthenticationAdapter
@@ -586,6 +593,114 @@ def _send_params(skill_id: str, *, prompt: str = "Build the widget tool") -> dic
     }
 
 
+class _LocalOTLPHTTPReceiver(ThreadingHTTPServer):
+    """In-process OTLP receiver with queryable metric and log payloads."""
+
+    def __init__(self) -> None:
+        super().__init__(("127.0.0.1", 0), _LocalOTLPRequestHandler)
+        self.metric_requests: list[Any] = []
+        self.log_requests: list[Any] = []
+
+    @property
+    def endpoint(self) -> str:
+        host, port = self.server_address
+        return f"http://{host}:{port}"
+
+
+class _LocalOTLPRequestHandler(BaseHTTPRequestHandler):
+    def do_POST(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
+        from opentelemetry.proto.collector.logs.v1.logs_service_pb2 import ExportLogsServiceRequest
+        from opentelemetry.proto.collector.metrics.v1.metrics_service_pb2 import (
+            ExportMetricsServiceRequest,
+        )
+
+        body = self.rfile.read(int(self.headers["Content-Length"]))
+        if self.headers.get("Content-Encoding") == "gzip":
+            body = gzip.decompress(body)
+        receiver = self.server
+        if self.path == "/v1/metrics":
+            request = ExportMetricsServiceRequest.FromString(body)
+            receiver.metric_requests.append(request)  # type: ignore[attr-defined]
+        elif self.path == "/v1/logs":
+            request = ExportLogsServiceRequest.FromString(body)
+            receiver.log_requests.append(request)  # type: ignore[attr-defined]
+        else:
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return None
+
+
+class _LocalTempoReceiver:
+    """In-process Tempo OTLP/gRPC receiver with a trace-name query."""
+
+    def __init__(self) -> None:
+        from opentelemetry.proto.collector.trace.v1.trace_service_pb2_grpc import (
+            TraceServiceServicer,
+            add_TraceServiceServicer_to_server,
+        )
+
+        requests: list[Any] = []
+
+        class Receiver(TraceServiceServicer):
+            def Export(self, request, _context):  # noqa: N802 - OTLP service contract
+                requests.append(request)
+                from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (
+                    ExportTraceServiceResponse,
+                )
+
+                return ExportTraceServiceResponse()
+
+        self.requests = requests
+        self.server = grpc_server(ThreadPoolExecutor(max_workers=1))
+        add_TraceServiceServicer_to_server(Receiver(), self.server)
+        self.port = self.server.add_insecure_port("127.0.0.1:0")
+
+    @property
+    def endpoint(self) -> str:
+        return f"127.0.0.1:{self.port}"
+
+    def start(self) -> None:
+        self.server.start()
+
+    def stop(self) -> None:
+        self.server.stop(0).wait()
+
+
+def _metric_names(requests: list[Any]) -> set[str]:
+    return {
+        metric.name
+        for request in requests
+        for resource_metrics in request.resource_metrics
+        for scope_metrics in resource_metrics.scope_metrics
+        for metric in scope_metrics.metrics
+    }
+
+
+def _span_names(requests: list[Any]) -> set[str]:
+    return {
+        span.name
+        for request in requests
+        for resource_spans in request.resource_spans
+        for scope_spans in resource_spans.scope_spans
+        for span in scope_spans.spans
+    }
+
+
+def _log_records(requests: list[Any]) -> list[Any]:
+    return [
+        log_record
+        for request in requests
+        for resource_logs in request.resource_logs
+        for scope_logs in resource_logs.scope_logs
+        for log_record in scope_logs.log_records
+    ]
+
+
 class TestSendMessage:
     def test_launches_workflow_and_returns_submitted_task(self) -> None:
         workflow = _make_workflow()
@@ -662,6 +777,181 @@ class TestSendMessage:
         campaign = asyncio.run(campaigns.get_campaign_by_slug(task_id))
         assert campaign is not None
         assert "actor_id" not in campaign.metadata
+
+    def test_task_lifecycle_drives_send_get_and_cancel_over_jsonrpc(self) -> None:
+        """Exercise all required task operations against one launched workflow."""
+        workflow = _make_workflow()
+        client, campaigns, port = _make_client(
+            workflow_repo=InMemoryWorkflowRepository([workflow]),
+        )
+
+        sent = _rpc(client, "SendMessage", _send_params(str(workflow.id)))
+
+        assert sent.status_code == 200
+        task_id = sent.json()["result"]["task"]["id"]
+        fetched = _rpc(client, "GetTask", {"id": task_id})
+        canceled = _rpc(client, "CancelTask", {"id": task_id})
+
+        assert fetched.status_code == 200
+        assert fetched.json()["result"]["id"] == task_id
+        assert canceled.status_code == 200
+        assert canceled.json()["result"]["status"]["state"] == "TASK_STATE_CANCELED"
+        assert port.stopped == ["session-123"]
+        persisted = next(iter(campaigns._campaigns.values()))
+        assert persisted.metadata["a2a_canceled"] is True
+
+    def test_jsonrpc_span_uses_traceparent_header(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class Span:
+            def set_attribute(self, _name, _value) -> None:
+                return None
+
+        class RecordingTelemetry:
+            def __init__(self) -> None:
+                self.spans: list[tuple[str, dict[str, Any]]] = []
+                self.counts: list[tuple[str, dict[str, Any]]] = []
+                self.durations: list[str] = []
+
+            @contextmanager
+            def span(self, name, **kwargs):
+                self.spans.append(
+                    (
+                        name,
+                        {
+                            key: dict(value) if isinstance(value, dict) else value
+                            for key, value in kwargs.items()
+                        },
+                    )
+                )
+                yield Span()
+
+            def event(self, *_args, **_kwargs) -> None:
+                return None
+
+            def inject(self) -> dict[str, str]:
+                return {}
+
+            def mark_error(self, *_args, **_kwargs) -> None:
+                return None
+
+            def count(self, name, *, attributes=None, **_kwargs) -> None:
+                self.counts.append((name, dict(attributes or {})))
+
+            def duration(self, name, *_args, **_kwargs) -> None:
+                self.durations.append(name)
+
+        telemetry = RecordingTelemetry()
+        monkeypatch.setattr("ting.api.a2a.get_observability", lambda: telemetry)
+        workflow = _make_workflow()
+        client, _campaigns, _port = _make_client(
+            workflow_repo=InMemoryWorkflowRepository([workflow]),
+        )
+        traceparent = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"
+
+        response = _rpc(
+            client,
+            "SendMessage",
+            _send_params(str(workflow.id)),
+            headers={**_headers(), "traceparent": traceparent},
+        )
+
+        assert response.status_code == 200
+        assert telemetry.spans[0] == (
+            "ting.a2a.SendMessage",
+            {
+                "attributes": {
+                    "rpc.system": "jsonrpc",
+                    "rpc.method": "SendMessage",
+                    "workflowId": str(workflow.id),
+                    "a2a.skill.id": str(workflow.id),
+                    "a2a.message.id": "msg-1",
+                },
+                "carrier": {"traceparent": traceparent},
+            },
+        )
+        assert (
+            "a2a_requests_total",
+            {"method": "SendMessage", "outcome": "ok"},
+        ) in telemetry.counts
+        assert "a2a_request_duration_seconds" in telemetry.durations
+
+    def test_a2a_otlp_export_reaches_tempo_and_loki_receivers(self) -> None:
+        """Exercise Ting's real OTLP exporters against local queryable receivers."""
+        from niuu.domain.observability import ObservabilityConfig
+        from niuu.observability import configure_observability, shutdown_observability
+
+        tempo = _LocalTempoReceiver()
+        loki = _LocalOTLPHTTPReceiver()
+        tempo.start()
+        loki_thread = Thread(target=loki.serve_forever, daemon=True)
+        loki_thread.start()
+        a2a_logger = logging.getLogger("ting.api.a2a")
+        previous_level = a2a_logger.level
+        a2a_logger.setLevel(logging.INFO)
+        traceparent = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"
+        try:
+            telemetry = configure_observability(
+                ObservabilityConfig(
+                    enabled=True,
+                    trace_endpoint=tempo.endpoint,
+                    metric_endpoint=f"{loki.endpoint}/v1/metrics",
+                    log_endpoint=f"{loki.endpoint}/v1/logs",
+                    insecure=True,
+                    metric_export_interval_milliseconds=1_000,
+                ),
+                component="ting",
+                default_service_name="ting",
+            )
+            workflow = _make_workflow()
+            client, _campaigns, _port = _make_client(
+                workflow_repo=InMemoryWorkflowRepository([workflow]),
+            )
+
+            response = _rpc(
+                client,
+                "SendMessage",
+                _send_params(str(workflow.id)),
+                headers={**_headers(), "traceparent": traceparent},
+            )
+
+            assert response.status_code == 200
+            telemetry.shutdown()
+
+            assert "ting.a2a.SendMessage" in _span_names(tempo.requests)
+            trace_ids = {
+                span.trace_id.hex()
+                for request in tempo.requests
+                for resource_spans in request.resource_spans
+                for scope_spans in resource_spans.scope_spans
+                for span in scope_spans.spans
+                if span.name == "ting.a2a.SendMessage"
+            }
+            assert trace_ids == {"0123456789abcdef0123456789abcdef"}
+            assert {
+                "a2a_requests_total",
+                "a2a_request_duration_seconds",
+            }.issubset(_metric_names(loki.metric_requests))
+            records = _log_records(loki.log_requests)
+            a2a_records = [
+                record
+                for record in records
+                if "A2A JSON-RPC SendMessage finished" in record.body.string_value
+            ]
+            assert len(a2a_records) == 1
+            assert a2a_records[0].trace_id.hex() == "0123456789abcdef0123456789abcdef"
+            assert a2a_records[0].span_id
+            print(
+                "OTLP exporter proof: "
+                "Tempo query span=ting.a2a.SendMessage trace_id=0123456789abcdef0123456789abcdef; "
+                "Loki receiver query metrics=a2a_requests_total,a2a_request_duration_seconds; "
+                "logs=A2A JSON-RPC SendMessage finished with correlated trace_id."
+            )
+        finally:
+            a2a_logger.setLevel(previous_level)
+            shutdown_observability()
+            loki.shutdown()
+            loki.server_close()
+            loki_thread.join()
+            tempo.stop()
 
     def test_reuses_task_when_message_is_retried(self) -> None:
         workflow = _make_workflow()
