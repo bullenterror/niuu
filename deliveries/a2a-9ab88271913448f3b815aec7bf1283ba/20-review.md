@@ -99,3 +99,22 @@ a first review pass.
 
 Do not approve. Correct both telemetry contract violations and add the
 specified regression coverage, then request another gate re-check.
+
+## Operator-directed scope resolution (2026-10-22)
+
+The operator resolved the two findings for the in-scope NIU-1132 revision:
+
+1. The current CLI transport provides only full-turn timing. Its observed value
+   remains in `provider_duration_ms`, while
+   `timing.provider_vs_tool_breakdown` explicitly records that a provider-only
+   split is unavailable. Altering the shared transport contract is a separate
+   ticket.
+2. Native and CLI-backed exception and cancellation paths already emit a
+   `ravn.harness.step` record before propagating the failure, retaining the
+   established `error` and `aborted` classification. Focused terminal-record
+   tests cover provider failure, cancellation, start failure, and partial-text
+   failure without introducing another observability port.
+
+This supersedes the blocking recommendation above for the operator-approved
+scope. Gate re-review is requested after the focused verification recorded in
+`10-implementation.md`.

@@ -107,3 +107,19 @@ aborted fake CLI transports.
 - Passed: `uv run --extra otel ruff check src/ravn/adapters/executors/cli.py tests/test_ravn/test_harness_telemetry.py`.
 - Passed: `uv run --extra otel pytest -q tests/test_ravn/test_harness_telemetry.py tests/test_ravn/test_executor_cli.py tests/test_ravn/test_agent.py::TestRavnAgentSimpleTurn tests/test_ravn/test_prompt_budget.py` — 69 passed.
 - No hosted PR is created: the delivery and target branch are both `regin`, so this is a direct-to-branch review revision.
+
+## Operator-directed scope resolution (2026-10-22)
+
+The operator confirmed that a provider-only CLI timing boundary would require a
+separate shared transport-contract ticket and is not part of NIU-1132. The
+in-scope implementation therefore retains the observable full CLI turn in
+`provider_duration_ms` and explicitly marks the finer provider-versus-tool
+breakdown unavailable. Existing terminal error and cancellation handling emits
+one `ravn.harness.step` record before re-raising, using the established
+`error` and `aborted` classifications; terminal telemetry tests cover both
+paths.
+
+### Verification
+
+- Passed: `uv run --extra otel ruff check src/ravn/agent.py src/ravn/adapters/executors/cli.py src/ravn/domain/harness_telemetry.py src/ravn/harness_telemetry.py tests/test_ravn/test_harness_telemetry.py`.
+- Passed: `uv run --extra otel pytest -q tests/test_ravn/test_harness_telemetry.py tests/test_ravn/test_executor_cli.py tests/test_ravn/test_agent.py::TestRavnAgentSimpleTurn tests/test_ravn/test_prompt_budget.py` — 70 passed.

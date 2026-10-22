@@ -44,3 +44,12 @@ complete `CliTurnRunner` turn, not a provider-only boundary; the canonical
 report their provider-only duration. Failure and cancellation paths continue to
 emit terminal records through the existing `ravn.harness.step` observability
 event before propagating the existing error classification.
+
+## Operator-directed scope resolution (2026-10-22)
+
+Tracker status is **In Progress** while this revision returns to the gate. The
+operator confirmed that changing the shared CLI transport contract is outside
+NIU-1132. The existing full `CliTurnRunner` duration remains the available
+CLI value in `provider_duration_ms`, and
+`timing.provider_vs_tool_breakdown` explicitly states that a provider-only
+split is unavailable. Native records continue to report provider-only timing.
