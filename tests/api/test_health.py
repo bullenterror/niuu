@@ -67,3 +67,35 @@ def test_health_rate_limit_refills_one_token_per_second() -> None:
     now = 1.0
 
     assert limiter.retry_after(endpoint="/health", client_ip="198.51.100.10") is None
+
+
+def test_health_rate_limit_discards_inactive_full_buckets() -> None:
+    now = 0.0
+    limiter = TokenBucketRateLimiter(
+        capacity=1,
+        refill_rate=1.0,
+        bucket_idle_ttl=1.0,
+        max_buckets=2,
+        clock=lambda: now,
+    )
+
+    assert limiter.retry_after(endpoint="/health", client_ip="198.51.100.10") is None
+
+    now = 1.0
+
+    assert limiter.retry_after(endpoint="/health", client_ip="198.51.100.11") is None
+    assert ("/health", "198.51.100.10") not in limiter._buckets
+
+
+def test_health_rate_limit_caps_retained_buckets() -> None:
+    limiter = TokenBucketRateLimiter(
+        bucket_idle_ttl=60.0,
+        max_buckets=2,
+        clock=lambda: 0.0,
+    )
+
+    for client_ip in ("198.51.100.10", "198.51.100.11", "198.51.100.12"):
+        assert limiter.retry_after(endpoint="/health", client_ip=client_ip) is None
+
+    assert len(limiter._buckets) == 2
+    assert ("/health", "198.51.100.10") not in limiter._buckets

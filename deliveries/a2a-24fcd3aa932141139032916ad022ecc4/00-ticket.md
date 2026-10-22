@@ -16,3 +16,9 @@ changes a `/status` endpoint.
 Each client IP has a 60-token bucket for `GET /health`, refilled at one token
 per second. Requests with a token continue returning the existing 200 body;
 requests without one return 429 and a `Retry-After` header.
+
+## Review revision
+
+The reviewer found unbounded per-IP bucket retention on the public endpoint. This
+revision bounds retained buckets and removes inactive, fully refilled buckets;
+the tracker was returned to `In Progress` for the fix.
