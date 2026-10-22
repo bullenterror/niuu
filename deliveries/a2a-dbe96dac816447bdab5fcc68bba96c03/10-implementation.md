@@ -37,8 +37,8 @@ limit path, cleanup after a stream closes, changed-summary-only fan-out,
 
 ## Hosted delivery
 
-PR [#1162](https://github.com/niuulabs/niuu/pull/1162) targets `regin`
-from `feat/niu-298-sse-stream`.
+PR [#1162](https://github.com/niuulabs/niuu/pull/1162) merged
+`feat/niu-298-sse-stream` into `regin` (merge commit `bad34ddb`).
 
 ## Review revision
 
