@@ -8,4 +8,7 @@
 
 ## Revision acceptance
 
-Address the review finding that CLI provider duration must exclude the union of concurrent remote-tool intervals, including work that remains unfinished when a turn fails. Preserve canonical terminal records for native and CLI provider failures, including normalized error categories.
+Address the review finding that terminal telemetry must retain usage reported
+before a native or CLI provider failure. Native terminal records must retain the
+last streamed `MESSAGE_DONE` usage, and CLI terminal records must retain the
+latest transport payload containing `modelUsage` even if `run_prompt()` raises.

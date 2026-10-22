@@ -233,6 +233,7 @@ class RavnAgent:
         self._last_provider_duration_ms: float | None = None
         self._last_ttft_ms: float | None = None
         self._last_usage_available = False
+        self._last_usage: TokenUsage | None = None
         # NIU-1118: cap one tool result's contribution to history; 0 disables
         self._max_tool_result_chars = max_tool_result_chars
 
@@ -1379,10 +1380,13 @@ class RavnAgent:
         """Emit the normalized record without replacing established LLM telemetry."""
         compression = self._last_compression_result
         unavailable: dict[str, str] = {"provider_call.id": "provider_does_not_expose_request_id"}
-        if response is None:
-            unavailable["usage"] = "provider_call_did_not_complete"
-        elif not self._last_usage_available:
-            unavailable["usage"] = "provider_did_not_report_usage"
+        observed_usage = self._last_usage if self._last_usage_available else None
+        if observed_usage is None:
+            unavailable["usage"] = (
+                "provider_call_did_not_complete"
+                if response is None
+                else "provider_did_not_report_usage"
+            )
         if self._last_ttft_ms is None:
             unavailable["timing.ttft_ms"] = (
                 "provider_call_terminated_before_text"
@@ -1414,7 +1418,7 @@ class RavnAgent:
             ttft_ms=self._last_ttft_ms,
             tool_wall_time_ms=tool_wall_time_ms,
             tool_call_count=len(response.tool_calls) if response is not None else 0,
-            usage=response.usage if response is not None and self._last_usage_available else None,
+            usage=observed_usage,
             stop_reason=(
                 str(response.stop_reason) if response is not None else terminal_stop_reason
             ),
@@ -1538,6 +1542,7 @@ class RavnAgent:
         accumulated_reasoning = ""
         self._last_ttft_ms = None
         self._last_usage_available = False
+        self._last_usage = None
         stream_started = time.monotonic()
         tool_calls: list[ToolCall] = []
         final_usage = TokenUsage(input_tokens=0, output_tokens=0)
@@ -1590,6 +1595,7 @@ class RavnAgent:
                 case StreamEventType.MESSAGE_DONE:
                     if event.usage:
                         final_usage = event.usage
+                        self._last_usage = event.usage
                         self._last_usage_available = True
 
         # Decided after the stream rather than inside MESSAGE_DONE, because

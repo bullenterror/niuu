@@ -492,11 +492,18 @@ class CliTransportAgent(ExecutionAgentPort):
         try:
             response_text = await self._turn_runner.run_prompt(prompt, request_id=correlation_id)
         finally:
+            result_payload = self._transport.last_result
+            if isinstance(result_payload, dict):
+                observed_usage = self._turn_result_payload.get("modelUsage")
+                if isinstance(observed_usage, dict) and not isinstance(
+                    result_payload.get("modelUsage"), dict
+                ):
+                    result_payload = {**result_payload, "modelUsage": observed_usage}
+                self._turn_result_payload = result_payload
             self._turn_finished_at = monotonic()
             self._turn_duration_ms = (self._turn_finished_at - self._turn_started_at) * 1_000
 
-        result_payload = self._transport.last_result or {}
-        self._turn_result_payload = result_payload
+        result_payload = self._turn_result_payload
         self._raise_if_transport_failed(result_payload)
 
         usage = _sum_model_usage(result_payload)
@@ -726,6 +733,9 @@ class CliTransportAgent(ExecutionAgentPort):
             raise RuntimeError(str(message))
 
     async def _handle_transport_event(self, data: dict) -> None:
+        if isinstance(data.get("modelUsage"), dict):
+            self._turn_result_payload = data
+
         correlation_id = str(self._session.id)
         event_type = str(data.get("type", ""))
 

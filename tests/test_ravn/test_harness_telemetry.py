@@ -422,6 +422,24 @@ class _FailingAfterTextLLM(LLMPort):
         raise AssertionError("generate is not used by a normal harness step")
 
 
+class _FailingAfterUsageLLM(LLMPort):
+    async def stream(self, *_args: object, **_kwargs: object) -> AsyncIterator[StreamEvent]:
+        yield StreamEvent(
+            type=StreamEventType.MESSAGE_DONE,
+            usage=TokenUsage(
+                input_tokens=3,
+                output_tokens=1,
+                cache_read_tokens=4,
+                cache_write_tokens=2,
+                thinking_tokens=1,
+            ),
+        )
+        raise RuntimeError("provider failure after usage")
+
+    async def generate(self, *_args: object, **_kwargs: object):
+        raise AssertionError("generate is not used by a normal harness step")
+
+
 class _TerminalCliTransport(CLITransport):
     terminal_error: BaseException = RuntimeError("provider failure contains sensitive details")
 
@@ -473,6 +491,34 @@ class _FailingAfterTextCliTransport(_TerminalCliTransport):
     async def send_message(self, _content: str) -> None:
         await self._emit({"type": "content_block_delta", "delta": {"text": "partial output"}})
         raise RuntimeError("provider failure after streamed text")
+
+
+class _FailingAfterUsageCliTransport(_TerminalCliTransport):
+    def __init__(self) -> None:
+        super().__init__()
+        self._last_result: dict | None = None
+
+    async def send_message(self, _content: str) -> None:
+        await self._emit(
+            {
+                "type": "result",
+                "modelUsage": {
+                    "test-model": {
+                        "inputTokens": 3,
+                        "outputTokens": 1,
+                        "cacheReadInputTokens": 4,
+                        "cacheCreationInputTokens": 2,
+                        "thinkingTokens": 1,
+                    }
+                },
+            }
+        )
+        self._last_result = {"type": "error", "is_error": True}
+        raise RuntimeError("provider failure after usage")
+
+    @property
+    def last_result(self) -> dict | None:
+        return self._last_result
 
 
 def _build_cli_agent(transport_adapter: str) -> object:
@@ -615,6 +661,35 @@ async def test_cli_start_failure_emits_terminal_record_with_explicit_missing_dur
     assert record["unavailable"]["timing.provider_duration_ms"] == (
         "cli_transport_turn_duration_not_observed"
     )
+
+
+@pytest.mark.asyncio
+async def test_terminal_records_preserve_usage_reported_before_provider_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    telemetry = _RecordingTelemetry()
+    monkeypatch.setattr("ravn.agent.get_observability", lambda: telemetry)
+    monkeypatch.setattr("ravn.adapters.executors.cli.get_observability", lambda: telemetry)
+    monkeypatch.setattr("ravn.harness_telemetry.get_observability", lambda: telemetry)
+
+    with pytest.raises(RuntimeError, match="after usage"):
+        await _build_native_agent(_FailingAfterUsageLLM()).run_turn("test")
+    with pytest.raises(RuntimeError, match="after usage"):
+        await _build_cli_agent(
+            "tests.test_ravn.test_harness_telemetry._FailingAfterUsageCliTransport"
+        ).run_turn("test")
+
+    native_record, cli_record = _harness_records(telemetry)
+    expected_usage = {
+        "input_tokens": 3,
+        "output_tokens": 1,
+        "cache_read_tokens": 4,
+        "cache_write_tokens": 2,
+        "thinking_tokens": 1,
+    }
+    for record in (native_record, cli_record):
+        assert record["usage"] == expected_usage
+        assert "usage" not in record["unavailable"]
 
 
 @pytest.mark.asyncio
