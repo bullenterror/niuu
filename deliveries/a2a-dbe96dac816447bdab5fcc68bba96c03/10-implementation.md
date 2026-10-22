@@ -56,3 +56,6 @@ from `feat/niu-298-sse-stream`.
 
 - Passed: `uv run ruff check src/yggdrasil tests/api/test_routes_sse.py tests/sse`
 - Passed: `uv run --extra dev pytest -q --cov=src/yggdrasil --cov-branch --cov-fail-under=85 tests/api/test_routes_sse.py tests/sse` — `12 passed`, `97.58%` coverage.
+- Full suite attempted: `uv run --extra dev pytest -q` is blocked at collection
+  by the pre-existing missing `kubernetes_asyncio` dependency required by
+  `tests/test_adapters/test_user_home_files.py`.
