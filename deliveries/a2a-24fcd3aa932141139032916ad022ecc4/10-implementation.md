@@ -43,3 +43,5 @@ bucket retention.
 - Passed: `uv run ruff check src/yggdrasil/rate_limit.py tests/api/test_health.py`.
 - Passed: `uv run pytest -q --no-cov tests/api/test_health.py tests/api/test_routes_sse.py tests/sse/test_poller.py` (19 passed; one existing TestClient deprecation warning).
 - Passed: `git diff --check`.
+
+The review revision is committed and pushed directly to `regin`; this direct-regin delivery has no hosted PR.

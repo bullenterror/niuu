@@ -3,7 +3,7 @@
 - **Tracker:** [NIU-305](https://linear.app/niuu/issue/NIU-305/add-rate-limiting-to-public-endpoints)
 - **Delivery slug:** `a2a-24fcd3aa932141139032916ad022ecc4`
 - **Required base and delivery branch:** `regin`
-- **Tracker status:** `In Progress`
+- **Tracker status:** `In Review`
 
 ## Scope correction
 
