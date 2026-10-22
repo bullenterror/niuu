@@ -74,20 +74,6 @@ UserInputFn = Callable[[str], Coroutine[Any, Any, str]]
 _ASK_USER_TOOL_NAME = "ask_user"
 
 
-def _llm_error_category(exc: BaseException) -> str:
-    """Classify a terminal provider exception without exporting its content."""
-    current: BaseException | None = exc
-    seen: set[int] = set()
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        if isinstance(current, asyncio.CancelledError):
-            return "aborted"
-        if isinstance(current, TimeoutError) or "timeout" in type(current).__name__.lower():
-            return "timeout"
-        current = current.__cause__ or current.__context__
-    return "provider_error"
-
-
 class RavnAgent:
     """Turn-based agent that converses with an LLM and executes tools.
 
@@ -597,7 +583,6 @@ class RavnAgent:
                         tool_wall_time_ms=0.0,
                         recovery_state=stop_reason,
                         terminal_stop_reason=stop_reason,
-                        llm_error_category=_llm_error_category(exc),
                     )
                     raise
 
@@ -1374,7 +1359,6 @@ class RavnAgent:
         tool_wall_time_ms: float,
         recovery_state: str,
         terminal_stop_reason: str | None = None,
-        llm_error_category: str | None = None,
     ) -> None:
         """Emit the normalized record without replacing established LLM telemetry."""
         compression = self._last_compression_result
@@ -1418,7 +1402,6 @@ class RavnAgent:
             stop_reason=(
                 str(response.stop_reason) if response is not None else terminal_stop_reason
             ),
-            llm_error_category=llm_error_category,
             retry_index=iteration,
             recovery_state=recovery_state,
             unavailable=unavailable,
