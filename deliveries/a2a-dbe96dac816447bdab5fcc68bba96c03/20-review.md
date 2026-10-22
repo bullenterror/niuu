@@ -2,39 +2,23 @@
 
 ## Verdict
 
-`needs_changes`
+`pass`
 
 ## Findings
 
-### Major — startup polls every adapter twice without waiting for the configured interval
+### Minor — delivery record has not been updated after the cadence PR merged
 
-**`src/yggdrasil/main.py:46-47`** performs an immediate startup poll and then
-starts the background task. **`src/yggdrasil/sse/poller.py:67-69`** makes that
-task call `poll_once()` before its first `sleep()`, so every adapter is called
-twice back-to-back at startup rather than once per `poll_interval`. This can
-violate the configured polling rate and unnecessarily hit health adapters.
-Since the lifespan already obtains the snapshot needed for an immediate first
-SSE event, make the recurring loop sleep for `poll_interval` before its next
-poll (or otherwise avoid one of the two startup polls) and add a regression
-test proving no second call occurs before the interval elapses.
+**`deliveries/a2a-dbe96dac816447bdab5fcc68bba96c03/00-ticket.md:7-8`** still describes the tracker as `In Progress` and the cadence work as an unmerged follow-up branch, although PR #1163 is now merged into `regin` at `525f7b43` and the tracker is in `In Review`. Update the handoff record to the current merge and review status on the next delivery-record update.
 
 ## Verification notes
 
-- Re-checked the merged PR [#1162](https://github.com/niuulabs/niuu/pull/1162)
-  against `regin` at merge commit `bad34ddb`; it correctly targets `regin`.
-- The prior requests are satisfied: `routes_sse.py:24-25` captures the summary
-  before registration, `stream.py:31` emits that captured value, and
-  `test_routes_sse.py:108-127` covers exactly one queued update after it.
-- The focused gate passes: `uv run --extra dev pytest -q
-  --cov=src/yggdrasil --cov-branch --cov-fail-under=85 tests/api/test_routes_sse.py
-  tests/sse` — 12 passed, 97.58%.
-- `uv run ruff check src/yggdrasil tests/api/test_routes_sse.py tests/sse`
-  passes. The full suite remains blocked during collection by the pre-existing
-  missing `kubernetes_asyncio` dependency imported by
-  `tests/test_adapters/test_user_home_files.py`.
+- This is a re-check, not a first pass. The exact prior request is satisfied in merged commit `aa39bc97`, included by PR #1163 into `regin` at `525f7b43`.
+- `src/yggdrasil/sse/poller.py:67-69` now waits for the configured interval before `poll_once()`, preserving the lifespan's initial snapshot without a second immediate adapter call.
+- `tests/sse/test_poller.py:91-102` adds the requested regression assertion that a poller started after the initial snapshot does not call the adapter again before the interval elapses.
+- Passed: `uv run ruff check src/yggdrasil tests/api/test_routes_sse.py tests/sse`.
+- Passed: `uv run --extra dev pytest -q --cov=src/yggdrasil --cov-branch --cov-fail-under=85 tests/api/test_routes_sse.py tests/sse` — 13 passed, 97.10% coverage.
+- Full suite attempt remains blocked during collection by the environment's missing `kubernetes_asyncio` dependency imported by `tests/test_adapters/test_user_home_files.py`.
 
 ## Recommendation
 
-Follow up on the merged change: remove the duplicate startup poll, add the
-cadence regression test, and re-run the focused gate plus the full suite when
-the environment dependency is available.
+Accept the merged cadence fix. Update the stale delivery-status lines in a follow-up documentation record.
