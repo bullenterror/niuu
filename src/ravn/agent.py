@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import itertools
 import logging
 import re
@@ -566,11 +567,24 @@ class RavnAgent:
                 "ravn.harness.phase": "model_turn",
             }
             with get_observability().span("ravn harness step", attributes=step_attributes):
-                llm_response = await self._call_llm_streaming(
-                    system_prompt=effective_system,
-                    messages=messages_for_llm,
-                    thinking=thinking_param,
-                )
+                try:
+                    llm_response = await self._call_llm_streaming(
+                        system_prompt=effective_system,
+                        messages=messages_for_llm,
+                        thinking=thinking_param,
+                    )
+                except BaseException as exc:
+                    stop_reason = "aborted" if isinstance(exc, asyncio.CancelledError) else "error"
+                    self._emit_native_harness_step(
+                        iteration=iteration,
+                        prompt_sections=prompt_sections,
+                        message_count=len(messages_for_llm),
+                        response=None,
+                        tool_wall_time_ms=0.0,
+                        recovery_state=stop_reason,
+                        terminal_stop_reason=stop_reason,
+                    )
+                    raise
 
                 # Consume one iteration from the budget.
                 if self._iteration_budget is not None:
@@ -1341,17 +1355,23 @@ class RavnAgent:
         iteration: int,
         prompt_sections: dict[str, int],
         message_count: int,
-        response: LLMResponse,
+        response: LLMResponse | None,
         tool_wall_time_ms: float,
         recovery_state: str,
+        terminal_stop_reason: str | None = None,
     ) -> None:
         """Emit the normalized record without replacing established LLM telemetry."""
         compression = self._last_compression_result
         unavailable: dict[str, str] = {"provider_call.id": "provider_does_not_expose_request_id"}
-        if not self._last_usage_available:
+        if response is None:
+            unavailable["usage"] = "provider_call_did_not_complete"
+            unavailable["timing.ttft_ms"] = "provider_call_terminated_before_text"
+        elif not self._last_usage_available:
             unavailable["usage"] = "provider_did_not_report_usage"
-        if self._last_ttft_ms is None:
+        elif self._last_ttft_ms is None:
             unavailable["timing.ttft_ms"] = "no_streamed_text_token"
+        if self._last_provider_duration_ms is None:
+            unavailable["timing.provider_duration_ms"] = "provider_duration_not_observed"
         record = HarnessStepTelemetryRecord(
             step_id=f"{self._session.id}:{self._turn_count}:{iteration}",
             session_id=str(self._session.id),
@@ -1374,9 +1394,11 @@ class RavnAgent:
             provider_duration_ms=self._last_provider_duration_ms,
             ttft_ms=self._last_ttft_ms,
             tool_wall_time_ms=tool_wall_time_ms,
-            tool_call_count=len(response.tool_calls),
-            usage=response.usage if self._last_usage_available else None,
-            stop_reason=str(response.stop_reason),
+            tool_call_count=len(response.tool_calls) if response is not None else 0,
+            usage=response.usage if response is not None and self._last_usage_available else None,
+            stop_reason=(
+                str(response.stop_reason) if response is not None else terminal_stop_reason
+            ),
             retry_index=iteration,
             recovery_state=recovery_state,
             unavailable=unavailable,
@@ -1409,6 +1431,7 @@ class RavnAgent:
                 "gen_ai.agent.name",
             )
         }
+        self._last_provider_duration_ms = None
         started = time.monotonic()
         with telemetry.span(f"chat {self._model}", attributes=attributes) as span:
             telemetry.event(
@@ -1429,14 +1452,16 @@ class RavnAgent:
                     messages=messages,
                     thinking=thinking,
                 )
-            except Exception:
+            except BaseException:
+                duration = time.monotonic() - started
+                self._last_provider_duration_ms = duration * 1_000
                 telemetry.count(
                     "ravn.agent.llm.calls",
                     attributes={**metric_attributes, "error.type": "exception"},
                 )
                 telemetry.duration(
                     "gen_ai.client.operation.duration",
-                    time.monotonic() - started,
+                    duration,
                     attributes={**metric_attributes, "error.type": "exception"},
                 )
                 raise

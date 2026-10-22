@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import contextmanager
 
@@ -153,6 +154,10 @@ async def test_native_and_cli_emit_one_canonical_step_schema(
     assert cli_record["harness_type"] == "cli-backed"
     assert native_record["context_section_estimates"] is not None
     assert cli_record["context_section_estimates"] is None
+    assert cli_record["provider_duration_ms"] is None
+    assert cli_record["unavailable"]["timing.provider_duration_ms"] == (
+        "cli_transport_does_not_expose_provider_boundary"
+    )
     assert native_record["unavailable"]["timing.ttft_ms"] == "no_streamed_text_token"
     assert cli_record["unavailable"]["timing.ttft_ms"] == "no_streamed_text_token"
     for field in (
@@ -260,3 +265,146 @@ async def test_cross_harness_step_events_export_without_content_capture(
     )
 
     telemetry.shutdown()
+
+
+class _FailingLLM(LLMPort):
+    async def stream(self, *_args: object, **_kwargs: object) -> AsyncIterator[StreamEvent]:
+        raise RuntimeError("provider failure contains sensitive details")
+        yield  # pragma: no cover
+
+    async def generate(self, *_args: object, **_kwargs: object):
+        raise AssertionError("generate is not used by a normal harness step")
+
+
+class _AbortedLLM(LLMPort):
+    async def stream(self, *_args: object, **_kwargs: object) -> AsyncIterator[StreamEvent]:
+        raise asyncio.CancelledError
+        yield  # pragma: no cover
+
+    async def generate(self, *_args: object, **_kwargs: object):
+        raise AssertionError("generate is not used by a normal harness step")
+
+
+class _TerminalCliTransport(CLITransport):
+    terminal_error: BaseException = RuntimeError("provider failure contains sensitive details")
+
+    async def start(self) -> None:
+        return None
+
+    async def stop(self) -> None:
+        return None
+
+    async def send_message(self, _content: str) -> None:
+        raise self.terminal_error
+
+    @property
+    def session_id(self) -> str | None:
+        return None
+
+    @property
+    def last_result(self) -> dict | None:
+        return None
+
+    @property
+    def is_alive(self) -> bool:
+        return True
+
+
+class _AbortedCliTransport(_TerminalCliTransport):
+    terminal_error = asyncio.CancelledError()
+
+
+def _build_cli_agent(transport_adapter: str) -> object:
+    return CliTransportExecutor(transport_adapter=transport_adapter).build(
+        channel=InMemoryChannel(),
+        system_prompt="test system",
+        session=Session(),
+        model="test-model",
+        max_iterations=1,
+        checkpoint_port=None,
+        task_id="cli-task",
+        persona="tester",
+        workspace_dir="/tmp/workspace",
+        permission_mode="workspace_write",
+        tools=[],
+    )
+
+
+def _build_native_agent(llm: LLMPort) -> RavnAgent:
+    return RavnAgent(
+        llm=llm,
+        tools=[],
+        channel=InMemoryChannel(),
+        permission=AllowAllPermission(),
+        system_prompt="test system",
+        model="test-model",
+        max_tokens=64,
+        max_iterations=1,
+        task_id="native-task",
+    )
+
+
+def _harness_records(telemetry: _RecordingTelemetry) -> list[dict[str, object]]:
+    return [kwargs["content"] for name, kwargs in telemetry.events if name == HARNESS_STEP_EVENT]
+
+
+@pytest.mark.asyncio
+async def test_native_and_cli_emit_terminal_records_for_provider_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    telemetry = _RecordingTelemetry()
+    monkeypatch.setattr("ravn.agent.get_observability", lambda: telemetry)
+    monkeypatch.setattr("ravn.adapters.executors.cli.get_observability", lambda: telemetry)
+    monkeypatch.setattr("ravn.harness_telemetry.get_observability", lambda: telemetry)
+
+    with pytest.raises(RuntimeError, match="sensitive details"):
+        await _build_native_agent(_FailingLLM()).run_turn("test")
+    with pytest.raises(RuntimeError, match="sensitive details"):
+        await _build_cli_agent(
+            "tests.test_ravn.test_harness_telemetry._TerminalCliTransport"
+        ).run_turn("test")
+
+    native_record, cli_record = _harness_records(telemetry)
+    assert native_record["harness_type"] == "native"
+    assert native_record["stop_reason"] == "error"
+    assert native_record["provider_duration_ms"] is not None
+    assert native_record["unavailable"] == {
+        "provider_call.id": "provider_does_not_expose_request_id",
+        "usage": "provider_call_did_not_complete",
+        "timing.ttft_ms": "provider_call_terminated_before_text",
+    }
+    assert cli_record["harness_type"] == "cli-backed"
+    assert cli_record["stop_reason"] == "error"
+    assert cli_record["provider_duration_ms"] is None
+    assert cli_record["unavailable"]["timing.provider_duration_ms"] == (
+        "cli_transport_does_not_expose_provider_boundary"
+    )
+    assert cli_record["unavailable"]["usage"] == "provider_call_did_not_complete"
+    assert "sensitive details" not in str(native_record)
+    assert "sensitive details" not in str(cli_record)
+
+
+@pytest.mark.asyncio
+async def test_native_and_cli_emit_terminal_records_for_aborted_provider_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    telemetry = _RecordingTelemetry()
+    monkeypatch.setattr("ravn.agent.get_observability", lambda: telemetry)
+    monkeypatch.setattr("ravn.adapters.executors.cli.get_observability", lambda: telemetry)
+    monkeypatch.setattr("ravn.harness_telemetry.get_observability", lambda: telemetry)
+
+    with pytest.raises(asyncio.CancelledError):
+        await _build_native_agent(_AbortedLLM()).run_turn("test")
+    with pytest.raises(asyncio.CancelledError):
+        await _build_cli_agent(
+            "tests.test_ravn.test_harness_telemetry._AbortedCliTransport"
+        ).run_turn("test")
+
+    records = _harness_records(telemetry)
+    assert [record["stop_reason"] for record in records] == ["aborted", "aborted"]
+    assert [record["recovery_state"] for record in records] == ["aborted", "aborted"]
+    for record in records:
+        assert record["usage"] is None
+        assert record["ttft_ms"] is None
+        assert record["unavailable"]["usage"] == "provider_call_did_not_complete"
+        assert record["unavailable"]["timing.ttft_ms"] == "provider_call_terminated_before_text"

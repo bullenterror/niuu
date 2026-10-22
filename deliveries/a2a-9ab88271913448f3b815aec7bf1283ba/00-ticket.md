@@ -20,3 +20,9 @@ The review follow-up keeps a native harness-step span open from the provider
 call through tool execution and canonical event emission. It also exports the
 content-safe canonical fields as bounded event attributes when observability
 content capture is disabled.
+
+## Review revision (2026-10-22)
+
+Tracker status was moved to **In Progress** for the requested review revision. The
+remaining acceptance issues are provider-duration comparability and terminal
+failure/abort records in both runtime harnesses.

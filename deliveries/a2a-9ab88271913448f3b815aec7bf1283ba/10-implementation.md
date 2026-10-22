@@ -51,3 +51,22 @@ responses.
 Revision committed and pushed directly to the required `regin` branch (`73e6cb6a`). No hosted PR is
 created because the required delivery branch and merge target are both `regin`;
 a forge PR cannot use the same branch as its head and base.
+
+## Review revision: timing and terminal calls
+
+CLI transports do not expose a provider-call boundary, so their canonical
+`provider_duration_ms` is now explicitly unavailable rather than measuring the
+full CLI turn (which can include remote tool execution). The existing CLI turn
+duration metric remains unchanged.
+
+Both native and CLI-backed provider exceptions and cancellations now emit one
+content-safe terminal `ravn.harness.step` record before re-raising. Terminal
+records normalize the stop/recovery state to `error` or `aborted` and explicitly
+mark unavailable usage and TTFT; CLI terminal records also mark provider and
+tool timing unavailable when no reliable boundary exists.
+
+### Revision verification
+
+- Passed: `uv run --extra otel ruff check src/ravn/agent.py src/ravn/adapters/executors/cli.py tests/test_ravn/test_harness_telemetry.py`.
+- Passed: `uv run --extra otel pytest -q tests/test_ravn/test_harness_telemetry.py tests/test_ravn/test_executor_cli.py tests/test_ravn/test_agent.py::TestRavnAgentSimpleTurn tests/test_ravn/test_prompt_budget.py` — 68 passed.
+- No hosted PR is created: the required delivery branch and merge target are both `regin`, so this is a direct-to-branch delivery.

@@ -1,47 +1,72 @@
-# NIU-1132 review
+# NIU-1132 review (re-check)
 
 ## Verdict
 
 **needs_changes**
 
+## Prior review follow-up
+
+The two prior major findings are satisfied on the repository-root `regin` branch:
+
+- `src/ravn/agent.py:568-683` now holds a native `ravn harness step` span open
+  through the provider call, tool execution, and canonical event emission.
+- `src/ravn/domain/harness_telemetry.py:100-107` exports bounded prompt-section
+  estimates and the full usage breakdown as attributes, and
+  `tests/test_ravn/test_harness_telemetry.py:170-262` verifies both harnesses
+  with `capture_content=False`.
+
 ## Findings
 
-### Major — native records are emitted after their telemetry span closes
+### Major — CLI provider duration includes tool execution time
 
-`src/ravn/agent.py:593` and `src/ravn/agent.py:670` call the new emitter only
-after `_call_llm_streaming()` has returned. That method's span is scoped to
-`src/ravn/agent.py:1407-1479`, while `emit_harness_step()` attaches an event to
-the *current* span (`src/ravn/harness_telemetry.py:13`). A native turn without
-an ambient parent span therefore drops `ravn.harness.step` instead of exporting
-it. The CLI path emits inside its span, so the cross-harness test's recording
-fake masks this runtime difference. Keep a step span active through the native
-record emission (including tool timing), or otherwise emit using the provider
-span context, and add an SDK-backed regression test proving both harnesses
-export an event with no ambient parent span.
+`src/ravn/adapters/executors/cli.py:445-447` measures
+`CliTurnRunner.run_prompt()` from start to finish and stores it as
+`provider_duration_ms`. A CLI-backed run includes remote tool execution inside
+that interval, while the native `provider_duration_ms` only encloses the model
+stream (native tools are timed separately at `src/ravn/agent.py:637-639`). A
+cross-harness query will therefore attribute tool wall time to the CLI provider
+as well as to `tool_wall_time_ms`, yielding an incomparable/overstated provider
+call duration whenever a CLI turn invokes a tool.
 
-### Major — the canonical record is hidden behind optional content capture
+**Fix:** Populate `provider_duration_ms` only from CLI transport events that
+bound a provider call. If that boundary is not exposed, emit `None` and add an
+explicit `timing.provider_duration_ms` unavailable reason; retain any whole-run
+duration under a separate, accurately named field if it is useful.
 
-`src/ravn/harness_telemetry.py:13-16` passes the record as `content`, but
-`niuu.observability.Observability.event()` only exports content when
-`capture_content` is enabled (`src/niuu/observability.py:243-247`), which is
-false by default. The attributes built in
-`src/ravn/domain/harness_telemetry.py:63-102` omit prompt-section estimates and
-cache/write/thinking usage, so a default production observability surface
-cannot show the promised canonical context composition and full usage record.
-Export every content-safe canonical field as bounded event attributes (or add a
-safe always-exported structured record path through the existing port), while
-continuing to exclude prompts, tool inputs, outputs, and model text. Add a
-regression test with `capture_content=False`.
+### Major — failed or aborted calls emit no canonical step record
+
+The native call at `src/ravn/agent.py:569-573` exits its step span on a provider
+exception before `_emit_native_harness_step()` is reached. Likewise, the CLI
+exception path at `src/ravn/adapters/executors/cli.py:349-361` re-raises before
+the emitter at line 412. Consequently the canonical schema has no event for
+provider failures/aborted runs and cannot expose their stop/error or unavailable
+timing/usage fields, despite the ticket explicitly requiring unavailable-field
+behavior for aborted calls.
+
+**Fix:** In each harness, emit a content-safe terminal step record in the
+exception/abort path before propagating the original error. Mark unavailable
+fields (including usage/TTFT as appropriate) explicitly and use a normalized,
+non-content-bearing failure/abort category. Add native and fake-CLI regression
+coverage that asserts one emitted record on this path.
 
 ## Verification notes
 
-- Reviewed committed implementation `e34c930f` on `regin` against its parent;
-  `regin..HEAD` is empty because this is direct-to-`regin` delivery.
-- Passed: `uv run pytest -q tests/test_ravn/test_executor_cli.py tests/test_ravn/test_harness_telemetry.py` (40 passed, 1 skipped).
-- Passed: `uv run ruff check src/ravn/agent.py src/ravn/adapters/executors/cli.py src/ravn/domain/harness_telemetry.py src/ravn/harness_telemetry.py tests/test_ravn/test_harness_telemetry.py`.
-- SDK-backed direct verification could not run because `opentelemetry.sdk` is not installed in this checkout; the span/content behavior is established by the checked-in `Observability.event` implementation.
+- Reviewed live `regin` / `origin/regin` at `5c41853d`, with the delivery diff
+  `e2eec6dc..HEAD`; the branch has no local source modifications.
+- Passed: `uv run --extra otel pytest -q tests/test_ravn/test_harness_telemetry.py tests/test_ravn/test_executor_cli.py` (42 passed).
+- Passed: `uv run --extra otel pytest -q tests/test_ravn/test_agent.py::TestRavnAgentSimpleTurn tests/test_ravn/test_prompt_budget.py` (24 passed).
+- Passed: `uv run --extra otel ruff check src/ravn/agent.py src/ravn/adapters/executors/cli.py src/ravn/domain/harness_telemetry.py src/ravn/harness_telemetry.py tests/test_ravn/test_harness_telemetry.py`.
+- Passed: `git diff --check e2eec6dc..HEAD`.
 
 ## Recommendation
 
-Do not merge as-is. Address both major observability-export gaps and provide an
-SDK-backed cross-harness regression proof.
+Do not merge until the CLI timing is normalized and failure/abort records are
+emitted consistently by both harnesses.
+
+## Revision implementation evidence
+
+The revision makes CLI `provider_duration_ms` unavailable with the explicit
+`cli_transport_does_not_expose_provider_boundary` reason, rather than timing the
+full `run_prompt()` interval. Native and CLI exception/cancellation paths now
+emit normalized terminal step records before propagation. Focused regression
+coverage validates both harnesses for errors and aborted calls.
