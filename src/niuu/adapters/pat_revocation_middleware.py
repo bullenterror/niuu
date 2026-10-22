@@ -73,6 +73,17 @@ class PATRevocationMiddleware:
         ):
             await self.app(scope, receive, send)
             return
+        if (
+            scope["type"] == "http"
+            and scope.get("method") in ("GET", "HEAD")
+            and scope["path"] in _UNAUTHENTICATED_READ_PATHS
+        ):
+            # Served without identity, so a credential the caller happens to
+            # present grants nothing here and must not refuse the read either.
+            # A least-privilege scoped token was denied the public Agent Card
+            # while an anonymous request got it.
+            await self.app(scope, receive, send)
+            return
         validator = getattr(scope["app"].state, "pat_validator", None)
         headers = Headers(scope=scope)
         auth = headers.get("authorization", "")
@@ -102,11 +113,7 @@ class PATRevocationMiddleware:
             return
         if scope["type"] == "http":
             if self._authenticate_http and not (
-                (
-                    scope.get("method") in ("GET", "HEAD")
-                    and scope["path"] in _UNAUTHENTICATED_READ_PATHS
-                )
-                or (scope.get("method") == "POST" and _NODE_SIGNED_PATH.fullmatch(scope["path"]))
+                scope.get("method") == "POST" and _NODE_SIGNED_PATH.fullmatch(scope["path"])
             ):
                 if not isinstance(identity, HeaderAuthenticationPort):
                     await JSONResponse(

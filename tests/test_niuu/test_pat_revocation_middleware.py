@@ -450,3 +450,32 @@ class TestAgentCardExemption:
 
     def test_write_methods_still_require_identity_validation(self):
         assert self._client().post("/.well-known/agent-card.json").status_code == 401
+
+    def test_scoped_credential_can_read_the_public_card(self):
+        """A least-privilege token must not see less than an anonymous caller."""
+        import jwt
+
+        scoped = jwt.encode(
+            {"sub": "user-1", "token_use": "valkyrie_build", "scopes": ["ting:workflow:launch"]},
+            "test-only-hmac-key-at-least-32-bytes-long",
+            algorithm="HS256",
+        )
+        resp = self._client().get(
+            "/.well-known/agent-card.json", headers={"Authorization": f"Bearer {scoped}"}
+        )
+
+        assert resp.status_code == 200
+
+    def test_scoped_credential_is_still_denied_on_writes_to_the_card_path(self):
+        import jwt
+
+        scoped = jwt.encode(
+            {"sub": "user-1", "token_use": "valkyrie_build", "scopes": ["ting:workflow:launch"]},
+            "test-only-hmac-key-at-least-32-bytes-long",
+            algorithm="HS256",
+        )
+        resp = self._client().post(
+            "/.well-known/agent-card.json", headers={"Authorization": f"Bearer {scoped}"}
+        )
+
+        assert resp.status_code == 403
