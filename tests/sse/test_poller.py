@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from unittest.mock import Mock
 
 import pytest
+from fastapi import Request
 
 from yggdrasil.connection_manager import ConnectionManager, SSEClientLimitExceededError
 from yggdrasil.main import create_app
@@ -123,11 +124,23 @@ async def test_application_lifespan_starts_and_stops_the_poller() -> None:
     summary = RealmSummary(realm_id="odin", health_status="healthy")
     app = create_app(adapters=[FakeRealmAdapter("odin", summary)])
     health = next(route for route in app.routes if getattr(route, "path", None) == "/health")
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/health",
+            "headers": [],
+            "client": ("testclient", 50000),
+            "server": ("testserver", 80),
+            "scheme": "http",
+            "query_string": b"",
+        }
+    )
 
     async with app.router.lifespan_context(app):
         assert app.state.realm_poller.summary_for("odin") == summary
         assert app.state.realm_poller._task is not None
-        assert await health.endpoint() == {"status": "healthy"}
+        assert await health.endpoint(request) == {"status": "healthy"}
 
     assert app.state.realm_poller._task is None
 
