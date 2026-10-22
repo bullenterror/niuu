@@ -35,5 +35,4 @@ be relabelled as NIU-298 completion.
 
 Provide the repository revision/worktree containing the Yggdrasil service, or
 revise NIU-298 to name the existing Niuu package and its intended API contract.
-The tracker remains `In Progress`; no PR is opened or merged because this
-branch intentionally contains only the durable blocker handoff.
+The tracker remains `In Progress`. Draft PR [#1162](https://github.com/niuulabs/niuu/pull/1162) targets `regin` and contains only this durable blocker handoff; it is not ready to merge.
