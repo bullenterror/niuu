@@ -28,6 +28,7 @@ from ravn.domain.exceptions import (
     PermissionDeniedError,
     PromptBudgetExceededError,
 )
+from ravn.domain.harness_telemetry import HarnessStepTelemetryRecord
 from ravn.domain.models import (
     Episode,
     LLMResponse,
@@ -41,6 +42,7 @@ from ravn.domain.models import (
     ToolResult,
     TurnResult,
 )
+from ravn.harness_telemetry import emit_harness_step
 from ravn.ports.channel import ChannelPort
 from ravn.ports.checkpoint import CheckpointPort
 from ravn.ports.llm import LLMPort, SystemPrompt
@@ -213,6 +215,9 @@ class RavnAgent:
         ]
         self._max_prompt_tokens = min(prompt_ceilings) if prompt_ceilings else 0
         self._last_prompt_budget_status: dict[str, int | float | bool] = {}
+        self._last_provider_duration_ms: float | None = None
+        self._last_ttft_ms: float | None = None
+        self._last_usage_available = False
         # NIU-1118: cap one tool result's contribution to history; 0 disables
         self._max_tool_result_chars = max_tool_result_chars
 
@@ -553,6 +558,7 @@ class RavnAgent:
                 explicit=explicit_thinking,
                 last_had_tool_error=last_had_tool_error,
             )
+            recovery_state = "retry_after_tool_error" if last_had_tool_error else "none"
 
             llm_response = await self._call_llm_streaming(
                 system_prompt=effective_system,
@@ -584,6 +590,14 @@ class RavnAgent:
                         reasoning=llm_response.reasoning,
                     )
                 )
+                self._emit_native_harness_step(
+                    iteration=iteration,
+                    prompt_sections=prompt_sections,
+                    message_count=len(messages_for_llm),
+                    response=llm_response,
+                    tool_wall_time_ms=0.0,
+                    recovery_state=recovery_state,
+                )
                 break
 
             # Track partial response for checkpointing during tool-call iterations.
@@ -602,6 +616,7 @@ class RavnAgent:
 
             # Execute all tool calls sequentially and collect results.
             tool_results_content = []
+            tool_wall_time_ms = 0.0
             last_had_tool_error = False
             for tool_call in llm_response.tool_calls:
                 turn_tool_calls.append(tool_call)
@@ -613,7 +628,9 @@ class RavnAgent:
                 ):
                     await self._maybe_save_snapshot(label=f"auto: before {tool_call.name}")
 
+                tool_started = time.monotonic()
                 result = await self._execute_tool(tool_call)
+                tool_wall_time_ms += (time.monotonic() - tool_started) * 1_000
 
                 # NIU-1118: cap the result BEFORE it enters history — one
                 # oversized result lands in the compression-protected tail
@@ -650,6 +667,14 @@ class RavnAgent:
 
             # Append tool results as a user message.
             self._session.messages.append(Message(role="user", content=tool_results_content))
+            self._emit_native_harness_step(
+                iteration=iteration,
+                prompt_sections=prompt_sections,
+                message_count=len(messages_for_llm),
+                response=llm_response,
+                tool_wall_time_ms=tool_wall_time_ms,
+                recovery_state=recovery_state,
+            )
         else:
             await self._write_checkpoint(
                 user_input=user_input,
@@ -1304,6 +1329,54 @@ class RavnAgent:
 
         return None
 
+    def _emit_native_harness_step(
+        self,
+        *,
+        iteration: int,
+        prompt_sections: dict[str, int],
+        message_count: int,
+        response: LLMResponse,
+        tool_wall_time_ms: float,
+        recovery_state: str,
+    ) -> None:
+        """Emit the normalized record without replacing established LLM telemetry."""
+        compression = self._last_compression_result
+        unavailable: dict[str, str] = {"provider_call.id": "provider_does_not_expose_request_id"}
+        if not self._last_usage_available:
+            unavailable["usage"] = "provider_did_not_report_usage"
+        if self._last_ttft_ms is None:
+            unavailable["timing.ttft_ms"] = "no_streamed_text_token"
+        record = HarnessStepTelemetryRecord(
+            step_id=f"{self._session.id}:{self._turn_count}:{iteration}",
+            session_id=str(self._session.id),
+            task_id=self._task_id,
+            turn=self._turn_count,
+            attempt=iteration,
+            phase="model_turn",
+            harness_type="native",
+            model=self._model,
+            provider=type(self._llm).__name__,
+            provider_call_id=None,
+            context_section_estimates=dict(prompt_sections),
+            context_message_count=message_count,
+            context_tool_schema_count=len(self._tools),
+            compaction_applied=compression.was_compressed if compression is not None else False,
+            compaction_passes=compression.compression_count if compression is not None else 0,
+            compaction_messages_removed=(
+                compression.removed_message_count if compression is not None else 0
+            ),
+            provider_duration_ms=self._last_provider_duration_ms,
+            ttft_ms=self._last_ttft_ms,
+            tool_wall_time_ms=tool_wall_time_ms,
+            tool_call_count=len(response.tool_calls),
+            usage=response.usage if self._last_usage_available else None,
+            stop_reason=str(response.stop_reason),
+            retry_index=iteration,
+            recovery_state=recovery_state,
+            unavailable=unavailable,
+        )
+        emit_harness_step(record)
+
     async def _call_llm_streaming(
         self,
         system_prompt: SystemPrompt | None = None,
@@ -1362,6 +1435,7 @@ class RavnAgent:
                 )
                 raise
             duration = time.monotonic() - started
+            self._last_provider_duration_ms = duration * 1_000
             span.set_attribute("gen_ai.usage.input_tokens", response.usage.input_tokens)
             span.set_attribute("gen_ai.usage.output_tokens", response.usage.output_tokens)
             span.set_attribute("ravn.llm.tool_call_count", len(response.tool_calls))
@@ -1411,6 +1485,9 @@ class RavnAgent:
         """Call the LLM with streaming and accumulate into an LLMResponse."""
         accumulated_text = ""
         accumulated_reasoning = ""
+        self._last_ttft_ms = None
+        self._last_usage_available = False
+        stream_started = time.monotonic()
         tool_calls: list[ToolCall] = []
         final_usage = TokenUsage(input_tokens=0, output_tokens=0)
         stop_reason = StopReason.END_TURN
@@ -1434,6 +1511,8 @@ class RavnAgent:
             match event.type:
                 case StreamEventType.TEXT_DELTA:
                     if event.text:
+                        if self._last_ttft_ms is None:
+                            self._last_ttft_ms = (time.monotonic() - stream_started) * 1_000
                         accumulated_text += event.text
                         await self._channel.emit(
                             RavnEvent.thought(
@@ -1460,6 +1539,7 @@ class RavnAgent:
                 case StreamEventType.MESSAGE_DONE:
                     if event.usage:
                         final_usage = event.usage
+                        self._last_usage_available = True
 
         # Decided after the stream rather than inside MESSAGE_DONE, because
         # MESSAGE_DONE is not the last event. Servers that send a usage chunk
