@@ -65,5 +65,5 @@ class RealmPoller:
 
     async def _run(self) -> None:
         while True:
-            await self.poll_once()
             await asyncio.sleep(self._poll_interval)
+            await self.poll_once()

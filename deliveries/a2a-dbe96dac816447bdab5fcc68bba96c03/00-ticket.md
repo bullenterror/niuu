@@ -4,8 +4,9 @@
 - Required base and target: `regin`
 - Working branch: `feat/niu-298-sse-stream`, cut from `regin`
 - Tracker issue: [NIU-298](https://linear.app/niuu/issue/NIU-298/sse-endpoint-and-background-polling-loop)
-- Tracker status: `Done`
-- Delivery status: PR #1162 merged into `regin` (merge commit `bad34ddb`).
+- Tracker status: `In Progress`
+- Delivery status: cadence follow-up on `fix/niu-298-poller-cadence`, branched
+  from `regin`.
 
 ## Scope
 
@@ -32,3 +33,9 @@ this greenfield implementation on a feature branch targeting `regin` only.
 
 - Reviewer feedback from `20-review.md` was addressed in commit `2c997d2b` and
   merged through PR #1162 into `regin`.
+
+## Cadence follow-up
+
+- Re-review found that the immediate lifespan poll was followed by a second,
+  immediate background poll. This follow-up makes the recurring task wait one
+  configured interval before polling again and adds a regression test.

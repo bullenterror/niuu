@@ -59,3 +59,19 @@ PR [#1162](https://github.com/niuulabs/niuu/pull/1162) merged
 - Full suite attempted: `uv run --extra dev pytest -q` is blocked at collection
   by the pre-existing missing `kubernetes_asyncio` dependency required by
   `tests/test_adapters/test_user_home_files.py`.
+
+## Cadence follow-up
+
+- The lifespan retains its one immediate `poll_once()` for the initial SSE
+  snapshot. The recurring loop now sleeps for `poll_interval` before polling,
+  preventing an immediate duplicate adapter call at startup.
+- Added a regression test that starts the recurring poller after an initial
+  poll and verifies that no second adapter call occurs before the interval.
+
+## Cadence follow-up verification
+
+- Passed: `uv run ruff check src/yggdrasil tests/api/test_routes_sse.py tests/sse`
+- Passed: `uv run --extra dev pytest -q --cov=src/yggdrasil --cov-branch --cov-fail-under=85 tests/api/test_routes_sse.py tests/sse` — `13 passed`, `97.10%` coverage.
+- Full suite attempted: `uv run --extra dev pytest -q` is blocked at collection
+  by the pre-existing missing `kubernetes_asyncio` dependency required by
+  `tests/test_adapters/test_user_home_files.py`.
