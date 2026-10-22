@@ -1,38 +1,41 @@
-# NIU-298 implementation status
+# NIU-298 implementation
 
-## Result
+## Delivered behavior
 
-No product code was added. The requested Yggdrasil package is absent from the
-specified `regin` base, so implementation cannot preserve the required
-hexagonal boundaries or satisfy the declared-file contract.
+- `src/yggdrasil/` provides a standalone FastAPI service with
+  `GET /api/v1/yggdrasil/realms/{realm_id}/stream`.
+- `ConnectionManager` enforces the configured global client limit, returns a
+  503 before accepting an over-limit client, and removes each subscription in
+  the stream generator's `finally` path.
+- Every accepted stream starts with a named `realm.summary` SSE frame for the
+  current `RealmSummary`; the poller broadcasts only changed health status or
+  metrics.
+- `RealmPoller` polls each configured adapter at `poll_interval` seconds
+  (default 15, configurable with `YGGDRASIL_POLL_INTERVAL`) and logs a
+  warning while continuing when one adapter fails.
+- Adapter classes are dynamically loaded from `YGGDRASIL_ADAPTERS`; test
+  adapters are explicit fakes and no external integration was added.
 
-## Related landed functionality
+## Guardrail search result
 
-`regin` does contain a different, already-landed authenticated realm-detail
-SSE stream in `src/niuu/adapters/inbound/rest_realms.py`:
+**Findings, not a clean repository:** NIU-300 serves the existing Niuu
+realm-detail stream from `src/niuu/adapters/inbound/rest_realms.py` at
+`GET /api/v1/realms/{slug}/stream`. It is not an SSE hub for health-summary
+adapters and does not own the separately declared Yggdrasil API. No
+case-insensitive repository hit identified an existing Yggdrasil package or
+`ConnectionManager`.
 
-- `GET /api/v1/realms/{slug}/stream`
-- immediate `realm.detail` snapshot, changed-snapshot detection, and keepalive
-  frames
-- `realm_detail_stream_interval_seconds` configuration composed by Volundr and
-  the CLI host
+## Verification
 
-That implementation is not the ticket's `/api/v1/yggdrasil/...` API, does not
-have the stated connection-manager/poller architecture, and cannot responsibly
-be relabelled as NIU-298 completion.
+- Passed: `uv run ruff check src/yggdrasil tests/api/test_routes_sse.py tests/sse`
+- Passed: `uv run pytest -q --no-cov tests/api/test_routes_sse.py tests/sse` —
+  `5 passed in 0.08s`
 
-## Evidence
+The focused tests prove SSE framing and the immediate snapshot, the 503 client
+limit path, cleanup after a stream closes, changed-summary-only fan-out,
+`YGGDRASIL_POLL_INTERVAL`, and warning-level adapter-failure isolation.
 
-- `find src -maxdepth 1 -type d` has no `yggdrasil` package.
-- `git log --all -- src/yggdrasil tests/api/test_routes_sse.py tests/sse` is
-  empty.
-- `git ls-remote --heads origin '*ygg*' '*niu-298*' '*sse*'` found no matching
-  branch.
-- `gh pr list --repo niuulabs/niuu --state all --search 'NIU-298'` found no
-  NIU-298 pull request.
+## Hosted delivery
 
-## Required operator decision
-
-Provide the repository revision/worktree containing the Yggdrasil service, or
-revise NIU-298 to name the existing Niuu package and its intended API contract.
-The tracker remains `In Progress`. Draft PR [#1162](https://github.com/niuulabs/niuu/pull/1162) targets `regin` and contains only this durable blocker handoff; it is not ready to merge.
+Draft PR [#1162](https://github.com/niuulabs/niuu/pull/1162) targets `regin`
+from `feat/niu-298-sse-stream`.
