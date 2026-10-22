@@ -56,7 +56,13 @@ class _NoTextLLM(LLMPort):
     async def stream(self, *_args: object, **_kwargs: object) -> AsyncIterator[StreamEvent]:
         yield StreamEvent(
             type=StreamEventType.MESSAGE_DONE,
-            usage=TokenUsage(input_tokens=3, output_tokens=0),
+            usage=TokenUsage(
+                input_tokens=3,
+                output_tokens=0,
+                cache_read_tokens=4,
+                cache_write_tokens=2,
+                thinking_tokens=1,
+            ),
         )
 
     async def generate(self, *_args: object, **_kwargs: object):
@@ -75,7 +81,15 @@ class _CliTransport(CLITransport):
             "type": "result",
             "result": "complete",
             "stop_reason": "end_turn",
-            "modelUsage": {"test-model": {"inputTokens": 3, "outputTokens": 1}},
+            "modelUsage": {
+                "test-model": {
+                    "inputTokens": 3,
+                    "outputTokens": 1,
+                    "cacheReadInputTokens": 4,
+                    "cacheCreationInputTokens": 2,
+                    "thinkingTokens": 1,
+                }
+            },
         }
         await self._emit(self._last_result)
 
@@ -154,3 +168,95 @@ async def test_native_and_cli_emit_one_canonical_step_schema(
         "recovery_state",
     ):
         assert field in native_record
+
+
+@pytest.mark.asyncio
+async def test_cross_harness_step_events_export_without_content_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("opentelemetry.sdk")
+    from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from niuu.observability import Observability
+
+    exporter = InMemorySpanExporter()
+    tracer_provider = TracerProvider()
+    tracer_provider.add_span_processor(SimpleSpanProcessor(exporter))
+    telemetry = Observability(
+        tracer_provider=tracer_provider,
+        meter_provider=MeterProvider(),
+        capture_content=False,
+    )
+    monkeypatch.setattr("ravn.agent.get_observability", lambda: telemetry)
+    monkeypatch.setattr("ravn.adapters.executors.cli.get_observability", lambda: telemetry)
+    monkeypatch.setattr("ravn.harness_telemetry.get_observability", lambda: telemetry)
+
+    native = RavnAgent(
+        llm=_NoTextLLM(),
+        tools=[],
+        channel=InMemoryChannel(),
+        permission=AllowAllPermission(),
+        system_prompt="test system",
+        model="test-model",
+        max_tokens=64,
+        max_iterations=1,
+        task_id="native-task",
+    )
+    await native.run_turn("test")
+
+    cli = CliTransportExecutor(
+        transport_adapter="tests.test_ravn.test_harness_telemetry._CliTransport"
+    ).build(
+        channel=InMemoryChannel(),
+        system_prompt="test system",
+        session=Session(),
+        model="test-model",
+        max_iterations=1,
+        checkpoint_port=None,
+        task_id="cli-task",
+        persona="tester",
+        workspace_dir="/tmp/workspace",
+        permission_mode="workspace_write",
+        tools=[],
+    )
+    await cli.run_turn("test")
+
+    events = [
+        event
+        for span in exporter.get_finished_spans()
+        for event in span.events
+        if event.name == HARNESS_STEP_EVENT
+    ]
+    assert len(events) == 2
+    for event in events:
+        attributes = event.attributes
+        assert "ravn.content" not in attributes
+        assert attributes["ravn.harness.context.section_estimates.available"] in (True, False)
+        assert attributes["gen_ai.usage.cache_read_tokens"] == 4
+        assert attributes["gen_ai.usage.cache_write_tokens"] == 2
+        assert attributes["gen_ai.usage.thinking_tokens"] == 1
+
+    native_event = next(
+        event for event in events if event.attributes["ravn.harness.type"] == "native"
+    )
+    cli_event = next(
+        event for event in events if event.attributes["ravn.harness.type"] == "cli-backed"
+    )
+    assert native_event.attributes["ravn.harness.context.section_estimates.available"] is True
+    assert "ravn.harness.context.section_estimates" in native_event.attributes
+    assert cli_event.attributes["ravn.harness.context.section_estimates.available"] is False
+    assert (
+        cli_event.attributes[
+            "ravn.harness.context.section_estimates.unavailable_reason"
+        ]
+        == "cli_transport_does_not_expose_prompt_sections"
+    )
+    assert any(
+        span.name == "ravn harness step" and native_event in span.events
+        for span in exporter.get_finished_spans()
+    )
+
+    telemetry.shutdown()

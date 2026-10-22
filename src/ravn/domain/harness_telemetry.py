@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import asdict, dataclass, field
 from typing import Literal
 
 from ravn.domain.models import TokenUsage
 
 HarnessType = Literal["native", "cli-backed"]
+
+_MAX_CONTEXT_SECTION_ESTIMATES = 32
+_MAX_CONTEXT_SECTION_NAME_LENGTH = 128
 
 
 @dataclass(frozen=True)
@@ -93,9 +97,14 @@ class HarnessStepTelemetryRecord:
             "ravn.harness.compaction.messages_removed",
             self.compaction_messages_removed,
         )
+        _set_context_section_estimates(attributes, self.context_section_estimates)
+        attributes["ravn.harness.usage.available"] = self.usage is not None
         if self.usage is not None:
             attributes["gen_ai.usage.input_tokens"] = self.usage.input_tokens
             attributes["gen_ai.usage.output_tokens"] = self.usage.output_tokens
+            attributes["gen_ai.usage.cache_read_tokens"] = self.usage.cache_read_tokens
+            attributes["gen_ai.usage.cache_write_tokens"] = self.usage.cache_write_tokens
+            attributes["gen_ai.usage.thinking_tokens"] = self.usage.thinking_tokens
         for field_name, reason in self.unavailable.items():
             attributes[f"ravn.harness.{field_name}.available"] = False
             attributes[f"ravn.harness.{field_name}.unavailable_reason"] = reason
@@ -110,3 +119,24 @@ def _set_available(
     attributes[f"{name}.available"] = value is not None
     if value is not None:
         attributes[name] = value
+
+
+def _set_context_section_estimates(
+    attributes: dict[str, str | int | float | bool],
+    estimates: dict[str, int] | None,
+) -> None:
+    """Export prompt composition without relying on optional content capture."""
+    name = "ravn.harness.context.section_estimates"
+    attributes[f"{name}.available"] = estimates is not None
+    if estimates is None:
+        return
+
+    bounded_estimates = {
+        section[:_MAX_CONTEXT_SECTION_NAME_LENGTH]: tokens
+        for section, tokens in sorted(estimates.items())[:_MAX_CONTEXT_SECTION_ESTIMATES]
+    }
+    attributes[name] = json.dumps(bounded_estimates, separators=(",", ":"), sort_keys=True)
+    attributes["ravn.harness.context.section_estimate_count"] = len(estimates)
+    attributes["ravn.harness.context.section_estimates.truncated"] = (
+        len(estimates) > _MAX_CONTEXT_SECTION_ESTIMATES
+    )

@@ -13,3 +13,10 @@ step/session/task identities, model/provider call facts, prompt-composition
 estimates when exposed by the harness, compaction, timings, tool wall time,
 usage, stop reason, and retry/recovery state. It deliberately excludes prompts,
 tool inputs, tool outputs, and model text.
+
+## Revision
+
+The review follow-up keeps a native harness-step span open from the provider
+call through tool execution and canonical event emission. It also exports the
+content-safe canonical fields as bounded event attributes when observability
+content capture is disabled.

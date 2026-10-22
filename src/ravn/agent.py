@@ -560,121 +560,127 @@ class RavnAgent:
             )
             recovery_state = "retry_after_tool_error" if last_had_tool_error else "none"
 
-            llm_response = await self._call_llm_streaming(
-                system_prompt=effective_system,
-                messages=messages_for_llm,
-                thinking=thinking_param,
-            )
+            step_attributes = {
+                "ravn.harness.step.id": f"{self._session.id}:{self._turn_count}:{iteration}",
+                "ravn.harness.type": "native",
+                "ravn.harness.phase": "model_turn",
+            }
+            with get_observability().span("ravn harness step", attributes=step_attributes):
+                llm_response = await self._call_llm_streaming(
+                    system_prompt=effective_system,
+                    messages=messages_for_llm,
+                    thinking=thinking_param,
+                )
 
-            # Consume one iteration from the budget.
-            if self._iteration_budget is not None:
-                self._iteration_budget.consume()
+                # Consume one iteration from the budget.
+                if self._iteration_budget is not None:
+                    self._iteration_budget.consume()
 
-            cumulative_usage = cumulative_usage + llm_response.usage
+                cumulative_usage = cumulative_usage + llm_response.usage
 
-            if llm_response.stop_reason != StopReason.TOOL_USE:
-                if llm_response.content:
-                    await self._channel.emit(
-                        RavnEvent.response(
-                            source=self._source_id,
-                            text=llm_response.content,
-                            correlation_id=self._session.id,
-                            session_id=self._session.id,
+                if llm_response.stop_reason != StopReason.TOOL_USE:
+                    if llm_response.content:
+                        await self._channel.emit(
+                            RavnEvent.response(
+                                source=self._source_id,
+                                text=llm_response.content,
+                                correlation_id=self._session.id,
+                                session_id=self._session.id,
+                            )
+                        )
+                    final_response = llm_response.content
+                    self._session.add_message(
+                        Message(
+                            role="assistant",
+                            content=llm_response.content,
+                            reasoning=llm_response.reasoning,
                         )
                     )
-                final_response = llm_response.content
-                self._session.add_message(
+                    self._emit_native_harness_step(
+                        iteration=iteration,
+                        prompt_sections=prompt_sections,
+                        message_count=len(messages_for_llm),
+                        response=llm_response,
+                        tool_wall_time_ms=0.0,
+                        recovery_state=recovery_state,
+                    )
+                    break
+
+                # Track partial response for checkpointing during tool-call iterations.
+                if llm_response.content:
+                    final_response = llm_response.content
+
+                # Append the assistant message (with tool calls) to history.
+                assistant_content = _build_assistant_content(llm_response)
+                self._session.messages.append(
                     Message(
                         role="assistant",
-                        content=llm_response.content,
+                        content=assistant_content,
                         reasoning=llm_response.reasoning,
                     )
                 )
+
+                # Execute all tool calls sequentially and collect results.
+                tool_results_content = []
+                tool_wall_time_ms = 0.0
+                last_had_tool_error = False
+                for tool_call in llm_response.tool_calls:
+                    turn_tool_calls.append(tool_call)
+
+                    # NIU-537: auto-snapshot before destructive operations.
+                    if (
+                        self._auto_checkpoint_before_destructive
+                        and tool_call.name in DESTRUCTIVE_TOOL_NAMES
+                    ):
+                        await self._maybe_save_snapshot(label=f"auto: before {tool_call.name}")
+
+                    tool_started = time.monotonic()
+                    result = await self._execute_tool(tool_call)
+                    tool_wall_time_ms += (time.monotonic() - tool_started) * 1_000
+
+                    # NIU-1118: cap the result BEFORE it enters history — one
+                    # oversized result lands in the compression-protected tail
+                    # and would make the rest of the turn unrecoverable.
+                    result = self._truncate_oversized_tool_result(tool_call, result)
+
+                    # Inject budget warning into the tool result content.
+                    result = _maybe_append_budget_warning(result, self._iteration_budget)
+
+                    if result.is_error:
+                        last_had_tool_error = True
+                    turn_tool_results.append(result)
+                    tool_results_content.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_call.id,
+                            "content": result.content,
+                            "is_error": result.is_error,
+                        }
+                    )
+
+                    # Write a crash-safe checkpoint after every tool call.
+                    await self._write_checkpoint(
+                        user_input=user_input,
+                        partial_response=final_response,
+                        last_tool_call=tool_call,
+                        last_tool_result=result,
+                        interrupted_by=None,
+                    )
+
+                    # NIU-537: increment tool counter and check cadence/budget triggers.
+                    self._tool_call_count += 1
+                    await self._check_auto_snapshot_triggers(tool_call.name)
+
+                # Append tool results as a user message.
+                self._session.messages.append(Message(role="user", content=tool_results_content))
                 self._emit_native_harness_step(
                     iteration=iteration,
                     prompt_sections=prompt_sections,
                     message_count=len(messages_for_llm),
                     response=llm_response,
-                    tool_wall_time_ms=0.0,
+                    tool_wall_time_ms=tool_wall_time_ms,
                     recovery_state=recovery_state,
                 )
-                break
-
-            # Track partial response for checkpointing during tool-call iterations.
-            if llm_response.content:
-                final_response = llm_response.content
-
-            # Append the assistant message (with tool calls) to history.
-            assistant_content = _build_assistant_content(llm_response)
-            self._session.messages.append(
-                Message(
-                    role="assistant",
-                    content=assistant_content,
-                    reasoning=llm_response.reasoning,
-                )
-            )
-
-            # Execute all tool calls sequentially and collect results.
-            tool_results_content = []
-            tool_wall_time_ms = 0.0
-            last_had_tool_error = False
-            for tool_call in llm_response.tool_calls:
-                turn_tool_calls.append(tool_call)
-
-                # NIU-537: auto-snapshot before destructive operations.
-                if (
-                    self._auto_checkpoint_before_destructive
-                    and tool_call.name in DESTRUCTIVE_TOOL_NAMES
-                ):
-                    await self._maybe_save_snapshot(label=f"auto: before {tool_call.name}")
-
-                tool_started = time.monotonic()
-                result = await self._execute_tool(tool_call)
-                tool_wall_time_ms += (time.monotonic() - tool_started) * 1_000
-
-                # NIU-1118: cap the result BEFORE it enters history — one
-                # oversized result lands in the compression-protected tail
-                # and would make the rest of the turn unrecoverable.
-                result = self._truncate_oversized_tool_result(tool_call, result)
-
-                # Inject budget warning into the tool result content.
-                result = _maybe_append_budget_warning(result, self._iteration_budget)
-
-                if result.is_error:
-                    last_had_tool_error = True
-                turn_tool_results.append(result)
-                tool_results_content.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": tool_call.id,
-                        "content": result.content,
-                        "is_error": result.is_error,
-                    }
-                )
-
-                # Write a crash-safe checkpoint after every tool call.
-                await self._write_checkpoint(
-                    user_input=user_input,
-                    partial_response=final_response,
-                    last_tool_call=tool_call,
-                    last_tool_result=result,
-                    interrupted_by=None,
-                )
-
-                # NIU-537: increment tool counter and check cadence/budget triggers.
-                self._tool_call_count += 1
-                await self._check_auto_snapshot_triggers(tool_call.name)
-
-            # Append tool results as a user message.
-            self._session.messages.append(Message(role="user", content=tool_results_content))
-            self._emit_native_harness_step(
-                iteration=iteration,
-                prompt_sections=prompt_sections,
-                message_count=len(messages_for_llm),
-                response=llm_response,
-                tool_wall_time_ms=tool_wall_time_ms,
-                recovery_state=recovery_state,
-            )
         else:
             await self._write_checkpoint(
                 user_input=user_input,

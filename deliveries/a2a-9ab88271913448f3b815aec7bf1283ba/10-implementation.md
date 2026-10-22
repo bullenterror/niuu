@@ -14,6 +14,18 @@ streamed output, tool lifecycle, and model usage into the same schema. Existing
 `gen_ai.*` and Ravn telemetry remains unchanged and is emitted alongside the
 new event.
 
+## Review revision
+
+Native steps now run in a `ravn harness step` span that stays active through
+the nested provider call, any tool execution, and the canonical event. This
+ensures a native event is exported even when no ambient parent span exists.
+
+Canonical prompt-section estimates are serialized into a bounded safe event
+attribute (at most 32 names of 128 characters), and usage now includes cache
+read/write and thinking tokens. These attributes are emitted regardless of
+`capture_content`; raw prompts, tool inputs/results, and model text remain
+content-only and are not exported by default.
+
 ## Cross-harness verification
 
 `tests/test_ravn/test_harness_telemetry.py` runs a native and a CLI-backed
@@ -27,6 +39,12 @@ responses.
 - Passed: `uv run pytest -q tests/test_ravn/test_executor_cli.py tests/test_ravn/test_harness_telemetry.py` — 40 passed, 1 skipped.
 - Passed: `uv run pytest -q tests/test_ravn/test_agent.py::TestRavnAgentSimpleTurn tests/test_ravn/test_prompt_budget.py` — 24 passed.
 - `tests/test_ravn/test_agent.py` has one pre-existing failing persisted-commission test (`test_build_tool_reuses_persisted_commission_after_restart`); rerunning it alone fails with a regenerated operation ID and is unrelated to harness telemetry.
+
+### Revision verification
+
+- Passed: `uv run --extra otel ruff check src/ravn/agent.py src/ravn/domain/harness_telemetry.py tests/test_ravn/test_harness_telemetry.py`.
+- Passed: `uv run --extra otel pytest -q tests/test_ravn/test_harness_telemetry.py tests/test_ravn/test_executor_cli.py` — 42 passed.
+- The SDK-backed cross-harness test runs with `capture_content=False`, proves both harnesses export `ravn.harness.step` without an ambient parent span, and checks prompt sections plus cache/write/thinking usage attributes.
 
 ## Delivery
 
