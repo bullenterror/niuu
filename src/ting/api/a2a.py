@@ -424,6 +424,9 @@ class WorkflowTaskHandler(RequestHandler):
                     connection_id=resolved_connection_id,
                     workflow_version=workflow.version,
                 )
+                outbound_trace_context = telemetry.inject() or trace_context
+                if outbound_trace_context:
+                    launch.provenance["trace_context"] = outbound_trace_context
             else:
                 launch = WorkflowLaunchBody(
                     prompt=prompt,

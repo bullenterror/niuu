@@ -782,6 +782,10 @@ class TestSendMessage:
                 "connectionId": "local",
                 "repo": "https://github.com/niuulabs/niuu",
                 "branch": "regin",
+                "traceContext": {
+                    "traceparent": "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01",
+                    "tracestate": "niuu=resident",
+                },
             }
         )
 
@@ -800,6 +804,10 @@ class TestSendMessage:
         assert provenance["execution_id"] == str(ledger.execution.id)
         assert provenance["parent_session_key"] == f"workflow:execution-{ledger.execution.id.hex}"
         assert workload["ravn_config"]["workflow_execution"]["enabled"] is True
+        assert workload["provenance"]["trace_context"] == {
+            "traceparent": "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01",
+            "tracestate": "niuu=resident",
+        }
 
         campaign = next(iter(campaigns._campaigns.values()))
         assert campaign.metadata["workflow_execution_id"] == str(ledger.execution.id)

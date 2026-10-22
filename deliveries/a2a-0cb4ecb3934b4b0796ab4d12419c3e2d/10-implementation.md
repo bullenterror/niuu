@@ -32,3 +32,14 @@ only; it must not target `dev` or `main`.
 
 Pull request: [#1165](https://github.com/niuulabs/niuu/pull/1165), targeting
 `regin` only.
+
+## Review revision
+
+The fan-out parent launch now preserves the active W3C context in its trusted
+provenance: it merges `telemetry.inject() or trace_context` without replacing
+the owner-bound `workflow_execution` provenance. The Research Campaign A2A
+regression test now supplies `traceContext` and asserts the spawned workload
+carries it alongside the durable execution context.
+
+- Passed: `uv run ruff check src/ting/api/a2a.py tests/test_ting/test_a2a_tasks.py`.
+- Passed: `uv run --extra dev --extra otel pytest -q tests/test_ting/test_a2a_tasks.py` — 64 passed.
