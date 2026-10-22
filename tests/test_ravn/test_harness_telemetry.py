@@ -53,51 +53,6 @@ class _RecordingTelemetry:
         return {}
 
 
-class _ToolTimingCliTransport(CLITransport):
-    async def start(self) -> None:
-        return None
-
-    async def stop(self) -> None:
-        return None
-
-    async def send_message(self, _content: str) -> None:
-        await self._emit(
-            {
-                "type": "assistant",
-                "content": [
-                    {"type": "tool_use", "id": "tool-1", "name": "Bash", "input": {}},
-                ],
-            }
-        )
-        await self._emit(
-            {
-                "type": "user",
-                "content": [
-                    {"type": "tool_result", "tool_use_id": "tool-1", "content": "ok"},
-                ],
-            }
-        )
-        self._last_result = {
-            "type": "result",
-            "result": "complete",
-            "stop_reason": "end_turn",
-            "modelUsage": {"test-model": {"inputTokens": 3, "outputTokens": 1}},
-        }
-        await self._emit(self._last_result)
-
-    @property
-    def session_id(self) -> str | None:
-        return None
-
-    @property
-    def last_result(self) -> dict | None:
-        return self._last_result
-
-    @property
-    def is_alive(self) -> bool:
-        return True
-
-
 class _NoTextLLM(LLMPort):
     async def stream(self, *_args: object, **_kwargs: object) -> AsyncIterator[StreamEvent]:
         yield StreamEvent(
@@ -200,7 +155,9 @@ async def test_native_and_cli_emit_one_canonical_step_schema(
     assert native_record["context_section_estimates"] is not None
     assert cli_record["context_section_estimates"] is None
     assert cli_record["provider_duration_ms"] is not None
-    assert "timing.provider_vs_tool_breakdown" not in cli_record["unavailable"]
+    assert cli_record["unavailable"]["timing.provider_vs_tool_breakdown"] == (
+        "cli_transport_exposes_only_full_turn_duration"
+    )
     assert native_record["unavailable"]["timing.ttft_ms"] == "no_streamed_text_token"
     assert cli_record["unavailable"]["timing.ttft_ms"] == "no_streamed_text_token"
     for field in (
@@ -213,30 +170,9 @@ async def test_native_and_cli_emit_one_canonical_step_schema(
         "tool_wall_time_ms",
         "usage",
         "stop_reason",
-        "llm_error_category",
         "recovery_state",
     ):
         assert field in native_record
-
-
-@pytest.mark.asyncio
-async def test_cli_provider_duration_excludes_tool_execution(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    telemetry = _RecordingTelemetry()
-    clock = iter((0.0, 0.0, 0.0, 5.0, 7.0, 7.0))
-    monkeypatch.setattr("ravn.adapters.executors.cli.get_observability", lambda: telemetry)
-    monkeypatch.setattr("ravn.adapters.executors.cli.monotonic", lambda: next(clock))
-    monkeypatch.setattr("ravn.harness_telemetry.get_observability", lambda: telemetry)
-
-    await _build_cli_agent(
-        "tests.test_ravn.test_harness_telemetry._ToolTimingCliTransport"
-    ).run_turn("test")
-
-    [record] = _harness_records(telemetry)
-    assert record["tool_wall_time_ms"] == pytest.approx(5_000)
-    assert record["provider_duration_ms"] == pytest.approx(2_000)
-    assert "timing.provider_vs_tool_breakdown" not in record["unavailable"]
 
 
 @pytest.mark.asyncio
@@ -454,16 +390,17 @@ async def test_native_and_cli_emit_terminal_records_for_provider_failures(
     assert native_record["harness_type"] == "native"
     assert native_record["stop_reason"] == "error"
     assert native_record["provider_duration_ms"] is not None
-    assert native_record["llm_error_category"] == "provider_error"
     assert native_record["unavailable"] == {
         "provider_call.id": "provider_does_not_expose_request_id",
         "usage": "provider_call_did_not_complete",
         "timing.ttft_ms": "provider_call_terminated_before_text",
     }
     assert cli_record["harness_type"] == "cli-backed"
-    assert cli_record["stop_reason"] == "provider_error"
+    assert cli_record["stop_reason"] == "error"
     assert cli_record["provider_duration_ms"] is not None
-    assert cli_record["llm_error_category"] == "provider_error"
+    assert cli_record["unavailable"]["timing.provider_vs_tool_breakdown"] == (
+        "cli_transport_exposes_only_full_turn_duration"
+    )
     assert cli_record["unavailable"]["usage"] == "provider_call_did_not_complete"
     assert "sensitive details" not in str(native_record)
     assert "sensitive details" not in str(cli_record)
@@ -489,12 +426,14 @@ async def test_native_and_cli_emit_terminal_records_for_aborted_provider_calls(
     assert [record["stop_reason"] for record in records] == ["aborted", "aborted"]
     assert [record["recovery_state"] for record in records] == ["aborted", "aborted"]
     for record in records:
-        assert record["llm_error_category"] == "aborted"
         assert record["usage"] is None
         assert record["ttft_ms"] is None
         assert record["unavailable"]["usage"] == "provider_call_did_not_complete"
         assert record["unavailable"]["timing.ttft_ms"] == "provider_call_terminated_before_text"
     assert records[1]["provider_duration_ms"] is not None
+    assert records[1]["unavailable"]["timing.provider_vs_tool_breakdown"] == (
+        "cli_transport_exposes_only_full_turn_duration"
+    )
 
 
 @pytest.mark.asyncio
@@ -511,8 +450,7 @@ async def test_cli_start_failure_emits_terminal_record_with_explicit_missing_dur
         ).run_turn("test")
 
     [record] = _harness_records(telemetry)
-    assert record["stop_reason"] == "provider_error"
-    assert record["llm_error_category"] == "provider_error"
+    assert record["stop_reason"] == "error"
     assert record["provider_duration_ms"] is None
     assert record["unavailable"]["timing.provider_duration_ms"] == (
         "cli_transport_turn_duration_not_observed"
