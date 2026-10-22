@@ -6,13 +6,14 @@ import importlib
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request, status
 
 from niuu.service_runtime import run_service_app
 from yggdrasil.api.routes_sse import create_sse_router
 from yggdrasil.config import AdapterConfig, YggdrasilSettings
 from yggdrasil.connection_manager import ConnectionManager
 from yggdrasil.models import RealmAdapter
+from yggdrasil.rate_limit import TokenBucketRateLimiter
 from yggdrasil.sse.poller import RealmPoller
 
 
@@ -35,11 +36,14 @@ def create_app(
 ) -> FastAPI:
     """Create the Yggdrasil service and compose its configured adapters."""
     resolved_settings = settings or YggdrasilSettings()
-    resolved_adapters = tuple(adapters) if adapters is not None else tuple(
-        _build_adapter(config) for config in resolved_settings.adapters
+    resolved_adapters = (
+        tuple(adapters)
+        if adapters is not None
+        else tuple(_build_adapter(config) for config in resolved_settings.adapters)
     )
     connection_manager = ConnectionManager(resolved_settings.max_sse_clients)
     poller = RealmPoller(resolved_adapters, connection_manager, resolved_settings.poll_interval)
+    health_rate_limiter = TokenBucketRateLimiter()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -52,6 +56,7 @@ def create_app(
 
     app = FastAPI(title="Yggdrasil", lifespan=lifespan)
     app.state.connection_manager = connection_manager
+    app.state.health_rate_limiter = health_rate_limiter
     app.state.realm_poller = poller
     app.state.sse_router = create_sse_router(
         connection_manager,
@@ -61,7 +66,18 @@ def create_app(
     app.include_router(app.state.sse_router)
 
     @app.get("/health", tags=["Health"])
-    async def health() -> dict[str, str]:
+    async def health(request: Request) -> dict[str, str]:
+        client_ip = request.client.host if request.client is not None else "unknown"
+        retry_after = health_rate_limiter.retry_after(
+            endpoint=request.url.path,
+            client_ip=client_ip,
+        )
+        if retry_after is not None:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Rate limit exceeded",
+                headers={"Retry-After": str(retry_after)},
+            )
         return {"status": "healthy"}
 
     return app

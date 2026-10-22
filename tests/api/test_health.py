@@ -1,0 +1,69 @@
+"""Contract tests for the Yggdrasil health endpoint."""
+
+from __future__ import annotations
+
+from fastapi.testclient import TestClient
+
+from yggdrasil.main import create_app
+from yggdrasil.rate_limit import TokenBucketRateLimiter
+
+
+def _client(app, client_ip: str) -> TestClient:
+    return TestClient(app, client=(client_ip, 50000))
+
+
+def test_health_passes_through_unchanged_below_the_rate_limit() -> None:
+    client = _client(create_app(), "198.51.100.10")
+
+    try:
+        response = client.get("/health")
+    finally:
+        client.close()
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "healthy"}
+
+
+def test_health_returns_429_and_retry_after_when_rate_limit_is_exceeded() -> None:
+    client = _client(create_app(), "198.51.100.10")
+
+    try:
+        for _ in range(60):
+            assert client.get("/health").status_code == 200
+        response = client.get("/health")
+    finally:
+        client.close()
+
+    assert response.status_code == 429
+    assert response.headers["retry-after"] == "1"
+
+
+def test_health_rate_limits_each_client_ip_independently() -> None:
+    app = create_app()
+    limited_client = _client(app, "198.51.100.10")
+    isolated_client = _client(app, "198.51.100.11")
+
+    try:
+        for _ in range(60):
+            assert limited_client.get("/health").status_code == 200
+        limited_response = limited_client.get("/health")
+        isolated_response = isolated_client.get("/health")
+    finally:
+        limited_client.close()
+        isolated_client.close()
+
+    assert limited_response.status_code == 429
+    assert isolated_response.status_code == 200
+
+
+def test_health_rate_limit_refills_one_token_per_second() -> None:
+    now = 0.0
+    limiter = TokenBucketRateLimiter(clock=lambda: now)
+
+    for _ in range(60):
+        assert limiter.retry_after(endpoint="/health", client_ip="198.51.100.10") is None
+    assert limiter.retry_after(endpoint="/health", client_ip="198.51.100.10") == 1
+
+    now = 1.0
+
+    assert limiter.retry_after(endpoint="/health", client_ip="198.51.100.10") is None
