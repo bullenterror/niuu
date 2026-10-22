@@ -108,6 +108,16 @@ graph:
     position:
       x: 1408
       y: 280
+  - id: delivery-blocked
+    kind: gate
+    label: Delivery blocked
+    condition: Review the coder's stated reason, correct the ticket, then re-commission the delivery.
+    mode: human_approval
+    pendingBehavior: help_needed
+    instructions: The requested change could not be completed as written. Review the implementation outcome and update the ticket before re-commissioning.
+    position:
+      x: 704
+      y: 480
   - id: delivery-complete
     kind: end
     label: Delivery complete
@@ -125,6 +135,10 @@ graph:
     source: delivery-implement
     target: delivery-review
     label: code.changed -> code.changed
+  - id: edge-delivery-implement-to-blocked
+    source: delivery-implement
+    target: delivery-blocked
+    label: code.blocked -> code.blocked
   - id: edge-delivery-review-to-implement
     source: delivery-review
     target: delivery-implement

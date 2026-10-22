@@ -2117,6 +2117,7 @@ class TestBroker:
                     "fields": {
                         "verdict": "ready_for_gate",
                         "summary": "PRD is ready for approval.",
+                        "reason": "The requirements have been reconciled.",
                     },
                 },
             },
@@ -2128,6 +2129,9 @@ class TestBroker:
         assert gates[0]["status"] == "pending"
         assert gates[0]["pending_behavior"] == "help_needed"
         assert gates[0]["triggered_by_event_type"] == "spec.prd.ready_for_gate"
+        assert gates[0]["summary"] == (
+            "PRD is ready for approval. — The requirements have been reconciled."
+        )
         broker_under_test._emit_workflow_gate_help_needed_sleipnir_event.assert_awaited_once()
         broker_under_test._report_activity_state.assert_awaited_once()
         pending_events = [

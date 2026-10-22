@@ -2550,6 +2550,12 @@ class Broker(
 
         activation_id = self._workflow_activation_id_from_frame(frame)
         summary = str(payload.get("summary") or "").strip()
+        fields = payload.get("fields")
+        reason = ""
+        if isinstance(fields, dict):
+            reason = str(fields.get("rationale") or fields.get("reason") or "").strip()
+        if reason and reason not in summary:
+            summary = f"{summary} — {reason}" if summary else reason
 
         for node in matching_nodes:
             if node.mode == "evidence":

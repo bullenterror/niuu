@@ -6,6 +6,8 @@ from uuid import uuid4
 
 import pytest
 
+from ravn.config import Settings
+from ravn.workflow_runtime import _workflow_allowed_outcome_topics
 from ting.domain.exceptions import WorkflowDocumentError
 from ting.domain.models import WorkflowDefinition, WorkflowScope
 from ting.domain.workflow_document import workflow_document_revision
@@ -279,8 +281,41 @@ def test_load_system_workflows_only_keeps_supported_catalog() -> None:
         for member in node["stageMembers"]
     ] == ["gpt-5.6-terra"] * 4
     delivery_edge_labels = {edge["label"] for edge in delivery_flow.graph["edges"]}
+    assert "code.blocked -> code.blocked" in delivery_edge_labels
     assert "review.changes_requested -> review.changes_requested" in delivery_edge_labels
     assert "review.passed -> review.passed" in delivery_edge_labels
+    delivery_gates = {
+        node["id"]: node
+        for node in delivery_flow.graph["nodes"]
+        if node.get("kind") == "gate"
+    }
+    assert delivery_gates["delivery-blocked"] == {
+        "id": "delivery-blocked",
+        "kind": "gate",
+        "label": "Delivery blocked",
+        "condition": (
+            "Review the coder's stated reason, correct the ticket, then re-commission the delivery."
+        ),
+        "mode": "human_approval",
+        "pendingBehavior": "help_needed",
+        "instructions": (
+            "The requested change could not be completed as written. Review the implementation "
+            "outcome and update the ticket before re-commissioning."
+        ),
+        "position": {"x": 704, "y": 480},
+    }
+    delivery_settings = Settings.model_validate(
+        {
+            "workflow": {
+                "workflow_id": "tracker-delivery-flow",
+                "name": "Tracker Delivery Flow",
+                "graph": delivery_flow.graph,
+            }
+        }
+    )
+    assert _workflow_allowed_outcome_topics(
+        delivery_settings, node_id="delivery-implement"
+    ) == {"code.changed", "code.blocked"}
     delivery_resources = {
         node["label"]: node
         for node in delivery_flow.graph["nodes"]
