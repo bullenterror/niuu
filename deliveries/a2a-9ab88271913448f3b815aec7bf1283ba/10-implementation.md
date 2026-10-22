@@ -48,6 +48,6 @@ responses.
 
 ## Delivery
 
-Committed and pushed directly to the required `regin` branch. No hosted PR is
+Revision committed and pushed directly to the required `regin` branch (`73e6cb6a`). No hosted PR is
 created because the required delivery branch and merge target are both `regin`;
 a forge PR cannot use the same branch as its head and base.

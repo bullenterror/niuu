@@ -3,7 +3,7 @@
 - Delivery slug: `a2a-9ab88271913448f3b815aec7bf1283ba`
 - Required base and delivery branch: `regin`
 - Tracker: [NIU-1132](https://linear.app/niuu/issue/NIU-1132/emit-canonical-per-step-harness-telemetry-for-native-and-external)
-- Tracker status: `In Progress`
+- Tracker status: `In Review`
 
 ## Scope
 
