@@ -24,6 +24,7 @@ from grpc import server as grpc_server
 from identity.adapters.authorization import AllowAllAuthorizationAdapter
 from identity.adapters.identity import EnvoyHeaderAuthenticationAdapter
 from niuu.domain.models import Principal
+from ravn.adapters.personas.loader import FilesystemPersonaAdapter
 from ting.api.a2a import (
     _launch_digest,
     campaign_to_task,
@@ -45,6 +46,7 @@ from ting.domain.workflow_snapshot import build_workflow_snapshot
 from ting.ports.volundr import SpawnRequest, VolundrPort, VolundrSession
 from ting.ports.workflow_campaign_repository import WorkflowCampaignRepository
 from ting.ports.workflow_repository import WorkflowRepository
+from ting.system_workflows import load_system_workflows
 
 A2A_PATH = "/api/v1/ting/a2a"
 _SIGNING_KEY = "test-only-signing-key-32-bytes-long!"
@@ -195,6 +197,26 @@ class InMemoryA2ALaunchRepository:
                 self.by_message[key] = launched
                 return launched
         raise ValueError("missing reservation")
+
+
+class RecordingExecutionRepository:
+    def __init__(self) -> None:
+        self.reserved = []
+        self.execution = None
+
+    async def reserve_parent_launch(self, execution):
+        self.reserved.append(execution)
+        self.execution = execution
+        return execution, True
+
+    async def attach_parent_session(self, execution_id, *, session_id, connection_id):
+        assert self.execution is not None and self.execution.id == execution_id
+        self.execution = replace(
+            self.execution,
+            parent_session_id=session_id,
+            connection_id=connection_id,
+        )
+        return self.execution
 
 
 class RecordingVolundrPort(VolundrPort):
@@ -738,6 +760,57 @@ class TestSendMessage:
         assert campaign.metadata["surface"] == "a2a"
         assert campaign.metadata["a2a_message_id"] == "msg-1"
         assert campaign.metadata["a2a_workflow_slug"] == "build-the-widget-tool"
+
+    def test_fan_out_skill_binds_durable_execution_context(self) -> None:
+        workflow = next(
+            item for item in load_system_workflows() if item.name == "Research Campaign"
+        )
+        ledger = RecordingExecutionRepository()
+        client, campaigns, port = _make_client(
+            workflow_repo=InMemoryWorkflowRepository([workflow]),
+        )
+        client.app.state.persona_source = FilesystemPersonaAdapter(
+            persona_dirs=[], include_builtin=True
+        )
+        client.app.state.workflow_execution_repo = ledger
+        params = _send_params(
+            str(workflow.id),
+            prompt="Research durable context binding for this campaign",
+        )
+        params["message"]["metadata"].update(
+            {
+                "connectionId": "local",
+                "repo": "https://github.com/niuulabs/niuu",
+                "branch": "regin",
+                "traceContext": {
+                    "traceparent": "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01",
+                    "tracestate": "niuu=resident",
+                },
+            }
+        )
+
+        response = _rpc(client, "SendMessage", params)
+
+        assert response.status_code == 200, response.text
+        task = response.json()["result"]["task"]
+        assert task["status"]["state"] == "TASK_STATE_SUBMITTED"
+        assert len(ledger.reserved) == 1
+        assert ledger.execution.parent_node_id == "research-threads"
+        assert ledger.execution.parent_session_id == "session-123"
+        assert ledger.execution.connection_id == "local"
+
+        workload = port.spawned[0].workload_config
+        provenance = workload["provenance"]["workflow_execution"]
+        assert provenance["execution_id"] == str(ledger.execution.id)
+        assert provenance["parent_session_key"] == f"workflow:execution-{ledger.execution.id.hex}"
+        assert workload["ravn_config"]["workflow_execution"]["enabled"] is True
+        assert workload["provenance"]["trace_context"] == {
+            "traceparent": "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01",
+            "tracestate": "niuu=resident",
+        }
+
+        campaign = next(iter(campaigns._campaigns.values()))
+        assert campaign.metadata["workflow_execution_id"] == str(ledger.execution.id)
 
     def test_task_lifecycle_drives_send_get_and_cancel_over_jsonrpc(self) -> None:
         """Exercise all required task operations against one launched workflow."""
