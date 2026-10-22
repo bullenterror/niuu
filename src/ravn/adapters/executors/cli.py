@@ -141,6 +141,43 @@ def _sum_model_usage(raw: dict | None) -> TokenUsage:
     )
 
 
+def _interval_union_duration(
+    intervals: list[tuple[float, float]], *, start: float, end: float
+) -> float:
+    """Return the covered duration of intervals constrained to a turn."""
+    bounded = sorted(
+        (max(start, interval_start), min(end, interval_end))
+        for interval_start, interval_end in intervals
+        if interval_end > start and interval_start < end
+    )
+    if not bounded:
+        return 0.0
+
+    total = 0.0
+    current_start, current_end = bounded[0]
+    for interval_start, interval_end in bounded[1:]:
+        if interval_start <= current_end:
+            current_end = max(current_end, interval_end)
+            continue
+        total += current_end - current_start
+        current_start, current_end = interval_start, interval_end
+    return total + current_end - current_start
+
+
+def _llm_error_category(exc: BaseException) -> str:
+    """Classify a terminal provider exception without exporting its content."""
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, asyncio.CancelledError):
+            return "aborted"
+        if isinstance(current, TimeoutError) or "timeout" in type(current).__name__.lower():
+            return "timeout"
+        current = current.__cause__ or current.__context__
+    return "provider_error"
+
+
 def _is_ting_workflow_tool(tool_name: str) -> bool:
     name = tool_name.replace("-", "_")
     return name.startswith("ting_") or any(
@@ -243,11 +280,13 @@ class CliTransportAgent(ExecutionAgentPort):
         self._interrupt_reason: InterruptReason | None = None
         self._current_tool_names: dict[str, str] = {}
         self._tool_started_at: dict[str, float] = {}
+        self._tool_intervals: list[tuple[float, float]] = []
         self._turn_tool_calls: list[ToolCall] = []
         self._turn_tool_results: list[ToolResult] = []
         self._turn_tool_wall_time_ms = 0.0
         self._turn_ttft_ms: float | None = None
         self._turn_started_at: float | None = None
+        self._turn_finished_at: float | None = None
         self._turn_duration_ms: float | None = None
         self._turn_context_message_count = 0
         self._turn_result_payload: dict[str, Any] = {}
@@ -348,8 +387,8 @@ class CliTransportAgent(ExecutionAgentPort):
             )
             try:
                 result = await self._run_turn_observed(user_input)
-            except asyncio.CancelledError:
-                self._emit_cli_terminal_harness_step(stop_reason="aborted")
+            except asyncio.CancelledError as exc:
+                self._emit_cli_terminal_harness_step(stop_reason="aborted", error=exc)
                 telemetry.count(
                     "ravn.agent.llm.calls",
                     attributes={**metric_attributes, "error.type": "aborted"},
@@ -360,8 +399,8 @@ class CliTransportAgent(ExecutionAgentPort):
                     attributes={**metric_attributes, "error.type": "aborted"},
                 )
                 raise
-            except Exception:
-                self._emit_cli_terminal_harness_step(stop_reason="error")
+            except Exception as exc:
+                self._emit_cli_terminal_harness_step(stop_reason="provider_error", error=exc)
                 telemetry.count(
                     "ravn.agent.llm.calls",
                     attributes={**metric_attributes, "error.type": "exception"},
@@ -453,7 +492,8 @@ class CliTransportAgent(ExecutionAgentPort):
         try:
             response_text = await self._turn_runner.run_prompt(prompt, request_id=correlation_id)
         finally:
-            self._turn_duration_ms = (monotonic() - self._turn_started_at) * 1_000
+            self._turn_finished_at = monotonic()
+            self._turn_duration_ms = (self._turn_finished_at - self._turn_started_at) * 1_000
 
         result_payload = self._transport.last_result or {}
         self._turn_result_payload = result_payload
@@ -501,9 +541,6 @@ class CliTransportAgent(ExecutionAgentPort):
             "compaction.applied": "cli_transport_does_not_expose_compaction",
             "compaction.passes": "cli_transport_does_not_expose_compaction",
             "compaction.messages_removed": "cli_transport_does_not_expose_compaction",
-            "timing.provider_vs_tool_breakdown": (
-                "cli_transport_exposes_only_full_turn_duration"
-            ),
         }
         if self._turn_ttft_ms is None:
             unavailable["timing.ttft_ms"] = "no_streamed_text_token"
@@ -530,22 +567,20 @@ class CliTransportAgent(ExecutionAgentPort):
             compaction_applied=None,
             compaction_passes=None,
             compaction_messages_removed=None,
-            # CliTurnRunner reports only the complete external turn.  It can
-            # include remote tool work, so the unavailable map records that it
-            # is not a provider-only measurement.
-            provider_duration_ms=self._turn_duration_ms,
+            provider_duration_ms=self._provider_duration_ms(),
             ttft_ms=self._turn_ttft_ms,
             tool_wall_time_ms=self._turn_tool_wall_time_ms,
             tool_call_count=len(result.tool_calls),
             usage=result.usage if usage_available else None,
             stop_reason=stop_reason,
+            llm_error_category=None,
             retry_index=0,
             recovery_state="none",
             unavailable=unavailable,
         )
         emit_harness_step(record)
 
-    def _emit_cli_terminal_harness_step(self, *, stop_reason: str) -> None:
+    def _emit_cli_terminal_harness_step(self, *, stop_reason: str, error: BaseException) -> None:
         """Emit a content-safe record before a failed CLI turn propagates."""
         unavailable = {
             "provider_call.id": "cli_transport_does_not_expose_provider_request_id",
@@ -553,14 +588,14 @@ class CliTransportAgent(ExecutionAgentPort):
             "compaction.applied": "cli_transport_does_not_expose_compaction",
             "compaction.passes": "cli_transport_does_not_expose_compaction",
             "compaction.messages_removed": "cli_transport_does_not_expose_compaction",
-            "timing.provider_vs_tool_breakdown": (
-                "cli_transport_exposes_only_full_turn_duration"
-            ),
             "timing.tool_wall_time_ms": "provider_call_terminated_before_tool_completion",
-            "usage": "provider_call_did_not_complete",
         }
         if self._turn_ttft_ms is None:
             unavailable["timing.ttft_ms"] = "provider_call_terminated_before_text"
+        if self._turn_tool_results:
+            unavailable.pop("timing.tool_wall_time_ms")
+        if not isinstance(self._turn_result_payload.get("modelUsage"), dict):
+            unavailable["usage"] = "provider_call_did_not_complete"
         if self._turn_duration_ms is None:
             unavailable["timing.provider_duration_ms"] = "cli_transport_turn_duration_not_observed"
         record = HarnessStepTelemetryRecord(
@@ -580,27 +615,50 @@ class CliTransportAgent(ExecutionAgentPort):
             compaction_applied=None,
             compaction_passes=None,
             compaction_messages_removed=None,
-            provider_duration_ms=self._turn_duration_ms,
+            provider_duration_ms=self._provider_duration_ms(),
             ttft_ms=self._turn_ttft_ms,
-            tool_wall_time_ms=None,
+            tool_wall_time_ms=(self._turn_tool_wall_time_ms if self._turn_tool_results else None),
             tool_call_count=len(self._turn_tool_calls),
-            usage=None,
+            usage=(
+                _sum_model_usage(self._turn_result_payload)
+                if isinstance(self._turn_result_payload.get("modelUsage"), dict)
+                else None
+            ),
             stop_reason=stop_reason,
+            llm_error_category=_llm_error_category(error),
             retry_index=0,
             recovery_state=stop_reason,
             unavailable=unavailable,
         )
         emit_harness_step(record)
 
+    def _provider_duration_ms(self) -> float | None:
+        """Return CLI provider time after subtracting the union of tool intervals."""
+        if self._turn_started_at is None or self._turn_finished_at is None:
+            return None
+
+        intervals = [*self._tool_intervals]
+        intervals.extend(
+            (started_at, self._turn_finished_at) for started_at in self._tool_started_at.values()
+        )
+        tool_duration = _interval_union_duration(
+            intervals,
+            start=self._turn_started_at,
+            end=self._turn_finished_at,
+        )
+        return max(0.0, (self._turn_finished_at - self._turn_started_at - tool_duration) * 1_000)
+
     def _reset_turn_telemetry(self) -> None:
         """Clear telemetry that is scoped to one external runtime turn."""
         self._current_tool_names.clear()
         self._tool_started_at.clear()
+        self._tool_intervals = []
         self._turn_tool_calls = []
         self._turn_tool_results = []
         self._turn_tool_wall_time_ms = 0.0
         self._turn_ttft_ms = None
         self._turn_started_at = None
+        self._turn_finished_at = None
         self._turn_duration_ms = None
         self._turn_context_message_count = 0
         self._turn_result_payload = {}
@@ -903,7 +961,9 @@ class CliTransportAgent(ExecutionAgentPort):
         telemetry.count("ravn.agent.tool.calls", attributes=attributes)
         started = self._tool_started_at.pop(tool_use_id, None)
         if started is not None:
-            duration = monotonic() - started
+            completed = monotonic()
+            duration = completed - started
+            self._tool_intervals.append((started, completed))
             self._turn_tool_wall_time_ms += duration * 1_000
             telemetry.duration(
                 "ravn.agent.tool.duration",

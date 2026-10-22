@@ -46,6 +46,7 @@ class HarnessStepTelemetryRecord:
     tool_call_count: int
     usage: TokenUsage | None
     stop_reason: str | None
+    llm_error_category: str | None
     retry_index: int
     recovery_state: str
     unavailable: dict[str, str] = field(default_factory=dict)
@@ -90,6 +91,7 @@ class HarnessStepTelemetryRecord:
         _set_available(attributes, "ravn.harness.timing.ttft_ms", self.ttft_ms)
         _set_available(attributes, "ravn.harness.timing.tool_wall_time_ms", self.tool_wall_time_ms)
         _set_available(attributes, "ravn.harness.stop_reason", self.stop_reason)
+        _set_available(attributes, "ravn.harness.llm_error_category", self.llm_error_category)
         _set_available(attributes, "ravn.harness.compaction.applied", self.compaction_applied)
         _set_available(attributes, "ravn.harness.compaction.passes", self.compaction_passes)
         _set_available(
