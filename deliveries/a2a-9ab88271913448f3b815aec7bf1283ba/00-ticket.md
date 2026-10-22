@@ -26,3 +26,10 @@ content capture is disabled.
 Tracker status was moved to **In Progress** for the requested review revision. The
 remaining acceptance issues are provider-duration comparability and terminal
 failure/abort records in both runtime harnesses.
+
+## Review revision: streamed terminal TTFT (2026-10-22)
+
+A terminal native or CLI-backed record now preserves its measured TTFT if text
+was streamed before the provider/transport failed or was cancelled. The TTFT
+field is marked unavailable only when no text token was observed, preventing a
+numeric telemetry value from contradicting its availability metadata.

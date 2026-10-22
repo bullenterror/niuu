@@ -70,3 +70,18 @@ tool timing unavailable when no reliable boundary exists.
 - Passed: `uv run --extra otel ruff check src/ravn/agent.py src/ravn/adapters/executors/cli.py tests/test_ravn/test_harness_telemetry.py`.
 - Passed: `uv run --extra otel pytest -q tests/test_ravn/test_harness_telemetry.py tests/test_ravn/test_executor_cli.py tests/test_ravn/test_agent.py::TestRavnAgentSimpleTurn tests/test_ravn/test_prompt_budget.py` — 68 passed.
 - No hosted PR is created: the required delivery branch and merge target are both `regin`, so this is a direct-to-branch delivery.
+
+## Review revision: streamed terminal TTFT
+
+Terminal native and CLI-backed harness records now retain an observed TTFT after
+partial streamed text and omit `timing.ttft_ms` from `unavailable`. Calls that
+end before any text still retain the explicit
+`provider_call_terminated_before_text` reason. The cross-harness regression
+uses a streaming native LLM and fake CLI transport that each emit text then
+raise.
+
+### Revision verification
+
+- Passed: `uv run --extra otel ruff check src/ravn/agent.py src/ravn/adapters/executors/cli.py tests/test_ravn/test_harness_telemetry.py`.
+- Passed: `uv run --extra otel pytest -q tests/test_ravn/test_harness_telemetry.py tests/test_ravn/test_executor_cli.py tests/test_ravn/test_agent.py::TestRavnAgentSimpleTurn tests/test_ravn/test_prompt_budget.py` — 69 passed.
+- No hosted PR is created: the required delivery branch and merge target are both `regin`, so this is a direct-to-branch delivery.

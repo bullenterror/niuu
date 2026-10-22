@@ -543,10 +543,11 @@ class CliTransportAgent(ExecutionAgentPort):
             "compaction.passes": "cli_transport_does_not_expose_compaction",
             "compaction.messages_removed": "cli_transport_does_not_expose_compaction",
             "timing.provider_duration_ms": "cli_transport_does_not_expose_provider_boundary",
-            "timing.ttft_ms": "provider_call_terminated_before_text",
             "timing.tool_wall_time_ms": "provider_call_terminated_before_tool_completion",
             "usage": "provider_call_did_not_complete",
         }
+        if self._turn_ttft_ms is None:
+            unavailable["timing.ttft_ms"] = "provider_call_terminated_before_text"
         record = HarnessStepTelemetryRecord(
             step_id=f"{self._session.id}:{self._session.turn_count}:0",
             session_id=str(self._session.id),
@@ -565,7 +566,7 @@ class CliTransportAgent(ExecutionAgentPort):
             compaction_passes=None,
             compaction_messages_removed=None,
             provider_duration_ms=None,
-            ttft_ms=None,
+            ttft_ms=self._turn_ttft_ms,
             tool_wall_time_ms=None,
             tool_call_count=len(self._turn_tool_calls),
             usage=None,

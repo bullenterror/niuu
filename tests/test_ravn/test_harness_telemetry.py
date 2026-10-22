@@ -285,6 +285,15 @@ class _AbortedLLM(LLMPort):
         raise AssertionError("generate is not used by a normal harness step")
 
 
+class _FailingAfterTextLLM(LLMPort):
+    async def stream(self, *_args: object, **_kwargs: object) -> AsyncIterator[StreamEvent]:
+        yield StreamEvent(type=StreamEventType.TEXT_DELTA, text="partial output")
+        raise RuntimeError("provider failure after streamed text")
+
+    async def generate(self, *_args: object, **_kwargs: object):
+        raise AssertionError("generate is not used by a normal harness step")
+
+
 class _TerminalCliTransport(CLITransport):
     terminal_error: BaseException = RuntimeError("provider failure contains sensitive details")
 
@@ -312,6 +321,14 @@ class _TerminalCliTransport(CLITransport):
 
 class _AbortedCliTransport(_TerminalCliTransport):
     terminal_error = asyncio.CancelledError()
+
+
+class _FailingAfterTextCliTransport(_TerminalCliTransport):
+    async def send_message(self, _content: str) -> None:
+        await self._emit(
+            {"type": "content_block_delta", "delta": {"text": "partial output"}}
+        )
+        raise RuntimeError("provider failure after streamed text")
 
 
 def _build_cli_agent(transport_adapter: str) -> object:
@@ -408,3 +425,25 @@ async def test_native_and_cli_emit_terminal_records_for_aborted_provider_calls(
         assert record["ttft_ms"] is None
         assert record["unavailable"]["usage"] == "provider_call_did_not_complete"
         assert record["unavailable"]["timing.ttft_ms"] == "provider_call_terminated_before_text"
+
+
+@pytest.mark.asyncio
+async def test_terminal_records_preserve_ttft_after_streamed_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    telemetry = _RecordingTelemetry()
+    monkeypatch.setattr("ravn.agent.get_observability", lambda: telemetry)
+    monkeypatch.setattr("ravn.adapters.executors.cli.get_observability", lambda: telemetry)
+    monkeypatch.setattr("ravn.harness_telemetry.get_observability", lambda: telemetry)
+
+    with pytest.raises(RuntimeError, match="after streamed text"):
+        await _build_native_agent(_FailingAfterTextLLM()).run_turn("test")
+    with pytest.raises(RuntimeError, match="after streamed text"):
+        await _build_cli_agent(
+            "tests.test_ravn.test_harness_telemetry._FailingAfterTextCliTransport"
+        ).run_turn("test")
+
+    native_record, cli_record = _harness_records(telemetry)
+    for record in (native_record, cli_record):
+        assert record["ttft_ms"] is not None
+        assert "timing.ttft_ms" not in record["unavailable"]

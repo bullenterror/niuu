@@ -1365,11 +1365,14 @@ class RavnAgent:
         unavailable: dict[str, str] = {"provider_call.id": "provider_does_not_expose_request_id"}
         if response is None:
             unavailable["usage"] = "provider_call_did_not_complete"
-            unavailable["timing.ttft_ms"] = "provider_call_terminated_before_text"
         elif not self._last_usage_available:
             unavailable["usage"] = "provider_did_not_report_usage"
-        elif self._last_ttft_ms is None:
-            unavailable["timing.ttft_ms"] = "no_streamed_text_token"
+        if self._last_ttft_ms is None:
+            unavailable["timing.ttft_ms"] = (
+                "provider_call_terminated_before_text"
+                if response is None
+                else "no_streamed_text_token"
+            )
         if self._last_provider_duration_ms is None:
             unavailable["timing.provider_duration_ms"] = "provider_duration_not_observed"
         record = HarnessStepTelemetryRecord(
