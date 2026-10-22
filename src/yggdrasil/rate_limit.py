@@ -67,13 +67,14 @@ class TokenBucketRateLimiter:
             return max(1, ceil((1.0 - bucket.tokens) / self._refill_rate))
 
     def _discard_inactive_buckets(self, now: float) -> None:
-        for bucket_key, bucket in tuple(self._buckets.items()):
+        while self._buckets:
+            bucket_key = next(iter(self._buckets))
+            bucket = self._buckets[bucket_key]
             elapsed = now - bucket.updated_at
-            if elapsed < self._bucket_idle_ttl:
-                continue
             refilled_tokens = min(self._capacity, bucket.tokens + elapsed * self._refill_rate)
-            if refilled_tokens == self._capacity:
-                del self._buckets[bucket_key]
+            if elapsed < self._bucket_idle_ttl or refilled_tokens < self._capacity:
+                return
+            self._buckets.popitem(last=False)
 
     def _discard_oldest_buckets(self) -> None:
         while len(self._buckets) >= self._max_buckets:

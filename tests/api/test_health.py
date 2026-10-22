@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
+
 from fastapi.testclient import TestClient
 
 from yggdrasil.main import create_app
@@ -85,6 +87,35 @@ def test_health_rate_limit_discards_inactive_full_buckets() -> None:
 
     assert limiter.retry_after(endpoint="/health", client_ip="198.51.100.11") is None
     assert ("/health", "198.51.100.10") not in limiter._buckets
+
+
+def test_health_rate_limit_does_not_scan_unexpired_buckets() -> None:
+    class CountingOrderedDict(OrderedDict):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self.inspected_buckets = 0
+
+        def __iter__(self):
+            for bucket_key in super().__iter__():
+                self.inspected_buckets += 1
+                yield bucket_key
+
+    now = 0.0
+    limiter = TokenBucketRateLimiter(
+        bucket_idle_ttl=60.0,
+        max_buckets=100,
+        clock=lambda: now,
+    )
+    for client_number in range(100):
+        assert (
+            limiter.retry_after(endpoint="/health", client_ip=f"198.51.100.{client_number}") is None
+        )
+
+    limiter._buckets = CountingOrderedDict(limiter._buckets)
+    now = 1.0
+
+    assert limiter.retry_after(endpoint="/health", client_ip="198.51.100.0") is None
+    assert limiter._buckets.inspected_buckets == 1
 
 
 def test_health_rate_limit_caps_retained_buckets() -> None:

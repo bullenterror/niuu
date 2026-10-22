@@ -45,3 +45,24 @@ bucket retention.
 - Passed: `git diff --check`.
 
 The review revision is committed and pushed directly to `regin`; this direct-regin delivery has no hosted PR.
+
+## Review revision: ordered cleanup
+
+`TokenBucketRateLimiter` now removes only the least-recently-used inactive,
+fully refilled buckets. Because buckets are access-ordered, cleanup stops at
+the first retained bucket that has not expired instead of allocating and
+scanning the full store on every `/health` request.
+
+Added regression coverage using a 100-bucket store that verifies an unexpired
+request inspects only the oldest bucket.
+
+### Verification
+
+- Passed: `uv run ruff check src/yggdrasil/rate_limit.py tests/api/test_health.py`.
+- Passed: `uv run ruff format src/yggdrasil/rate_limit.py tests/api/test_health.py`.
+- Passed: `uv run pytest -q --no-cov tests/api/test_health.py tests/api/test_routes_sse.py tests/sse/test_poller.py` (20 passed; one existing TestClient deprecation warning).
+- Passed: `git diff --check`.
+
+The revision is committed and pushed directly to `regin`. No hosted PR exists:
+the required head and base are both `regin`, and GitHub does not allow a pull
+request whose head and base branches are the same.
