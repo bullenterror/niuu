@@ -163,3 +163,19 @@ No blocking findings.
 ### Recommendation
 
 Approve NIU-1132 on `regin`.
+
+## Operator-directed in-scope revision (2026-10-22)
+
+The operator superseded the prior request to derive a provider-only CLI timing
+value and to expand terminal taxonomy. The CLI transport exposes only complete
+turn duration, so `provider_duration_ms` retains that observed value and the
+record explicitly marks `timing.provider_vs_tool_breakdown` unavailable. Native
+timing remains provider-only. Existing terminal records remain emitted before
+failure or cancellation propagation using the established `error` and
+`aborted` classifications. No shared CLI contract/schema or observability port
+was changed.
+
+Focused verification passed:
+
+- `uv run --extra otel ruff check src/ravn/agent.py src/ravn/adapters/executors/cli.py src/ravn/domain/harness_telemetry.py tests/test_ravn/test_harness_telemetry.py`
+- `uv run --extra otel pytest -q tests/test_ravn/test_harness_telemetry.py tests/test_ravn/test_executor_cli.py tests/test_ravn/test_agent.py::TestRavnAgentSimpleTurn tests/test_ravn/test_prompt_budget.py` — 71 passed.

@@ -124,26 +124,26 @@ paths.
 - Passed: `uv run --extra otel ruff check src/ravn/agent.py src/ravn/adapters/executors/cli.py src/ravn/domain/harness_telemetry.py src/ravn/harness_telemetry.py tests/test_ravn/test_harness_telemetry.py`.
 - Passed: `uv run --extra otel pytest -q tests/test_ravn/test_harness_telemetry.py tests/test_ravn/test_executor_cli.py tests/test_ravn/test_agent.py::TestRavnAgentSimpleTurn tests/test_ravn/test_prompt_budget.py` — 70 passed.
 
-## Review revision: provider-only timing and terminal taxonomy
+## Operator-directed in-scope revision (2026-10-22)
 
-`CliTransportAgent` now derives `provider_duration_ms` by subtracting the
-already-observed remote tool wall time from the full `CliTurnRunner` duration.
-The separate `tool_wall_time_ms` remains unchanged, and the prior unavailable
-provider/tool-breakdown marker is removed because the canonical provider field
-is normalized to exclude completed tool work.
+The shared CLI transport contract and schema remain unchanged. The current
+`CliTurnRunner` exposes only complete-turn timing, so CLI-backed records retain
+that observed value in `provider_duration_ms` and set
+`timing.provider_vs_tool_breakdown` to
+`cli_transport_exposes_only_full_turn_duration`. Native records continue to
+report their actual provider-call duration.
 
-`HarnessStepTelemetryRecord` now carries `llm_error_category`. Native and CLI
-terminal paths classify exceptions without recording their messages: timeout
-exception types map to `timeout`, cancellations to `aborted`, and other
-provider failures to `provider_error`. CLI terminal provider failures use
-`stop_reason=provider_error`; when the transport supplied partial usage, that
-usage is retained rather than fabricated or discarded.
+Failure and cancellation paths continue to emit one existing
+`ravn.harness.step` record before re-raising, using the established `error` and
+`aborted` classifications. No new error-taxonomy field or observability port
+was added. The timing regression models five seconds of remote tool time and a
+seven-second complete CLI turn; it asserts the recorded duration remains 7,000
+ms and the unavailable breakdown reason is present.
 
 ### Verification
 
 - Passed: `uv run --extra otel pytest -q tests/test_ravn/test_harness_telemetry.py tests/test_ravn/test_executor_cli.py tests/test_ravn/test_agent.py::TestRavnAgentSimpleTurn tests/test_ravn/test_prompt_budget.py` — 71 passed.
-- Passed: `uv run --extra otel ruff check src/ravn/agent.py src/ravn/adapters/executors/cli.py src/ravn/domain/harness_telemetry.py tests/test_ravn/test_harness_telemetry.py tests/test_ravn/test_executor_cli.py`.
-- The deterministic CLI regression models five seconds of tool work followed by two seconds of provider time and asserts `provider_duration_ms == 2000` while tool wall time remains `5000`.
+- Passed: `uv run --extra otel ruff check src/ravn/agent.py src/ravn/adapters/executors/cli.py src/ravn/domain/harness_telemetry.py tests/test_ravn/test_harness_telemetry.py`.
 
 No hosted PR is created: the required delivery and target branch are both
 `regin`, so this review revision is delivered directly to that branch.
