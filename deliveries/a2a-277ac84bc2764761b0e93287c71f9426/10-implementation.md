@@ -18,6 +18,7 @@ response header, IP isolation, and deterministic one-token-per-second refill.
 
 ## Delivery
 
-The implementation is committed directly on `regin`, as required. A hosted PR
-will be created if the repository host supports it; otherwise this handoff will
-record the local-only result.
+The implementation is committed and pushed directly on `regin`, as required.
+GitHub hosts the repository, but no separate PR can be created because the
+required delivery and merge-target branch are both `regin`; GitHub does not
+permit a pull request whose head and base are the same branch.
