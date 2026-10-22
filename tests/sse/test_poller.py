@@ -20,8 +20,10 @@ class FakeRealmAdapter:
     realm_id: str
     summary: RealmSummary | None = None
     error: Exception | None = None
+    calls: int = 0
 
     async def get_summary(self) -> RealmSummary:
+        self.calls += 1
         if self.error is not None:
             raise self.error
         assert self.summary is not None
@@ -82,8 +84,22 @@ async def test_poller_start_is_idempotent_and_stop_cancels_the_task() -> None:
     await poller.stop()
 
     assert task is not None
-    assert poller.summary_for("odin") == summary
+    assert poller.summary_for("odin") is None
     assert poller._task is None
+
+
+@pytest.mark.asyncio
+async def test_poller_waits_an_interval_before_the_next_poll() -> None:
+    summary = RealmSummary(realm_id="odin", health_status="healthy")
+    adapter = FakeRealmAdapter("odin", summary=summary)
+    poller = RealmPoller([adapter], ConnectionManager(max_clients=1), poll_interval=15.0)
+
+    await poller.poll_once()
+    poller.start()
+    await asyncio.sleep(0)
+    await poller.stop()
+
+    assert adapter.calls == 1
 
 
 def test_connection_manager_enforces_the_limit_and_removes_empty_realm_sets() -> None:
