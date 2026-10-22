@@ -3,7 +3,8 @@
 - **Tracker:** NIU-1141
 - **Merged branch:** `regin`
 - **Target branch:** `regin`
-- **Merge commit SHA:** `6ef7b724` (direct integration on `regin`; no separate merge commit was required)
+- **Merge commit SHA:** `32fa85c947a5d1b1003c47a96554976798aa4e4f`
+- **Delivered-change commit:** `6ef7b724` (direct integration on `regin`)
 - **Final tracker status:** Done
 
 ## Landed summary
