@@ -6,21 +6,23 @@
 
 ## Prior review follow-up verification
 
-The prior request is satisfied on the live repository-root `regin` branch at
-`1f5d51bd`:
+The prior request to retain observed partial usage on terminal records is satisfied
+on the live repository-root `regin` branch at `216f2dca`:
 
-- CLI provider duration now subtracts the merged union of completed tool
-  intervals and the elapsed interval of a tool still active when the turn
-  finishes (`src/ravn/adapters/executors/cli.py:144-164,635-649,962-967`).
-  This avoids double-subtracting overlapping tools and avoids counting an
-  unfinished tool's elapsed wall time as provider time.
-- The regressions cover both overlapping five-second tools in a seven-second
-  turn (2,000 ms provider time) and a terminal error with an unfinished tool
-  (`tests/test_ravn/test_harness_telemetry.py:290-305,548-567`).
-- Native terminal errors have a non-null safe error category; CLI terminal
-  errors use `provider_error` and the same category
-  (`src/ravn/agent.py:590-601,1374-1419`,
-  `src/ravn/adapters/executors/cli.py:377-388,557-633`).
+- Native streaming stores the latest `MESSAGE_DONE` usage and terminal emission
+  uses that observed value even when the provider later raises
+  (`src/ravn/agent.py:1381-1428,1540-1600`).
+- CLI transport event handling retains an observed `modelUsage` payload; the
+  turn `finally` preserves it when a later `last_result` omits usage, and the
+  terminal record maps it to normalized usage
+  (`src/ravn/adapters/executors/cli.py:492-507,590-640,735-738`).
+- The re-check regression verifies both native and CLI usage reported before a
+  provider failure is present in the emitted terminal records
+  (`tests/test_ravn/test_harness_telemetry.py:667-694`).
+
+The earlier duration and error-record requests remain satisfied: CLI provider
+duration excludes the merged union of tool intervals (`src/ravn/adapters/executors/cli.py:642-656`), and failure records carry a content-safe error category
+(`src/ravn/agent.py:589-603`, `src/ravn/adapters/executors/cli.py:388-413,590-640`).
 
 ## Findings
 
@@ -28,19 +30,18 @@ No blocking findings.
 
 ## Verification notes
 
-- Reviewed `regin` at `1f5d51bd`; inspected
-  `git diff a7e39a0974d400187c6d39f723dcc9afd3dce9d0..HEAD` and
-  `git diff --check a7e39a0974d400187c6d39f723dcc9afd3dce9d0..HEAD`.
+- Reviewed `regin` at `216f2dca` and the committed diff
+  `git diff a7e39a0974d400187c6d39f723dcc9afd3dce9d0..HEAD`; `git diff --check`
+  passed.
 - Passed: `uv run --extra otel ruff check src/ravn/agent.py
   src/ravn/adapters/executors/cli.py src/ravn/domain/harness_telemetry.py
   tests/test_ravn/test_harness_telemetry.py`.
 - Passed: `uv run --extra otel ruff format --check src/ravn/agent.py
   src/ravn/adapters/executors/cli.py src/ravn/domain/harness_telemetry.py
   tests/test_ravn/test_harness_telemetry.py`.
-- Passed: `uv run --extra otel pytest -q
-  tests/test_ravn/test_harness_telemetry.py tests/test_ravn/test_executor_cli.py
-  tests/test_ravn/test_agent.py::TestRavnAgentSimpleTurn
-  tests/test_ravn/test_prompt_budget.py` — 73 passed.
+- Passed: `uv run --extra otel pytest -q tests/test_ravn/test_harness_telemetry.py
+  tests/test_ravn/test_executor_cli.py tests/test_ravn/test_agent.py::TestRavnAgentSimpleTurn
+  tests/test_ravn/test_prompt_budget.py` — 74 passed.
 
 ## Recommendation
 
