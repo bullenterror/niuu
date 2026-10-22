@@ -10,10 +10,8 @@ from fastapi import Request
 
 from yggdrasil.connection_manager import ConnectionManager
 from yggdrasil.models import RealmSummary
-from yggdrasil.sse.poller import RealmPoller
 
 REALM_SUMMARY_EVENT = "realm.summary"
-DISCONNECT_CHECK_INTERVAL_SECONDS = 1.0
 
 
 def format_sse(summary: RealmSummary) -> str:
@@ -26,19 +24,17 @@ async def stream_realm_summary(
     request: Request,
     realm_id: str,
     connection_manager: ConnectionManager,
-    poller: RealmPoller,
+    initial_summary: RealmSummary,
     queue: asyncio.Queue[RealmSummary],
+    disconnect_check_interval: float,
 ) -> AsyncGenerator[str, None]:
     """Yield an initial summary followed by changed summaries until disconnect."""
     try:
-        summary = poller.summary_for(realm_id)
-        if summary is None:
-            return
-        yield format_sse(summary)
+        yield format_sse(initial_summary)
 
         while not await request.is_disconnected():
             try:
-                summary = await asyncio.wait_for(queue.get(), DISCONNECT_CHECK_INTERVAL_SECONDS)
+                summary = await asyncio.wait_for(queue.get(), disconnect_check_interval)
             except TimeoutError:
                 continue
             yield format_sse(summary)

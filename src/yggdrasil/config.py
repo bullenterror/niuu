@@ -23,6 +23,11 @@ class YggdrasilSettings(BaseSettings):
         gt=0,
         description="Seconds between configured realm health polls.",
     )
+    stream_disconnect_check_interval: float = Field(
+        default=1.0,
+        gt=0,
+        description="Seconds between client disconnect checks for idle SSE streams.",
+    )
     max_sse_clients: int = Field(
         default=100,
         gt=0,

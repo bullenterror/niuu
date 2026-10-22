@@ -39,3 +39,20 @@ limit path, cleanup after a stream closes, changed-summary-only fan-out,
 
 Draft PR [#1162](https://github.com/niuulabs/niuu/pull/1162) targets `regin`
 from `feat/niu-298-sse-stream`.
+
+## Review revision
+
+- Captured the initial `RealmSummary` before registering the SSE subscription,
+  then pass that immutable snapshot to the stream generator. A poll occurring
+  after registration and before the first generator iteration is now delivered
+  once as the subsequent changed event rather than duplicating the initial
+  frame.
+- Added focused lifecycle, adapter-loading, connection-limit/cleanup, idle
+  disconnect, and race-regression coverage. The configured idle disconnect
+  check interval now also flows through `YggdrasilSettings` instead of being a
+  hard-coded runtime timing value.
+
+## Review revision verification
+
+- Passed: `uv run ruff check src/yggdrasil tests/api/test_routes_sse.py tests/sse`
+- Passed: `uv run --extra dev pytest -q --cov=src/yggdrasil --cov-branch --cov-fail-under=85 tests/api/test_routes_sse.py tests/sse` — `12 passed`, `97.58%` coverage.

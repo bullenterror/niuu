@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from unittest.mock import Mock
 
 import pytest
 
-from yggdrasil.connection_manager import ConnectionManager
+from yggdrasil.connection_manager import ConnectionManager, SSEClientLimitExceededError
+from yggdrasil.main import create_app
 from yggdrasil.models import RealmSummary
 from yggdrasil.sse.poller import RealmPoller
+from yggdrasil.stream import stream_realm_summary
 
 
 @dataclass
@@ -60,3 +63,83 @@ async def test_poller_logs_adapter_errors_and_continues(caplog: pytest.LogCaptur
     assert poller.summary_for("thor") == healthy_summary
     broadcast.assert_called_once_with(healthy_summary)
     assert "could not poll realm odin" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_poller_start_is_idempotent_and_stop_cancels_the_task() -> None:
+    summary = RealmSummary(realm_id="odin", health_status="healthy")
+    poller = RealmPoller(
+        [FakeRealmAdapter("odin", summary=summary)],
+        ConnectionManager(max_clients=1),
+        poll_interval=15.0,
+    )
+
+    poller.start()
+    task = poller._task
+    poller.start()
+    await asyncio.sleep(0)
+    await poller.stop()
+    await poller.stop()
+
+    assert task is not None
+    assert poller.summary_for("odin") == summary
+    assert poller._task is None
+
+
+def test_connection_manager_enforces_the_limit_and_removes_empty_realm_sets() -> None:
+    manager = ConnectionManager(max_clients=2)
+    queue = manager.connect("odin")
+    second_queue = manager.connect("odin")
+
+    assert manager.max_clients == 2
+    with pytest.raises(SSEClientLimitExceededError):
+        manager.connect("thor")
+    manager.disconnect("odin", queue)
+    assert manager.active_client_count == 1
+    manager.disconnect("thor", queue)
+    manager.disconnect("odin", second_queue)
+
+    assert manager.active_client_count == 0
+
+
+@pytest.mark.asyncio
+async def test_application_lifespan_starts_and_stops_the_poller() -> None:
+    summary = RealmSummary(realm_id="odin", health_status="healthy")
+    app = create_app(adapters=[FakeRealmAdapter("odin", summary)])
+    health = next(route for route in app.routes if getattr(route, "path", None) == "/health")
+
+    async with app.router.lifespan_context(app):
+        assert app.state.realm_poller.summary_for("odin") == summary
+        assert app.state.realm_poller._task is not None
+        assert await health.endpoint() == {"status": "healthy"}
+
+    assert app.state.realm_poller._task is None
+
+
+@pytest.mark.asyncio
+async def test_stream_checks_for_disconnect_after_an_empty_queue_timeout() -> None:
+    class RequestThatDisconnects:
+        def __init__(self) -> None:
+            self._checks = 0
+
+        async def is_disconnected(self) -> bool:
+            self._checks += 1
+            return self._checks > 1
+
+    manager = ConnectionManager(max_clients=2)
+    queue = manager.connect("odin")
+    summary = RealmSummary(realm_id="odin", health_status="healthy")
+    stream = stream_realm_summary(
+        RequestThatDisconnects(),
+        "odin",
+        manager,
+        summary,
+        queue,
+        disconnect_check_interval=0,
+    )
+
+    await anext(stream)
+    with pytest.raises(StopAsyncIteration):
+        await anext(stream)
+
+    assert manager.active_client_count == 0

@@ -13,6 +13,7 @@ from yggdrasil.stream import stream_realm_summary
 def create_sse_router(
     connection_manager: ConnectionManager,
     poller: RealmPoller,
+    disconnect_check_interval: float,
 ) -> APIRouter:
     """Create the realm summary SSE router."""
     router = APIRouter(prefix="/api/v1/yggdrasil/realms", tags=["Yggdrasil"])
@@ -20,7 +21,8 @@ def create_sse_router(
     @router.get("/{realm_id}/stream", summary="Stream realm health summary")
     async def stream_realm(request: Request, realm_id: str) -> StreamingResponse:
         """Stream an immediate summary and subsequent changed summaries."""
-        if poller.summary_for(realm_id) is None:
+        initial_summary = poller.summary_for(realm_id)
+        if initial_summary is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Realm summary is unavailable",
@@ -34,7 +36,14 @@ def create_sse_router(
             ) from error
 
         return StreamingResponse(
-            stream_realm_summary(request, realm_id, connection_manager, poller, queue),
+            stream_realm_summary(
+                request,
+                realm_id,
+                connection_manager,
+                initial_summary,
+                queue,
+                disconnect_check_interval,
+            ),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",

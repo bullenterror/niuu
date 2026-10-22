@@ -53,7 +53,11 @@ def create_app(
     app = FastAPI(title="Yggdrasil", lifespan=lifespan)
     app.state.connection_manager = connection_manager
     app.state.realm_poller = poller
-    app.state.sse_router = create_sse_router(connection_manager, poller)
+    app.state.sse_router = create_sse_router(
+        connection_manager,
+        poller,
+        resolved_settings.stream_disconnect_check_interval,
+    )
     app.include_router(app.state.sse_router)
 
     @app.get("/health", tags=["Health"])
