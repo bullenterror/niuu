@@ -276,6 +276,24 @@ def test_ting_gateway_admits_its_a2a_card_and_endpoint(method, path, admitted):
     assert any(method in route.methods and route.matches(path) for route in routes) is admitted
 
 
+def test_ting_a2a_endpoint_admits_launch_scoped_tokens():
+    """build_tool sends A2A messages with a ting:workflow:launch scoped token.
+
+    The gateway-scoped-credential policy refuses a scoped token on any route
+    whose required_scope is empty, so the A2A endpoint must carry the launch
+    scope itself rather than fall through to the /api/v1/ting prefix.
+    """
+    docs = render_cedar(chart=CHART.parent / "ting")
+    config = next(
+        yaml.safe_load(d["data"]["authz.yaml"])
+        for d in docs
+        if d["kind"] == "ConfigMap" and "authz.yaml" in d["data"]
+    )
+    routes = AuthorizationGatewayConfig.model_validate(config).routes
+    route = next(r for r in routes if "POST" in r.methods and r.matches("/api/v1/ting/a2a"))
+    assert route.required_scope == "ting:workflow:launch"
+
+
 def test_ting_agent_card_bypasses_jwt_validation():
     """A2A discovery occurs before a caller has a platform credential."""
     envoy = envoy_config(render_cedar(chart=CHART.parent / "ting"))

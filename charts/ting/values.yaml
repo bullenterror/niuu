@@ -468,6 +468,15 @@ envoy:
       methods:
       - POST
       required_scope: ting:workflow:launch
+    # A2A JSON-RPC (SendMessage, GetTask, CancelTask). A resident's build_tool
+    # launches workflows here with a scoped valkyrie_build token; without a
+    # required_scope the gateway-scoped-credential policy refuses every scoped
+    # token on the /api/v1/ting prefix below. Must precede that prefix: the
+    # first matching route wins.
+    - path: /api/v1/ting/a2a
+      methods:
+      - POST
+      required_scope: ting:workflow:launch
     # Ting's A2A Agent Card at the origin root (a2a-card-api). Without this
     # entry the gateway denies it, and no A2A client can discover Ting.
     - path: /.well-known/agent-card.json
