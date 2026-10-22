@@ -123,3 +123,27 @@ paths.
 
 - Passed: `uv run --extra otel ruff check src/ravn/agent.py src/ravn/adapters/executors/cli.py src/ravn/domain/harness_telemetry.py src/ravn/harness_telemetry.py tests/test_ravn/test_harness_telemetry.py`.
 - Passed: `uv run --extra otel pytest -q tests/test_ravn/test_harness_telemetry.py tests/test_ravn/test_executor_cli.py tests/test_ravn/test_agent.py::TestRavnAgentSimpleTurn tests/test_ravn/test_prompt_budget.py` — 70 passed.
+
+## Review revision: provider-only timing and terminal taxonomy
+
+`CliTransportAgent` now derives `provider_duration_ms` by subtracting the
+already-observed remote tool wall time from the full `CliTurnRunner` duration.
+The separate `tool_wall_time_ms` remains unchanged, and the prior unavailable
+provider/tool-breakdown marker is removed because the canonical provider field
+is normalized to exclude completed tool work.
+
+`HarnessStepTelemetryRecord` now carries `llm_error_category`. Native and CLI
+terminal paths classify exceptions without recording their messages: timeout
+exception types map to `timeout`, cancellations to `aborted`, and other
+provider failures to `provider_error`. CLI terminal provider failures use
+`stop_reason=provider_error`; when the transport supplied partial usage, that
+usage is retained rather than fabricated or discarded.
+
+### Verification
+
+- Passed: `uv run --extra otel pytest -q tests/test_ravn/test_harness_telemetry.py tests/test_ravn/test_executor_cli.py tests/test_ravn/test_agent.py::TestRavnAgentSimpleTurn tests/test_ravn/test_prompt_budget.py` — 71 passed.
+- Passed: `uv run --extra otel ruff check src/ravn/agent.py src/ravn/adapters/executors/cli.py src/ravn/domain/harness_telemetry.py tests/test_ravn/test_harness_telemetry.py tests/test_ravn/test_executor_cli.py`.
+- The deterministic CLI regression models five seconds of tool work followed by two seconds of provider time and asserts `provider_duration_ms == 2000` while tool wall time remains `5000`.
+
+No hosted PR is created: the required delivery and target branch are both
+`regin`, so this review revision is delivered directly to that branch.

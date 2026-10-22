@@ -53,3 +53,11 @@ NIU-1132. The existing full `CliTurnRunner` duration remains the available
 CLI value in `provider_duration_ms`, and
 `timing.provider_vs_tool_breakdown` explicitly states that a provider-only
 split is unavailable. Native records continue to report provider-only timing.
+
+## Review revision: provider-only timing and terminal taxonomy (2026-10-22)
+
+Review feedback was addressed on `regin`. CLI-backed step records now subtract
+observed remote-tool wall time from the complete CLI turn before reporting
+`provider_duration_ms`. Terminal records add a content-safe
+`llm_error_category`; native provider failures retain `stop_reason=error` and
+CLI provider failures use `stop_reason=provider_error`.
