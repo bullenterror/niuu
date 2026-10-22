@@ -33,3 +33,14 @@ A terminal native or CLI-backed record now preserves its measured TTFT if text
 was streamed before the provider/transport failed or was cancelled. The TTFT
 field is marked unavailable only when no text token was observed, preventing a
 numeric telemetry value from contradicting its availability metadata.
+
+## Review revision: CLI timing boundary (2026-10-22)
+
+The CLI transport is intentionally unchanged. Its available measurement is the
+complete `CliTurnRunner` turn, not a provider-only boundary; the canonical
+`provider_duration_ms` field records that observed full-turn duration and
+`timing.provider_vs_tool_breakdown` is explicitly unavailable with reason
+`cli_transport_exposes_only_full_turn_duration`. Native records continue to
+report their provider-only duration. Failure and cancellation paths continue to
+emit terminal records through the existing `ravn.harness.step` observability
+event before propagating the existing error classification.

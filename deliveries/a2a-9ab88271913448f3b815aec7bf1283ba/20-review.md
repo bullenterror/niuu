@@ -40,3 +40,11 @@ text retain explicit unavailable metadata.
 ## Recommendation
 
 Approve NIU-1132 for merge/delivery on the required `regin` branch.
+
+## Revision submitted for gate re-check (2026-10-22)
+
+The CLI-backed record now retains the existing full `CliTurnRunner` duration in
+`provider_duration_ms` and marks only the unavailable provider-versus-tool
+breakdown. This leaves the shared CLI transport contract unchanged. Terminal
+error and cancellation records remain emitted through `ravn.harness.step` with
+the existing error classification. Re-review is requested.

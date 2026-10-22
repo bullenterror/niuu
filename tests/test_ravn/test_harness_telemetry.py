@@ -154,9 +154,9 @@ async def test_native_and_cli_emit_one_canonical_step_schema(
     assert cli_record["harness_type"] == "cli-backed"
     assert native_record["context_section_estimates"] is not None
     assert cli_record["context_section_estimates"] is None
-    assert cli_record["provider_duration_ms"] is None
-    assert cli_record["unavailable"]["timing.provider_duration_ms"] == (
-        "cli_transport_does_not_expose_provider_boundary"
+    assert cli_record["provider_duration_ms"] is not None
+    assert cli_record["unavailable"]["timing.provider_vs_tool_breakdown"] == (
+        "cli_transport_exposes_only_full_turn_duration"
     )
     assert native_record["unavailable"]["timing.ttft_ms"] == "no_streamed_text_token"
     assert cli_record["unavailable"]["timing.ttft_ms"] == "no_streamed_text_token"
@@ -323,6 +323,11 @@ class _AbortedCliTransport(_TerminalCliTransport):
     terminal_error = asyncio.CancelledError()
 
 
+class _StartFailingCliTransport(_TerminalCliTransport):
+    async def start(self) -> None:
+        raise RuntimeError("CLI transport failed to start")
+
+
 class _FailingAfterTextCliTransport(_TerminalCliTransport):
     async def send_message(self, _content: str) -> None:
         await self._emit(
@@ -392,9 +397,9 @@ async def test_native_and_cli_emit_terminal_records_for_provider_failures(
     }
     assert cli_record["harness_type"] == "cli-backed"
     assert cli_record["stop_reason"] == "error"
-    assert cli_record["provider_duration_ms"] is None
-    assert cli_record["unavailable"]["timing.provider_duration_ms"] == (
-        "cli_transport_does_not_expose_provider_boundary"
+    assert cli_record["provider_duration_ms"] is not None
+    assert cli_record["unavailable"]["timing.provider_vs_tool_breakdown"] == (
+        "cli_transport_exposes_only_full_turn_duration"
     )
     assert cli_record["unavailable"]["usage"] == "provider_call_did_not_complete"
     assert "sensitive details" not in str(native_record)
@@ -425,6 +430,31 @@ async def test_native_and_cli_emit_terminal_records_for_aborted_provider_calls(
         assert record["ttft_ms"] is None
         assert record["unavailable"]["usage"] == "provider_call_did_not_complete"
         assert record["unavailable"]["timing.ttft_ms"] == "provider_call_terminated_before_text"
+    assert records[1]["provider_duration_ms"] is not None
+    assert records[1]["unavailable"]["timing.provider_vs_tool_breakdown"] == (
+        "cli_transport_exposes_only_full_turn_duration"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cli_start_failure_emits_terminal_record_with_explicit_missing_duration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    telemetry = _RecordingTelemetry()
+    monkeypatch.setattr("ravn.adapters.executors.cli.get_observability", lambda: telemetry)
+    monkeypatch.setattr("ravn.harness_telemetry.get_observability", lambda: telemetry)
+
+    with pytest.raises(RuntimeError, match="failed to start"):
+        await _build_cli_agent(
+            "tests.test_ravn.test_harness_telemetry._StartFailingCliTransport"
+        ).run_turn("test")
+
+    [record] = _harness_records(telemetry)
+    assert record["stop_reason"] == "error"
+    assert record["provider_duration_ms"] is None
+    assert record["unavailable"]["timing.provider_duration_ms"] == (
+        "cli_transport_turn_duration_not_observed"
+    )
 
 
 @pytest.mark.asyncio

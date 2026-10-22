@@ -248,6 +248,7 @@ class CliTransportAgent(ExecutionAgentPort):
         self._turn_tool_wall_time_ms = 0.0
         self._turn_ttft_ms: float | None = None
         self._turn_started_at: float | None = None
+        self._turn_duration_ms: float | None = None
         self._turn_context_message_count = 0
         self._turn_result_payload: dict[str, Any] = {}
 
@@ -449,7 +450,10 @@ class CliTransportAgent(ExecutionAgentPort):
 
         prompt = self._build_prompt(user_input)
         self._turn_started_at = monotonic()
-        response_text = await self._turn_runner.run_prompt(prompt, request_id=correlation_id)
+        try:
+            response_text = await self._turn_runner.run_prompt(prompt, request_id=correlation_id)
+        finally:
+            self._turn_duration_ms = (monotonic() - self._turn_started_at) * 1_000
 
         result_payload = self._transport.last_result or {}
         self._turn_result_payload = result_payload
@@ -497,10 +501,14 @@ class CliTransportAgent(ExecutionAgentPort):
             "compaction.applied": "cli_transport_does_not_expose_compaction",
             "compaction.passes": "cli_transport_does_not_expose_compaction",
             "compaction.messages_removed": "cli_transport_does_not_expose_compaction",
-            "timing.provider_duration_ms": "cli_transport_does_not_expose_provider_boundary",
+            "timing.provider_vs_tool_breakdown": (
+                "cli_transport_exposes_only_full_turn_duration"
+            ),
         }
         if self._turn_ttft_ms is None:
             unavailable["timing.ttft_ms"] = "no_streamed_text_token"
+        if self._turn_duration_ms is None:
+            unavailable["timing.provider_duration_ms"] = "cli_transport_turn_duration_not_observed"
         if not usage_available:
             unavailable["usage"] = "cli_transport_did_not_report_model_usage"
         if stop_reason is None:
@@ -522,7 +530,10 @@ class CliTransportAgent(ExecutionAgentPort):
             compaction_applied=None,
             compaction_passes=None,
             compaction_messages_removed=None,
-            provider_duration_ms=None,
+            # CliTurnRunner reports only the complete external turn.  It can
+            # include remote tool work, so the unavailable map records that it
+            # is not a provider-only measurement.
+            provider_duration_ms=self._turn_duration_ms,
             ttft_ms=self._turn_ttft_ms,
             tool_wall_time_ms=self._turn_tool_wall_time_ms,
             tool_call_count=len(result.tool_calls),
@@ -542,12 +553,16 @@ class CliTransportAgent(ExecutionAgentPort):
             "compaction.applied": "cli_transport_does_not_expose_compaction",
             "compaction.passes": "cli_transport_does_not_expose_compaction",
             "compaction.messages_removed": "cli_transport_does_not_expose_compaction",
-            "timing.provider_duration_ms": "cli_transport_does_not_expose_provider_boundary",
+            "timing.provider_vs_tool_breakdown": (
+                "cli_transport_exposes_only_full_turn_duration"
+            ),
             "timing.tool_wall_time_ms": "provider_call_terminated_before_tool_completion",
             "usage": "provider_call_did_not_complete",
         }
         if self._turn_ttft_ms is None:
             unavailable["timing.ttft_ms"] = "provider_call_terminated_before_text"
+        if self._turn_duration_ms is None:
+            unavailable["timing.provider_duration_ms"] = "cli_transport_turn_duration_not_observed"
         record = HarnessStepTelemetryRecord(
             step_id=f"{self._session.id}:{self._session.turn_count}:0",
             session_id=str(self._session.id),
@@ -565,7 +580,7 @@ class CliTransportAgent(ExecutionAgentPort):
             compaction_applied=None,
             compaction_passes=None,
             compaction_messages_removed=None,
-            provider_duration_ms=None,
+            provider_duration_ms=self._turn_duration_ms,
             ttft_ms=self._turn_ttft_ms,
             tool_wall_time_ms=None,
             tool_call_count=len(self._turn_tool_calls),
@@ -586,6 +601,7 @@ class CliTransportAgent(ExecutionAgentPort):
         self._turn_tool_wall_time_ms = 0.0
         self._turn_ttft_ms = None
         self._turn_started_at = None
+        self._turn_duration_ms = None
         self._turn_context_message_count = 0
         self._turn_result_payload = {}
 

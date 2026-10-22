@@ -85,3 +85,25 @@ raise.
 - Passed: `uv run --extra otel ruff check src/ravn/agent.py src/ravn/adapters/executors/cli.py tests/test_ravn/test_harness_telemetry.py`.
 - Passed: `uv run --extra otel pytest -q tests/test_ravn/test_harness_telemetry.py tests/test_ravn/test_executor_cli.py tests/test_ravn/test_agent.py::TestRavnAgentSimpleTurn tests/test_ravn/test_prompt_budget.py` — 69 passed.
 - No hosted PR is created: the required delivery branch and merge target are both `regin`, so this is a direct-to-branch delivery.
+
+## Review revision: CLI provider timing boundary
+
+No shared CLI transport contract or schema was changed. `CliTransportAgent`
+measures the existing `CliTurnRunner.run_prompt` operation and places that
+complete external-turn duration in `provider_duration_ms`, which is the timing
+the current transport path actually exposes. Because that duration can include
+remote tool execution, the record explicitly adds
+`timing.provider_vs_tool_breakdown=cli_transport_exposes_only_full_turn_duration`
+to `unavailable`; it does not claim a fabricated provider-only split. Native
+runtime records retain their provider-only measurement.
+
+Terminal CLI exceptions and cancellations use the same measured complete-turn
+duration when available and emit one existing `ravn.harness.step` event before
+the original error propagates. The regression covers successful, failed, and
+aborted fake CLI transports.
+
+### Revision verification
+
+- Passed: `uv run --extra otel ruff check src/ravn/adapters/executors/cli.py tests/test_ravn/test_harness_telemetry.py`.
+- Passed: `uv run --extra otel pytest -q tests/test_ravn/test_harness_telemetry.py tests/test_ravn/test_executor_cli.py tests/test_ravn/test_agent.py::TestRavnAgentSimpleTurn tests/test_ravn/test_prompt_budget.py` — 69 passed.
+- No hosted PR is created: the delivery and target branch are both `regin`, so this is a direct-to-branch review revision.
