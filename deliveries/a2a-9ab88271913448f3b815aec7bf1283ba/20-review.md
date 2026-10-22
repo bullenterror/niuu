@@ -118,3 +118,48 @@ The operator resolved the two findings for the in-scope NIU-1132 revision:
 This supersedes the blocking recommendation above for the operator-approved
 scope. Gate re-review is requested after the focused verification recorded in
 `10-implementation.md`.
+
+## Gate re-check: provider timing and terminal taxonomy (2026-10-22)
+
+### Verdict
+
+**pass**
+
+### Prior review follow-up verification
+
+This re-check verifies the two concrete findings from the prior gate review on
+the live `regin` branch at `eba1d1cf`:
+
+- CLI records now retain the complete observed turn duration separately and
+  export `provider_duration_ms` as the duration minus observed completed tool
+  wall time (`src/ravn/adapters/executors/cli.py:466-470,544,613-617`). The
+  regression simulates five seconds of tool time followed by two seconds of
+  provider time and asserts a 2,000 ms provider duration
+  (`tests/test_ravn/test_harness_telemetry.py:223-239`).
+- Native provider failures emit `stop_reason="error"` with a safe error
+  category, while CLI provider failures emit `stop_reason="provider_error"`
+  and the same taxonomy. Both cancellation paths preserve `aborted`
+  (`src/ravn/agent.py:590-601`,
+  `src/ravn/adapters/executors/cli.py:363-388,557-611`,
+  `tests/test_ravn/test_harness_telemetry.py:438-519`).
+
+### Findings
+
+No blocking findings.
+
+### Verification notes
+
+- Reviewed the committed repository-root diff
+  `git diff a7e39a0974d400187c6d39f723dcc9afd3dce9d0..eba1d1cf` and
+  `git diff --check a7e39a0974d400187c6d39f723dcc9afd3dce9d0..eba1d1cf`.
+- Passed: `uv run --extra otel ruff check src/ravn/agent.py
+  src/ravn/adapters/executors/cli.py src/ravn/domain/harness_telemetry.py
+  tests/test_ravn/test_harness_telemetry.py`.
+- Passed: `uv run --extra otel pytest -q
+  tests/test_ravn/test_harness_telemetry.py tests/test_ravn/test_executor_cli.py
+  tests/test_ravn/test_agent.py::TestRavnAgentSimpleTurn
+  tests/test_ravn/test_prompt_budget.py` — 71 passed.
+
+### Recommendation
+
+Approve NIU-1132 on `regin`.
