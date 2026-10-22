@@ -68,6 +68,10 @@ PR [#1162](https://github.com/niuulabs/niuu/pull/1162) merged
 - Added a regression test that starts the recurring poller after an initial
   poll and verifies that no second adapter call occurs before the interval.
 
+## Cadence follow-up delivery
+
+- Merged into `regin` through PR [#1163](https://github.com/niuulabs/niuu/pull/1163) (merge commit `525f7b43`).
+
 ## Cadence follow-up verification
 
 - Passed: `uv run ruff check src/yggdrasil tests/api/test_routes_sse.py tests/sse`

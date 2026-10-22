@@ -4,9 +4,9 @@
 - Required base and target: `regin`
 - Working branch: `feat/niu-298-sse-stream`, cut from `regin`
 - Tracker issue: [NIU-298](https://linear.app/niuu/issue/NIU-298/sse-endpoint-and-background-polling-loop)
-- Tracker status: `In Progress`
-- Delivery status: cadence follow-up on `fix/niu-298-poller-cadence`, branched
-  from `regin`.
+- Tracker status: `Done`
+- Delivery status: cadence follow-up merged through PR [#1163](https://github.com/niuulabs/niuu/pull/1163)
+  into `regin` (merge commit `525f7b43`).
 
 ## Scope
 
