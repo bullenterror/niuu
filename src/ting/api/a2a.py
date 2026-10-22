@@ -68,6 +68,11 @@ from ting.api.research import (
     _initial_stage_state,
     resolve_workflow_campaign_repo,
 )
+from ting.api.workflow_execution_launch import (
+    durable_parent_node_id,
+    new_parent_execution,
+    parent_launch_body,
+)
 from ting.api.workflows import (
     WorkflowLaunchBody,
     WorkflowLaunchExecution,
@@ -86,7 +91,11 @@ from ting.domain.services.workflow_campaign_lifecycle import (
     terminal_session_cleanup_needed,
 )
 from ting.domain.workflow_document import workflow_document_revision
-from ting.domain.workflow_execution import WorkflowExecutionError
+from ting.domain.workflow_execution import (
+    ExecutionConflictError,
+    WorkflowExecution,
+    WorkflowExecutionError,
+)
 from ting.domain.workflow_snapshot import (
     build_workflow_snapshot,
     workflow_artifact_paths_from_snapshot,
@@ -96,6 +105,7 @@ from ting.ports.a2a_launch import A2ALaunchReservationRepository
 from ting.ports.a2a_push import A2APushDispatcherPort
 from ting.ports.volundr import VolundrFactory
 from ting.ports.workflow_campaign_repository import WorkflowCampaignRepository
+from ting.ports.workflow_execution import WorkflowExecutionRepository
 from ting.ports.workflow_repository import WorkflowRepository
 
 logger = logging.getLogger(__name__)
@@ -395,32 +405,55 @@ class WorkflowTaskHandler(RequestHandler):
         ) as span:
             execution_context = await self._workflow_execution_context(metadata, reservation)
             inherited_result_schema = execution_context.pop("result_schema", {})
-            launch = WorkflowLaunchBody(
+            parent_execution = await self._reserve_durable_parent_execution(
+                workflow=workflow,
+                workflow_snapshot=pending.workflow_snapshot,
+                reservation=reservation,
                 prompt=prompt,
-                sessionName=f"a2a-{reservation.id.hex}",
-                repo=str(metadata.get("repo") or ""),
-                branch=str(metadata.get("branch") or ""),
-                model=str(metadata.get("model") or ""),
-                # The already-resolved (and, on a retry, already-persisted)
-                # connection — never re-derived from raw request metadata —
-                # so a retry lands on the exact target the first attempt did.
-                connectionId=resolved_connection_id,
-                inheritedResultSchema=(
-                    dict(inherited_result_schema)
-                    if isinstance(inherited_result_schema, dict)
-                    else {}
-                ),
-                provenance={
-                    "surface": A2A_SURFACE,
-                    "a2a_message_id": message.message_id,
-                    **({"workflow_execution": execution_context} if execution_context else {}),
-                    **(
-                        {"trace_context": outbound_trace_context}
-                        if (outbound_trace_context := telemetry.inject() or trace_context)
+                metadata=metadata,
+            )
+            if parent_execution is not None:
+                launch = parent_launch_body(
+                    parent_execution,
+                    request=self._request,
+                    prompt=prompt,
+                    session_name=f"a2a-{reservation.id.hex}",
+                    repo=str(metadata.get("repo") or ""),
+                    branch=str(metadata.get("branch") or ""),
+                    model=str(metadata.get("model") or ""),
+                    connection_id=resolved_connection_id,
+                    workflow_version=workflow.version,
+                )
+                outbound_trace_context = telemetry.inject() or trace_context
+                if outbound_trace_context:
+                    launch.provenance["trace_context"] = outbound_trace_context
+            else:
+                launch = WorkflowLaunchBody(
+                    prompt=prompt,
+                    sessionName=f"a2a-{reservation.id.hex}",
+                    repo=str(metadata.get("repo") or ""),
+                    branch=str(metadata.get("branch") or ""),
+                    model=str(metadata.get("model") or ""),
+                    # The already-resolved (and, on a retry, already-persisted)
+                    # connection — never re-derived from raw request metadata —
+                    # so a retry lands on the exact target the first attempt did.
+                    connectionId=resolved_connection_id,
+                    inheritedResultSchema=(
+                        dict(inherited_result_schema)
+                        if isinstance(inherited_result_schema, dict)
                         else {}
                     ),
-                },
-            )
+                    provenance={
+                        "surface": A2A_SURFACE,
+                        "a2a_message_id": message.message_id,
+                        **({"workflow_execution": execution_context} if execution_context else {}),
+                        **(
+                            {"trace_context": outbound_trace_context}
+                            if (outbound_trace_context := telemetry.inject() or trace_context)
+                            else {}
+                        ),
+                    },
+                )
             try:
                 # Recovery must look at the same connection the launch will
                 # use — a session a placed (or otherwise resolved) launch
@@ -462,7 +495,14 @@ class WorkflowTaskHandler(RequestHandler):
                         principal=self._principal,
                         bearer_token=self._downstream_auth_token(),
                         pinned_workflow_snapshot=pending.workflow_snapshot,
-                        trusted_workflow_execution=bool(execution_context),
+                        trusted_workflow_execution=bool(execution_context or parent_execution),
+                    )
+                if parent_execution is not None:
+                    execution_repo = self._workflow_execution_repo()
+                    await execution_repo.attach_parent_session(
+                        parent_execution.id,
+                        session_id=execution.session.id,
+                        connection_id=execution.connection_id or "",
                     )
             except Exception as exc:
                 telemetry.mark_error(span, type(exc).__name__, str(exc))
@@ -513,6 +553,11 @@ class WorkflowTaskHandler(RequestHandler):
                 # artifact is the branch the session pushes, not a Mimir page.
                 **({"repo": launch.repo} if launch.repo else {}),
                 **({"branch": launch.branch} if launch.branch else {}),
+                **(
+                    {"workflow_execution_id": str(parent_execution.id)}
+                    if parent_execution is not None
+                    else {}
+                ),
             },
             created_at=now,
             updated_at=now,
@@ -543,6 +588,60 @@ class WorkflowTaskHandler(RequestHandler):
         await _emit_campaign_event(self._request, "workflow.campaign.created", saved)
         await self._queue_push(saved)
         return campaign_to_task(saved)
+
+    async def _reserve_durable_parent_execution(
+        self,
+        *,
+        workflow: Any,
+        workflow_snapshot: dict[str, Any],
+        reservation: A2ALaunchReservation,
+        prompt: str,
+        metadata: dict[str, Any],
+    ) -> WorkflowExecution | None:
+        """Reserve the parent execution required by a fan-out A2A skill.
+
+        The A2A task surface launches the same workflow documents as the
+        research API. A coordinator with ``workflow_execution_*`` tools must
+        therefore receive the owner-bound runtime context that only a durable
+        parent execution can mint.
+        """
+        parent_node_id = durable_parent_node_id(workflow, workflow_snapshot)
+        if parent_node_id is None:
+            return None
+        execution_repo = self._workflow_execution_repo()
+        parent = new_parent_execution(
+            request=self._request,
+            principal=self._principal,
+            workflow=workflow,
+            execution_id=uuid4(),
+            parent_node_id=parent_node_id,
+            prompt=prompt,
+            name=_optional_str(metadata, "sessionName") or workflow.name,
+            launch_key=f"{A2A_SURFACE}:{reservation.campaign_id}",
+            launch_request={
+                "message_id": reservation.message_id,
+                "prompt": prompt,
+                "metadata": metadata,
+            },
+            workflow_snapshot=workflow_snapshot,
+        )
+        try:
+            reserved, _ = await execution_repo.reserve_parent_launch(parent)
+        except ExecutionConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return reserved
+
+    def _workflow_execution_repo(self) -> WorkflowExecutionRepository:
+        repository = getattr(self._request.app.state, "workflow_execution_repo", None)
+        if repository is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    "This workflow fans out through durable workflow executions, "
+                    "which are not enabled here (Ting workflow_execution.enabled)"
+                ),
+            )
+        return repository
 
     async def on_get_task(
         self,
