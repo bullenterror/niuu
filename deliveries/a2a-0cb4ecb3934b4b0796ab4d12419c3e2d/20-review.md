@@ -2,36 +2,39 @@
 
 ## Verdict
 
-**needs_changes**
+**pass**
 
-## Finding
+## Re-check
 
-### Major — A2A parent launch drops distributed trace propagation
+The prior request is satisfied. The parent A2A launch now merges the active
+W3C trace carrier into the trusted durable-launch provenance without replacing
+the owner-bound `workflow_execution` provenance. The Research Campaign A2A
+regression test supplies `traceContext` and verifies the spawned workload
+carries it alongside the durable execution context.
 
-`src/ting/api/a2a.py:416-426` replaces the ordinary A2A launch body with
-`parent_launch_body()` for fan-out workflows. Unlike the ordinary branch at
-`src/ting/api/a2a.py:443-451`, that parent body has no
-`provenance.trace_context`. Thus a `traceparent` supplied on an A2A
-Research Campaign request is not propagated into the spawned Ravn session.
-This regresses the required W3C context continuity across A2A tasks precisely
-for the workflow this patch changes, and makes its fan-out launch untraceable
-as part of the caller's request.
+No new blocking findings were identified in PR [#1165](https://github.com/niuulabs/niuu/pull/1165), which targets `regin`.
 
-**Fix:** Merge `telemetry.inject() or trace_context` into the trusted parent
-launch provenance (without replacing its `workflow_execution` provenance), and
-extend `test_fan_out_skill_binds_durable_execution_context` to assert that the
-spawned workload carries the propagated `trace_context`.
+## Findings
+
+None.
 
 ## Verification
 
-- Reviewed committed `origin/regin..HEAD` on
-  `fix/niu-1138-a2a-workflow-context` (`b385ec40`).
-- Confirmed PR #1165 is open with base `regin` and the expected feature head.
+- Reviewed the complete PR #1165 change (`c738b643..ffc84f77`) on
+  `fix/niu-1138-a2a-workflow-context`; the canonical PR base is `regin`.
+- Verified the exact prior follow-up in `src/ting/api/a2a.py`: the fan-out
+  parent body preserves `telemetry.inject() or trace_context`; the regression
+  assertion is present in `tests/test_ting/test_a2a_tasks.py`.
 - `uv run ruff check src/ting/api/a2a.py tests/test_ting/test_a2a_tasks.py` — passed.
 - `uv run --extra dev --extra otel pytest -q tests/test_ting/test_a2a_tasks.py` — 64 passed.
 - Focused durable-workflow suite — 11 passed.
+- `git diff --check c738b643..HEAD` — passed.
+
+The live external Yggdrasil/Forge connection is unavailable in this workspace,
+so the remote framed-research acceptance run could not be repeated. The
+focused A2A launch contract test verifies the setup path reaches
+`TASK_STATE_SUBMITTED` with the owner-bound context and trace carrier.
 
 ## Recommendation
 
-Do not merge until the parent A2A launch preserves its W3C trace context and a
-regression assertion covers that path.
+Approve PR #1165 for merge into `regin` once required CI completes successfully.
