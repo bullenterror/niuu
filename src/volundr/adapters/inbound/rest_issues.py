@@ -299,6 +299,13 @@ def _build_issues_router(
                 if issue is None:
                     continue
                 updated = await adapter.update_issue_status(issue_id, data.status)
+            except TrackerRequestError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        f"Issue tracker connection {conn.id} cannot update issue {issue_id}: {exc}"
+                    ),
+                ) from exc
             except Exception as exc:
                 raise _tracker_failure(conn.id, f"update issue {issue_id}", exc) from exc
             return updated

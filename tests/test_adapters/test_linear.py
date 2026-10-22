@@ -366,7 +366,7 @@ class TestUpdateIssueStatus:
             ),
         ]
 
-        with pytest.raises(LinearAPIError, match="Status 'Invalid' not found"):
+        with pytest.raises(TrackerRequestError, match="Status 'Invalid' not found"):
             await adapter.update_issue_status("issue-1", "Invalid")
 
 

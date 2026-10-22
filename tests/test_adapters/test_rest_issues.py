@@ -354,6 +354,33 @@ class TestUpdateIssueStatus:
             "RuntimeError: Status 'Shipped' not found"
         )
 
+    def test_unknown_status_is_a_400_naming_the_valid_statuses(self):
+        """A misspelled status is the caller's to fix, not a tracker outage."""
+        from tracker.ports import TrackerRequestError
+
+        app, integration_repo, tracker_factory = _make_app()
+        integration_repo.list_connections.return_value = [_make_connection()]
+
+        mock_adapter = AsyncMock()
+        mock_adapter.get_issue.return_value = _make_issue(issue_id="issue-1")
+        mock_adapter.update_issue_status.side_effect = TrackerRequestError(
+            "Status 'Cancelled' not found. Available: Todo, Done, Canceled"
+        )
+        tracker_factory.create.return_value = mock_adapter
+        client = TestClient(app)
+
+        resp = client.patch(
+            f"{PREFIX}/issues/issue-1",
+            json={"status": "Cancelled"},
+            headers=AUTH,
+        )
+
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == (
+            "Issue tracker connection conn-1 cannot update issue issue-1: "
+            "Status 'Cancelled' not found. Available: Todo, Done, Canceled"
+        )
+
     def test_update_skips_disabled_foreign_and_unmatched_connections(self):
         app, integration_repo, tracker_factory = _make_app()
         integration_repo.list_connections.return_value = [

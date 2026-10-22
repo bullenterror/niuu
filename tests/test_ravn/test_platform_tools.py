@@ -602,6 +602,23 @@ class TestTrackerIssueTool:
         assert data["status"] == "Done"
 
     @pytest.mark.asyncio
+    @respx.mock
+    async def test_update_status_failure_carries_the_server_detail(self):
+        """A resident must see why a write failed, not just the status code."""
+        detail = (
+            "Issue tracker connection conn-1 cannot update issue NIU-1: "
+            "Status 'Cancelled' not found. Available: Todo, Done, Canceled"
+        )
+        respx.patch(f"{TRACKER_ISSUES_URL}/NIU-1").mock(
+            return_value=httpx.Response(400, json={"detail": detail})
+        )
+        result = await self.tool.execute(
+            {"action": "update_status", "issue_id": "NIU-1", "status": "Cancelled"}
+        )
+        assert result.is_error
+        assert "Available: Todo, Done, Canceled" in result.content
+
+    @pytest.mark.asyncio
     async def test_update_status_missing_fields(self):
         result = await self.tool.execute({"action": "update_status", "status": "Done"})
         assert result.is_error

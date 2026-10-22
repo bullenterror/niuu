@@ -261,7 +261,7 @@ class JiraAdapter(IssueTrackerProvider):
 
         if target is None:
             available = [t.get("name", "") for t in transitions]
-            raise JiraAPIError(
+            raise TrackerRequestError(
                 f"Transition '{status}' not available. Available: {', '.join(available)}"
             )
 

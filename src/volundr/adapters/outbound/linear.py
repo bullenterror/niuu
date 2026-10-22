@@ -346,7 +346,9 @@ class LinearAdapter(IssueTrackerProvider):
 
         if target_state is None:
             available = [s["name"] for s in states]
-            raise GraphQLError(f"Status '{status}' not found. Available: {', '.join(available)}")
+            raise TrackerRequestError(
+                f"Status '{status}' not found. Available: {', '.join(available)}"
+            )
 
         # Update the issue
         data = await self._gql.query(
