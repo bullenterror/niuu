@@ -32,4 +32,4 @@ this greenfield implementation on a feature branch targeting `regin` only.
 ## Review revision
 
 - Reviewer feedback from `20-review.md` was addressed in commit `2c997d2b` on
-  `feat/niu-298-sse-stream`; the existing draft PR remains targeted at `regin`.
+  `feat/niu-298-sse-stream`; the existing PR remains targeted at `regin`.
