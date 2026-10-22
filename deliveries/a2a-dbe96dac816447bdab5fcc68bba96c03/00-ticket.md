@@ -5,6 +5,8 @@
 - Working branch: `feat/niu-298-sse-stream`, cut from `regin`
 - Tracker issue: [NIU-298](https://linear.app/niuu/issue/NIU-298/sse-endpoint-and-background-polling-loop)
 - Tracker status: `In Progress`
+- Review revision: resolving the snapshot race and coverage findings from
+  `20-review.md` before requesting re-review.
 
 ## Scope
 
@@ -26,3 +28,8 @@ own NIU-298's declared Yggdrasil endpoint.
 
 The operator explicitly confirmed `src/yggdrasil/` is absent and authorized
 this greenfield implementation on a feature branch targeting `regin` only.
+
+## Review revision
+
+- Reviewer feedback from `20-review.md` was addressed in commit `2c997d2b` on
+  `feat/niu-298-sse-stream`; the existing draft PR remains targeted at `regin`.
