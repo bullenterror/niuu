@@ -3,7 +3,7 @@
 - **Tracker identifier:** `NIU-1132`
 - **Merged branch:** `regin`
 - **Target branch:** `regin`
-- **Merge commit SHA:** `eba1d1cfe1ac3e0e96a5f831ed760a5f5a66a4bc` (direct-to-target delivery; no separate PR merge commit)
+- **Merge commit SHA:** `eba1d1cf0e632b9841a17e90a96a8f0c3a1938e1` (direct-to-target delivery; no separate PR merge commit)
 - **Final tracker status:** `Done`
 
 ## Landed
