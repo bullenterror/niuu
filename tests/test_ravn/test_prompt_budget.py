@@ -379,3 +379,68 @@ class TestBudgetDerivedToolResultCap:
         shared = agent._budget_tool_result_char_limit()
 
         assert shared == pytest.approx(alone / 4, rel=0.02)
+
+
+def make_parallel_tools_then_text_llm(tool_name: str, count: int) -> LLMPort:
+    """LLM that makes *count* parallel calls to *tool_name*, then finishes."""
+    calls = {"count": 0}
+
+    async def _stream(*args, **kwargs) -> AsyncIterator[StreamEvent]:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            for index in range(count):
+                yield StreamEvent(
+                    type=StreamEventType.TOOL_CALL,
+                    tool_call=ToolCall(id=f"tc{index}", name=tool_name, input={}),
+                )
+        else:
+            yield StreamEvent(type=StreamEventType.TEXT_DELTA, text="done")
+        yield StreamEvent(
+            type=StreamEventType.MESSAGE_DONE,
+            usage=TokenUsage(input_tokens=10, output_tokens=5),
+        )
+
+    llm = AsyncMock(spec=LLMPort)
+    llm.stream = _stream
+    return llm
+
+
+class TestParallelToolResultsShareTheSlot:
+    """Parallel results share one protected message, so they share its allowance.
+
+    Regin made three and four parallel calls per step; each result was capped
+    alone, together they filled the protected tail past the 64k ceiling, and the
+    turn died at 77179 estimated tokens with compaction unable to help.
+    """
+
+    @staticmethod
+    def _agent_with(count: int, *, result_size: int) -> RavnAgent:
+        fixed_cost_chars = 14_600 * _CHARS_PER_TOKEN // 3 * 2
+        agent = _agent(
+            make_parallel_tools_then_text_llm("giant_result", count),
+            tools=[GiantResultTool(size=result_size)],
+            max_tool_result_chars=100_000,
+            max_prompt_tokens=48_000,
+            token_estimate_safety_factor=1.5,
+            system_prompt="R" * fixed_cost_chars,
+        )
+        agent._compressor = _PassthroughCompressor(protect_last=2)
+        return agent
+
+    async def test_four_parallel_giant_results_fit_the_budget(self) -> None:
+        agent = self._agent_with(4, result_size=150_000)
+
+        result = await agent.run_turn("go")
+
+        assert result.response == "done"
+        assert agent.prompt_budget_status["estimated_prompt_tokens"] <= 48_000
+
+    async def test_each_parallel_result_gets_a_share_of_the_slot(self) -> None:
+        single = self._agent_with(1, result_size=150_000)
+        alone = len((await single.run_turn("go")).tool_results[0].content)
+
+        quad = self._agent_with(4, result_size=150_000)
+        shares = [len(r.content) for r in (await quad.run_turn("go")).tool_results]
+
+        assert len(shares) == 4
+        assert all(share < alone / 3 for share in shares)
