@@ -498,6 +498,68 @@ class TestRavnAgentToolUse:
         persisted = json.loads((artifacts_dir / "restart_probe.json").read_text())
         assert persisted["provenance"]["build_operation_id"] == duplicate_operation_id
 
+    async def test_changed_request_does_not_inherit_a_stale_commission_id(self, tmp_path) -> None:
+        """The operation id is the A2A messageId; the peer rejects it reused with new content.
+
+        Regin's earlier inline-canary commission for ``repo.inspect`` stayed
+        pending, and every later ``repo.inspect`` request inherited its id and
+        failed with "messageId ... was reused for different launch content"
+        (NIU-1144). An identical retry must still resume the same operation.
+        """
+        from ravn.ports.tool_build_backend import (
+            ToolBuildBackend,
+            ToolBuildError,
+            ToolBuildRequest,
+            ToolBuildResult,
+        )
+
+        class _InterruptedBackend(ToolBuildBackend):
+            def __init__(self) -> None:
+                self.requests: list[ToolBuildRequest] = []
+
+            @property
+            def name(self) -> str:
+                return "recoverable"
+
+            @property
+            def supports_restart_recovery(self) -> bool:
+                return True
+
+            async def build(self, request: ToolBuildRequest) -> ToolBuildResult:
+                self.requests.append(request)
+                raise ToolBuildError("connection closed before task response")
+
+        backend = _InterruptedBackend()
+        agent, _ = make_agent(make_simple_llm("unused"))
+        artifacts_dir = tmp_path / "artifacts"
+        tool = attach_build_tool(
+            agent,
+            tools_dir=tmp_path / "tools",
+            artifacts_dir=artifacts_dir,
+            build_backend=backend,
+            environment_id="cluster-a",
+            valkyrie_id="resident-a",
+        )
+        canary = {
+            "manifest": {"name": "repo_inspect", "required_permission": "repo:read"},
+            "build_request": "Inline canary: read README.md.",
+            "canary_input": {},
+        }
+        reader = {**canary, "build_request": "Read any file from the regin branch."}
+
+        await tool.execute(canary)
+        await tool.execute(canary)
+        await tool.execute(reader)
+
+        first, retry, changed = (request.operation_id for request in backend.requests)
+        assert retry == first, "an identical retry resumes the same operation"
+        assert changed != first, "a changed request must not reuse the stale messageId"
+        pending = [
+            json.loads(path.read_text())
+            for path in (artifacts_dir / "pending-commissions").glob("*.json")
+        ]
+        assert [record["operation_id"] for record in pending] == [changed]
+
     async def test_build_tool_reconciles_stale_commission_when_tool_is_installed(
         self,
         tmp_path,
