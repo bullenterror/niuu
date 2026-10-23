@@ -611,7 +611,7 @@ class WorkflowTaskHandler(RequestHandler):
         params: ListTasksRequest,
         context: ServerCallContext,
     ) -> ListTasksResponse:
-        self._reject_execution_gateway_operation()
+        launcher_actor = self._scoped_list_actor()
         campaigns = await self._campaign_repo.list_campaigns(
             owner_id=self._principal.user_id,
         )
@@ -623,6 +623,11 @@ class WorkflowTaskHandler(RequestHandler):
             else None
         )
         for campaign in campaigns:
+            if (
+                launcher_actor is not None
+                and str(campaign.metadata.get("actor_id") or "") != launcher_actor
+            ):
+                continue
             task = campaign_to_task(campaign)
             if params.context_id and task.context_id != params.context_id:
                 continue
@@ -686,7 +691,7 @@ class WorkflowTaskHandler(RequestHandler):
         params: TaskPushNotificationConfig,
         context: ServerCallContext,
     ) -> TaskPushNotificationConfig:
-        self._reject_execution_gateway_operation()
+        await self._authorize_scoped_task_operation(str(params.task_id or "").strip())
         task_id = str(params.task_id or "").strip()
         if not task_id:
             raise InvalidParamsError("taskId is required")
@@ -706,7 +711,7 @@ class WorkflowTaskHandler(RequestHandler):
         params: GetTaskPushNotificationConfigRequest,
         context: ServerCallContext,
     ) -> TaskPushNotificationConfig:
-        self._reject_execution_gateway_operation()
+        await self._authorize_scoped_task_operation(str(params.task_id or "").strip())
         task_id = str(params.task_id or "").strip()
         config_id = str(params.id or "").strip()
         if not task_id or not config_id:
@@ -726,7 +731,7 @@ class WorkflowTaskHandler(RequestHandler):
         params: ListTaskPushNotificationConfigsRequest,
         context: ServerCallContext,
     ) -> ListTaskPushNotificationConfigsResponse:
-        self._reject_execution_gateway_operation()
+        await self._authorize_scoped_task_operation(str(params.task_id or "").strip())
         task_id = str(params.task_id or "").strip()
         if not task_id:
             raise InvalidParamsError("taskId is required")
@@ -758,7 +763,7 @@ class WorkflowTaskHandler(RequestHandler):
         params: DeleteTaskPushNotificationConfigRequest,
         context: ServerCallContext,
     ) -> None:
-        self._reject_execution_gateway_operation()
+        await self._authorize_scoped_task_operation(str(params.task_id or "").strip())
         task_id = str(params.task_id or "").strip()
         config_id = str(params.id or "").strip()
         if not task_id or not config_id:
@@ -1355,6 +1360,44 @@ class WorkflowTaskHandler(RequestHandler):
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Scoped credential does not grant this A2A operation",
             )
+
+    async def _authorize_scoped_task_operation(self, task_id: str) -> None:
+        """Gate task-bound operations (push configs) for scoped credentials.
+
+        Unscoped callers are unaffected. A launch-scoped workload may manage
+        the tasks it launched (see ``_authorize_launcher_task``); developer
+        child credentials stay limited to their exact ledger operations.
+        """
+        if scoped_credential_claims(self._bearer_token or "") is None:
+            return
+        if self._execution_gateway_claims() is not None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Scoped credential does not grant this A2A operation",
+            )
+        await self._authorize_launcher_task(task_id)
+
+    def _scoped_list_actor(self) -> str | None:
+        """The workload a scoped ListTasks is limited to, or None when unscoped.
+
+        build_tool looks up its earlier task by contextId before sending, so a
+        launch-scoped workload may list tasks, but only the ones it launched.
+        """
+        if scoped_credential_claims(self._bearer_token or "") is None:
+            return None
+        if self._execution_gateway_claims() is not None or not token_has_scope(
+            self._bearer_token or "", LAUNCH_SCOPE
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Scoped credential does not grant this A2A operation",
+            )
+        if not self._principal.actor:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Scoped credential names no workload actor for this task operation",
+            )
+        return self._principal.actor
 
     async def _authorize_launcher_task(self, task_id: str) -> None:
         """Let a launch-scoped workload follow the tasks it launched itself.

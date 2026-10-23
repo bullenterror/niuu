@@ -1932,6 +1932,36 @@ class TestProtocolSurface:
         assert [task["id"] for task in result["tasks"]] == ["task-mine"]
         assert result["totalSize"] == 1
 
+    def test_scoped_launcher_lists_only_the_tasks_its_workload_launched(self) -> None:
+        """build_tool looks up its earlier task by contextId before re-sending."""
+        regin = "system:serviceaccount:nats:regin"
+        mine = _make_campaign(slug="task-regin", metadata={"actor_id": regin})
+        theirs = _make_campaign(
+            slug="task-ivaldi", metadata={"actor_id": "system:serviceaccount:nats:ivaldi"}
+        )
+        owners = _make_campaign(slug="task-owner")
+        client, _, _ = _make_client(
+            campaign_repo=InMemoryCampaignRepository([mine, theirs, owners]),
+        )
+        client.app.state.identity = EnvoyHeaderAuthenticationAdapter()
+        token = _build_token(["ting:workflow:launch"], act={"sub": regin})
+
+        response = _rpc(client, "ListTasks", {}, headers=_headers(token=token))
+
+        assert response.status_code == 200
+        assert [task["id"] for task in response.json()["result"]["tasks"]] == [mine.slug]
+
+    def test_scoped_list_without_launch_scope_is_denied(self) -> None:
+        client, _, _ = _make_client()
+        client.app.state.identity = EnvoyHeaderAuthenticationAdapter()
+        token = _build_token(
+            ["forge:session:create"], act={"sub": "system:serviceaccount:nats:regin"}
+        )
+
+        response = _rpc(client, "ListTasks", {}, headers=_headers(token=token))
+
+        assert response.status_code == 403
+
     def test_missing_identity_headers_are_unauthorized(self) -> None:
         client, _, _ = _make_client()
 
@@ -1985,6 +2015,41 @@ class TestPushNotifications:
         )
         assert deleted.status_code == 200
         assert dispatcher.repo.configs == {}
+
+    def test_scoped_launcher_registers_push_for_its_own_task_only(self) -> None:
+        """build_tool registers a callback for the build it just launched."""
+        regin = "system:serviceaccount:nats:regin"
+        mine = _make_campaign(slug="task-regin", metadata={"actor_id": regin})
+        theirs = _make_campaign(
+            slug="task-ivaldi", metadata={"actor_id": "system:serviceaccount:nats:ivaldi"}
+        )
+        dispatcher = RecordingPushDispatcher()
+        client, _, _ = _make_client(
+            campaign_repo=InMemoryCampaignRepository([mine, theirs]),
+            push_dispatcher=dispatcher,
+        )
+        client.app.state.identity = EnvoyHeaderAuthenticationAdapter()
+        token = _build_token(["ting:workflow:launch"], act={"sub": regin})
+
+        def register(task_id: str):
+            return _rpc(
+                client,
+                "CreateTaskPushNotificationConfig",
+                {
+                    "taskId": task_id,
+                    "id": "ravn-tool-build",
+                    "url": "https://resident.example/a2a/push",
+                    "authentication": {"scheme": "Bearer"},
+                },
+                headers=_headers(token=token),
+            )
+
+        own = register(mine.slug)
+        other = register(theirs.slug)
+
+        assert own.status_code == 200
+        assert own.json()["result"]["taskId"] == mine.slug
+        assert other.status_code == 403
 
     def test_rejects_unowned_or_unallowlisted_callback(self) -> None:
         campaign = _make_campaign()
