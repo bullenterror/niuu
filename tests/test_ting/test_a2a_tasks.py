@@ -1557,6 +1557,72 @@ class TestGetTask:
 
         assert response.status_code == 403
 
+    def test_scoped_launcher_reads_the_task_its_workload_launched(self) -> None:
+        """build_tool follows the task it started, with the token it started it with."""
+        regin = "system:serviceaccount:nats:regin"
+        campaign = _make_campaign(slug="task-built-by-regin", metadata={"actor_id": regin})
+        client, _, _ = _make_client(campaign_repo=InMemoryCampaignRepository([campaign]))
+        client.app.state.identity = EnvoyHeaderAuthenticationAdapter()
+        token = _build_token(["ting:workflow:launch"], act={"sub": regin})
+
+        response = _rpc(client, "GetTask", {"id": campaign.slug}, headers=_headers(token=token))
+
+        assert response.status_code == 200
+        assert response.json()["result"]["id"] == campaign.slug
+
+    def test_scoped_launcher_cannot_read_another_workloads_task(self) -> None:
+        campaign = _make_campaign(
+            slug="task-built-by-ivaldi",
+            metadata={"actor_id": "system:serviceaccount:nats:ivaldi"},
+        )
+        client, _, _ = _make_client(campaign_repo=InMemoryCampaignRepository([campaign]))
+        client.app.state.identity = EnvoyHeaderAuthenticationAdapter()
+        token = _build_token(
+            ["ting:workflow:launch"], act={"sub": "system:serviceaccount:nats:regin"}
+        )
+
+        response = _rpc(client, "GetTask", {"id": campaign.slug}, headers=_headers(token=token))
+
+        assert response.status_code == 403
+        assert "tasks its workload launched" in response.json()["detail"]
+
+    def test_scoped_launcher_cannot_read_tasks_its_owner_launched_directly(self) -> None:
+        """No recorded actor means the owner launched it; a scoped token gets nothing."""
+        campaign = _make_campaign(slug="task-by-owner")
+        client, _, _ = _make_client(campaign_repo=InMemoryCampaignRepository([campaign]))
+        client.app.state.identity = EnvoyHeaderAuthenticationAdapter()
+        token = _build_token(
+            ["ting:workflow:launch"], act={"sub": "system:serviceaccount:nats:regin"}
+        )
+
+        response = _rpc(client, "GetTask", {"id": campaign.slug}, headers=_headers(token=token))
+
+        assert response.status_code == 403
+
+    def test_actor_match_without_launch_scope_is_denied(self) -> None:
+        regin = "system:serviceaccount:nats:regin"
+        campaign = _make_campaign(slug="task-built-by-regin", metadata={"actor_id": regin})
+        client, _, _ = _make_client(campaign_repo=InMemoryCampaignRepository([campaign]))
+        client.app.state.identity = EnvoyHeaderAuthenticationAdapter()
+        token = _build_token(["forge:session:create"], act={"sub": regin})
+
+        response = _rpc(client, "GetTask", {"id": campaign.slug}, headers=_headers(token=token))
+
+        assert response.status_code == 403
+
+    def test_scoped_launcher_cancels_the_task_its_workload_launched(self) -> None:
+        regin = "system:serviceaccount:nats:regin"
+        campaign = _make_campaign(slug="task-built-by-regin", metadata={"actor_id": regin})
+        client, _, port = _make_client(campaign_repo=InMemoryCampaignRepository([campaign]))
+        client.app.state.identity = EnvoyHeaderAuthenticationAdapter()
+        token = _build_token(["ting:workflow:launch"], act={"sub": regin})
+
+        response = _rpc(client, "CancelTask", {"id": campaign.slug}, headers=_headers(token=token))
+
+        assert response.status_code == 200
+        assert response.json()["result"]["status"]["state"] == "TASK_STATE_CANCELED"
+        assert port.stopped == ["session-123"]
+
     def test_execution_gateway_token_is_bound_to_exact_ledger_task(self) -> None:
         execution_id = uuid4()
         attempt_id = uuid4()

@@ -1292,10 +1292,8 @@ class WorkflowTaskHandler(RequestHandler):
             return
         claims = self._execution_gateway_claims()
         if claims is None:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Scoped credential does not grant A2A task operations",
-            )
+            await self._authorize_launcher_task(task_id)
+            return
         slug = str(task_id or "").strip()
         if not slug or str(claims.get("workload_child_task_id") or "") != slug:
             raise HTTPException(
@@ -1356,6 +1354,36 @@ class WorkflowTaskHandler(RequestHandler):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Scoped credential does not grant this A2A operation",
+            )
+
+    async def _authorize_launcher_task(self, task_id: str) -> None:
+        """Let a launch-scoped workload follow the tasks it launched itself.
+
+        A resident's build_tool starts a task with a ``ting:workflow:launch``
+        scoped token and then has to read, answer and cancel it with the same
+        token. That token carries no developer-child lineage, so it is bound
+        to the task the other way round: the task's owner must be the token's
+        owner (``_owned_campaign`` enforces that), and the workload recorded
+        as the task's ``actor_id`` at launch must be this token's actor. A
+        scoped token never reaches another workload's tasks, or tasks its
+        owner launched directly.
+        """
+        if not token_has_scope(self._bearer_token or "", LAUNCH_SCOPE):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Scoped credential does not grant A2A task operations",
+            )
+        actor = self._principal.actor
+        if not actor:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Scoped credential names no workload actor for this task operation",
+            )
+        campaign = await self._owned_campaign(task_id)
+        if str(campaign.metadata.get("actor_id") or "") != actor:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Scoped credential only grants operations on tasks its workload launched",
             )
 
     async def _owned_campaign(self, task_id: str) -> WorkflowCampaign:
