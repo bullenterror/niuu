@@ -231,6 +231,15 @@ claim that already holds a workspace is never overwritten.
 - A failed upgrade marks the resident failed with a `PlatformUpgrade` /
   `UpgradeFailed` condition and is not retried until the version changes again,
   the resident is restarted, or Volundr restarts.
+- An OpenShell resident's old sandbox that is slow to go is not a failed
+  upgrade. Every removal of a resident sandbox waits
+  `resident_sandbox_delete_timeout_seconds` (180s; sessions keep
+  `resource_delete_timeout`, 30s). If the sandbox is still being deleted after
+  that, the resident reports `PlatformUpgrade` / `Upgrading` and its
+  redeployment waits for the sandbox to go, then recreates it on its workspace
+  claim, retrying on later passes. If the gateway refuses the delete, the
+  resident keeps running on its old sandbox (`PlatformUpgrade` /
+  `UpgradeRetrying`) and the next pass tries again.
 
 Key chart values:
 

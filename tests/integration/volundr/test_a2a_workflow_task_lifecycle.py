@@ -29,7 +29,7 @@ from ting.adapters.postgres_workflow_campaigns import PostgresWorkflowCampaignRe
 from ting.adapters.postgres_workflows import PostgresWorkflowRepository
 from ting.adapters.volundr_factory import LocalVolundrAdapterFactory
 from ting.api.a2a import create_a2a_router, resolve_a2a_launch_repo
-from ting.api.a2a_card import create_agent_card_router
+from ting.api.a2a_card import create_agent_card_router, resolve_card_workflow_repo
 from ting.api.dispatch import resolve_volundr_factory
 from ting.api.research import resolve_workflow_campaign_repo
 from ting.api.workflows import resolve_workflow_repo
@@ -229,12 +229,15 @@ async def test_ravn_a2a_tool_build_backend_commissions_real_workflow_task(
         auth=AuthConfig(
             allow_anonymous_dev=True,
             default_user_id="a2a-tool-build-client",
+            # Align with the Forge identity: sessions.tenant_id is a foreign key.
+            default_tenant_id="default",
         ),
         a2a=A2AConfig(),
     )
     ting_app.include_router(create_a2a_router())
     ting_app.include_router(create_agent_card_router(ting_app.state.settings.a2a))
     ting_app.dependency_overrides[resolve_workflow_repo] = lambda: workflow_repo
+    ting_app.dependency_overrides[resolve_card_workflow_repo] = lambda: workflow_repo
     ting_app.dependency_overrides[resolve_workflow_campaign_repo] = lambda: campaign_repo
     ting_app.dependency_overrides[resolve_a2a_launch_repo] = lambda: launch_repo
     ting_app.dependency_overrides[resolve_volundr_factory] = lambda: LocalVolundrAdapterFactory(

@@ -110,6 +110,7 @@ def _client(
     instances: list[RegisteredInstance],
     *,
     embedded_forge_app: FastAPI | None = None,
+    delegations: Any | None = None,
 ) -> TestClient:
     app = FastAPI()
     app.state.identity = AllowAllIdentityAdapter(user_repository=AsyncMock())
@@ -118,6 +119,7 @@ def _client(
         create_ravn_router(
             service,
             embedded_forge_app=embedded_forge_app,
+            delegations=delegations,
         )
     )
     app.include_router(  # type: ignore[arg-type]
@@ -1194,3 +1196,120 @@ class TestWsConnectKwargs:
         assert result is None
         websocket.close.assert_awaited_once()
         assert websocket.close.await_args.kwargs["code"] == 1011
+
+
+# --- workload delegations recorded with a deploy -----------------------------------
+
+_PLATFORM = "https://platform.test"
+_DELEGATIONS = f"{_PLATFORM}/api/v1/tokens/workload/delegations"
+_HELM_RESIDENT = {
+    "id": "0f9e3c1a",
+    "resident_name": "Muninn",
+    "backend_ref": {"kind": "HelmRelease", "namespace": "skuld", "name": "resident-0f9e3c1a"},
+}
+
+
+def _delegating_client(*, verifier: str | None = "k8s-valhalla") -> TestClient:
+    from niuu.adapters.outbound.http_workload_delegations import HttpResidentDelegationRegistrar
+
+    config = {"workload_verifier": verifier} if verifier else {}
+    return _client(
+        [_instance("valhalla", base_url="http://valhalla", config=config)],
+        delegations=HttpResidentDelegationRegistrar(_PLATFORM),
+    )
+
+
+@respx.mock
+def test_deploying_a_resident_records_its_delegation_as_the_deploying_owner() -> None:
+    respx.post("http://valhalla/api/v1/ravn/ravens").mock(
+        return_value=Response(201, json=_HELM_RESIDENT)
+    )
+    record = respx.post(_DELEGATIONS).mock(return_value=Response(201, json={"id": "d-1"}))
+
+    response = _delegating_client().post(
+        "/api/v1/ravn/ravens", headers=_headers(), json={"instance_id": "valhalla"}
+    )
+
+    assert response.status_code == 201
+    assert response.json()["workload_delegation"] == {"status": "recorded", "id": "d-1"}
+    sent = record.calls.last.request
+    assert sent.headers["authorization"] == "Bearer test-token"
+    assert json.loads(sent.read()) == {
+        "verifier": "k8s-valhalla",
+        "subject": "system:serviceaccount:skuld:resident-0f9e3c1a",
+        "name": "Muninn",
+        "residentId": "0f9e3c1a",
+    }
+
+
+@respx.mock
+def test_instance_without_a_verifier_records_no_delegation() -> None:
+    respx.post("http://valhalla/api/v1/ravn/ravens").mock(
+        return_value=Response(201, json=_HELM_RESIDENT)
+    )
+    record = respx.post(_DELEGATIONS)
+
+    response = _delegating_client(verifier=None).post(
+        "/api/v1/ravn/ravens", headers=_headers(), json={"instance_id": "valhalla"}
+    )
+
+    assert response.json()["workload_delegation"] == {"status": "skipped"}
+    assert not record.called
+
+
+@respx.mock
+def test_a_refused_delegation_reports_failure_but_keeps_the_deploy() -> None:
+    respx.post("http://valhalla/api/v1/ravn/ravens").mock(
+        return_value=Response(201, json=_HELM_RESIDENT)
+    )
+    respx.post(_DELEGATIONS).mock(return_value=Response(422, json={"detail": "no mapping"}))
+
+    response = _delegating_client().post(
+        "/api/v1/ravn/ravens", headers=_headers(), json={"instance_id": "valhalla"}
+    )
+
+    assert response.status_code == 201
+    assert response.json()["workload_delegation"]["status"] == "failed"
+
+
+@respx.mock
+def test_deleting_a_resident_revokes_its_delegations() -> None:
+    respx.delete("http://valhalla/api/v1/ravn/ravens/0f9e3c1a").mock(return_value=Response(204))
+    listed = respx.get(_DELEGATIONS, params={"residentId": "0f9e3c1a"}).mock(
+        return_value=Response(200, json=[{"id": "d-1"}])
+    )
+    revoked = respx.delete(f"{_DELEGATIONS}/d-1").mock(return_value=Response(204))
+
+    response = _delegating_client().delete(
+        "/api/v1/ravn/ravens/0f9e3c1a?instance_id=valhalla", headers=_headers()
+    )
+
+    assert response.status_code == 204
+    assert listed.called
+    assert revoked.calls.last.request.headers["authorization"] == "Bearer test-token"
+
+
+@respx.mock
+def test_a_delegated_caller_deploying_a_resident_records_nothing() -> None:
+    """A resident's own token (it names an actor) must not delegate onward."""
+    import jwt
+
+    respx.post("http://valhalla/api/v1/ravn/ravens").mock(
+        return_value=Response(201, json=_HELM_RESIDENT)
+    )
+    record = respx.post(_DELEGATIONS)
+    token = jwt.encode(
+        {"sub": "user-a", "act": {"sub": "system:serviceaccount:nats:regin"}},
+        "test-only-hmac-key-at-least-32-bytes-long",
+        algorithm="HS256",
+    )
+
+    response = _delegating_client().post(
+        "/api/v1/ravn/ravens",
+        headers={**_headers(), "authorization": f"Bearer {token}"},
+        json={"instance_id": "valhalla"},
+    )
+
+    assert response.status_code == 201
+    assert "workload_delegation" not in response.json()
+    assert not record.called

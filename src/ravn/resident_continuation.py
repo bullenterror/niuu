@@ -264,11 +264,19 @@ class LocalResidentMemory(ResidentMemoryPort):
                 live += 1
         return (live, total)
 
-    async def prune_cases(self) -> int:
-        """Delete unresumable cases beyond the retention policy; return the count."""
-        return await asyncio.to_thread(self._prune_cases_sync)
+    async def prune_cases(self, *, keep_case_id: str = "") -> int:
+        """Delete unresumable cases beyond the retention policy; return the count.
 
-    def _prune_cases_sync(self) -> int:
+        ``keep_case_id`` is never pruned. The sweep runs from ``write_turn``,
+        and a turn that has just been written is not yet resumable (its wake or
+        operator marker comes after it), so without this a resident holding
+        more live cases than the cap deleted the case it was in the middle of
+        writing and failed its own read-after-write.
+        """
+        keep = _slug(keep_case_id) if keep_case_id else ""
+        return await asyncio.to_thread(self._prune_cases_sync, keep)
+
+    def _prune_cases_sync(self, keep: str = "") -> int:
         base = self._root / self._prefix / "cases"
         if not base.is_dir():
             return 0
@@ -279,6 +287,9 @@ class LocalResidentMemory(ResidentMemoryPort):
         live = 0
         for case_dir in base.iterdir():
             if not case_dir.is_dir():
+                continue
+            if keep and case_dir.name == keep:
+                live += 1
                 continue
             if self._case_is_resumable(case_dir):
                 live += 1
@@ -318,7 +329,7 @@ class LocalResidentMemory(ResidentMemoryPort):
             )
         return removed
 
-    async def _maybe_prune_cases(self) -> None:
+    async def _maybe_prune_cases(self, *, keep_case_id: str = "") -> None:
         """Sweep when one is due. Never blocking, never on the read path."""
         if self._retention_max_cases <= 0 and self._retention_max_age_days <= 0:
             return
@@ -330,7 +341,7 @@ class LocalResidentMemory(ResidentMemoryPort):
             return
         self._last_retention_sweep = now
         try:
-            await self.prune_cases()
+            await self.prune_cases(keep_case_id=keep_case_id)
         except Exception:  # noqa: BLE001 — bookkeeping must never break a turn
             logger.warning("resident cases: retention sweep failed", exc_info=True)
 
@@ -387,7 +398,7 @@ class LocalResidentMemory(ResidentMemoryPort):
         ref = self._write(rel, _render_turn_record(record))
         # Every turn writes here, so this is the natural sweep tick. The
         # interval throttle keeps it off all but one write in fifteen minutes.
-        await self._maybe_prune_cases()
+        await self._maybe_prune_cases(keep_case_id=record.case_id)
         return ref
 
     async def write_working_state(self, record: ResidentWorkingStateRecord) -> str:

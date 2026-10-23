@@ -1614,7 +1614,7 @@ class ResidentLearningRuntime:
         if verify_rejection is not None:
             telemetry.count(
                 "ravn_learned_tool_installs_total",
-                attributes={"outcome": verify_rejection.status},
+                attributes={"outcome": verify_rejection.action},
                 description="Learned-tool install attempts by outcome.",
             )
             return verify_rejection

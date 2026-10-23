@@ -671,7 +671,9 @@ class RavnAgent:
                     # NIU-1118: cap the result BEFORE it enters history — one
                     # oversized result lands in the compression-protected tail
                     # and would make the rest of the turn unrecoverable.
-                    result = self._truncate_oversized_tool_result(tool_call, result)
+                    result = self._truncate_oversized_tool_result(
+                        tool_call, result, batch_size=len(llm_response.tool_calls)
+                    )
 
                     # Inject budget warning into the tool result content.
                     result = _maybe_append_budget_warning(result, self._iteration_budget)
@@ -995,6 +997,8 @@ class RavnAgent:
         self,
         tool_call: ToolCall,
         result: ToolResult,
+        *,
+        batch_size: int = 1,
     ) -> ToolResult:
         """Bound a single tool result's contribution to the conversation.
 
@@ -1008,11 +1012,20 @@ class RavnAgent:
         prompt budget can actually hold — see
         :meth:`_budget_tool_result_char_limit` for why the configured one alone
         was not enough.
+
+        ``batch_size`` is the number of tool calls the model made in this step.
+        Their results all land in ONE protected message, so the budget-derived
+        allowance for that slot is split between them. Capping each result on
+        its own let four parallel calls put ~4x the slot's allowance into the
+        protected tail; compaction could not shrink it, and the resident's
+        turn died on the prompt budget at 77k against a 64k ceiling.
         """
         content = result.content
         if not isinstance(content, str):
             return result
         budget_limit = self._budget_tool_result_char_limit()
+        if budget_limit > 0 and batch_size > 1:
+            budget_limit //= batch_size
         limits = [value for value in (self._max_tool_result_chars, budget_limit) if value > 0]
         if not limits:
             return result

@@ -359,7 +359,14 @@ class ResidentRuntime:
             limit=10,
         )
         a2a_block = (
-            json.dumps(a2a_tasks, indent=2, sort_keys=True)
+            _bounded(
+                json.dumps(
+                    [_a2a_handle_prompt_view(handle) for handle in a2a_tasks],
+                    indent=2,
+                    sort_keys=True,
+                ),
+                self._context_max_chars,
+            )
             if a2a_tasks
             else "(No active durable A2A task handles.)"
         )
@@ -1902,6 +1909,32 @@ def _a2a_record_payload(record: ResidentA2ATaskRecord) -> dict[str, Any]:
         "update_fingerprint": record.update_fingerprint,
         "updated_at": record.updated_at.isoformat(),
     }
+
+
+# What a turn needs to judge an in-flight A2A task. Each durable handle also
+# stores the mandate of the case that launched it (Regin's ran to ~32k chars)
+# and the full brief; rendered into every turn's context, a few active handles
+# alone pushed the first message past the prompt budget, where compaction
+# cannot reach. The full record stays available through a2a_task find/get.
+_A2A_HANDLE_PROMPT_FIELDS = (
+    "task_id",
+    "agent_id",
+    "skill_id",
+    "state",
+    "operation",
+    "status_message",
+    "question",
+    "case_id",
+    "push_registered",
+    "updated_at",
+)
+_A2A_HANDLE_BRIEF_CHARS = 280
+
+
+def _a2a_handle_prompt_view(handle: dict[str, Any]) -> dict[str, Any]:
+    view = {key: handle[key] for key in _A2A_HANDLE_PROMPT_FIELDS if key in handle}
+    view["brief"] = compact_line(str(handle.get("prompt") or ""), limit=_A2A_HANDLE_BRIEF_CHARS)
+    return view
 
 
 def _legacy_a2a_handles(entry: ResidentMemoryEntry, *, query: str) -> list[dict[str, Any]]:

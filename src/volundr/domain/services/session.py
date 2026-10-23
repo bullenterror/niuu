@@ -294,6 +294,7 @@ class SessionService:
             source=source,
             launch_spec_id=launch_spec_id,
             owner_id=principal.user_id if principal else None,
+            actor_id=(principal.actor or None) if principal else None,
             tenant_id=principal.tenant_id if principal else None,
             workspace_id=workspace_id,
             tracker_issue_id=tracker_issue_id,

@@ -936,6 +936,10 @@ workloadIdentity:
     enabled: false
     name: "ravn-resident"
     verifier: "kubernetes"
+    # -- Issuer of the resident pods' ServiceAccount tokens (the verifier's
+    # cluster), e.g. "https://kubernetes.default.svc". Required when enabled:
+    # a mapping without an issuer admits no one.
+    issuer: ""
     # -- Namespace resident pods run in — must match whatever namespace the
     # ResidentRuntimeController (flux.py) deploys resident HelmReleases into.
     namespace: ""

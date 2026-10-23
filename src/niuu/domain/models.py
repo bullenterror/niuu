@@ -18,6 +18,10 @@ class Principal:
     ``token_use``, ``scopes`` and ``bound_session_id`` are set only for a scoped
     credential (e.g. a Forge ``forge_session`` token): what it may do and the one
     session it is bound to. Human and PAT principals leave them empty.
+
+    ``actor`` names the workload acting on behalf of ``user_id`` (the RFC 8693
+    ``act.sub`` of an exchanged workload token, e.g. a resident's ServiceAccount);
+    empty when the caller speaks for itself. It is attribution only: it grants nothing.
     """
 
     user_id: str
@@ -27,6 +31,7 @@ class Principal:
     token_use: str = ""
     scopes: tuple[str, ...] = ()
     bound_session_id: str | None = None
+    actor: str = ""
 
 
 class IntegrationType(StrEnum):
@@ -304,6 +309,30 @@ class PersonalAccessToken:
     tenant_id: str = ""
     scopes: tuple[str, ...] | None = None
     expires_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class WorkloadDelegation:
+    """A workload (e.g. a resident's ServiceAccount) allowed to act for one owner.
+
+    The workload exchange admits a caller through a mapping with
+    ``owner_from: delegation`` only while an active record names the caller's
+    verifier and subject: the token then speaks for ``owner_id`` with the workload
+    as its actor (``act.sub``). The verifier, not the issuer, keys the record:
+    several clusters can share one issuer string, but each verifier pins its own
+    cluster's signing keys.
+    """
+
+    id: UUID
+    verifier: str
+    subject: str
+    owner_id: str
+    tenant_id: str
+    created_by: str
+    created_at: datetime
+    name: str = ""
+    resident_id: str = ""
+    revoked_at: datetime | None = None
 
 
 @dataclass(frozen=True)

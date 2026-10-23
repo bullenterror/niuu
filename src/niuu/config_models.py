@@ -276,9 +276,16 @@ class WorkloadIdentityMappingConfig(BaseModel):
     subject: str = Field(default="", description="Exact subject claim to match.")
     subject_prefix: str = Field(
         default="",
-        description="Subject claim prefix to match for dynamic workload identities.",
+        description=(
+            "Subject claim prefix to match for dynamic workload identities. It must end on a "
+            "separator (: - / . _ @) so it names whole segments; an exact subject outranks "
+            "any prefix, and a longer prefix outranks a shorter one."
+        ),
     )
-    issuer: str = Field(default="", description="Optional exact issuer claim to match.")
+    issuer: str = Field(
+        default="",
+        description="Exact issuer claim to match. Required: a mapping without one admits no one.",
+    )
     claims: dict[str, Any] = Field(
         default_factory=dict,
         description="Additional exact-match claim selectors. Dot notation is supported.",
@@ -309,6 +316,15 @@ class WorkloadIdentityMappingConfig(BaseModel):
             "resident id out of a Kubernetes ServiceAccount subject. Unset uses the "
             "whole claim value verbatim; a claim value that fails to match a "
             "configured pattern is rejected, not passed through unstripped."
+        ),
+    )
+    owner_from: str = Field(
+        default="",
+        description=(
+            "Where the owner comes from. Empty: owner_id or owner_id_claim. 'delegation': "
+            "the caller is admitted only while an active workload delegation names its "
+            "verifier and subject, and its token speaks for that record's owner and tenant "
+            "with the workload as actor (owner_id, owner_id_claim and tenant_id are unused)."
         ),
     )
     tenant_id: str = Field(default="default", description="Tenant/org id for isolation.")

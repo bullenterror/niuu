@@ -18,12 +18,14 @@ from niuu.adapters.inbound.rest_pats import create_pats_router
 from niuu.adapters.inbound.rest_realms import create_realms_router
 from niuu.adapters.inbound.rest_repos import create_repos_router
 from niuu.adapters.inbound.rest_setup import create_setup_router
+from niuu.adapters.inbound.rest_workload_delegations import create_workload_delegations_router
 from niuu.adapters.outbound.git_registry import create_git_registry
 from niuu.adapters.pat_revocation_middleware import PATRevocationMiddleware
 from niuu.adapters.postgres_credential_refresh_lock import PostgresCredentialRefreshLock
 from niuu.adapters.postgres_integrations import PostgresIntegrationRepository
 from niuu.adapters.postgres_pats import PostgresPATRepository
 from niuu.adapters.postgres_realms import PostgresRealmRepository
+from niuu.adapters.postgres_workload_delegations import PostgresWorkloadDelegationRepository
 from niuu.config import GitConfig, NiuuSettings
 from niuu.cors import apply_cors_middleware
 from niuu.domain.services.realm import RealmService
@@ -281,8 +283,10 @@ def create_app(
             app.state.storage = storage_adapter
             app.state.pat_validator = pat_validator
             app.state.pat_service = pat_service
+            workload_delegations = PostgresWorkloadDelegationRepository(pool)
+            app.state.workload_delegations = workload_delegations
             app.state.workload_identity_service = create_workload_identity_service(
-                loaded_settings.workload_identity
+                loaded_settings.workload_identity, delegations=workload_delegations
             )
             app.state.persona_registry = PostgresPersonaRegistry(pool)
 
@@ -296,6 +300,9 @@ def create_app(
             app.include_router(create_repos_router(repo_service))
             app.include_router(create_identity_router(tenant_service))
             app.include_router(create_pats_router(extract_principal, prefix="/api/v1/tokens"))
+            app.include_router(
+                create_workload_delegations_router(extract_principal, prefix="/api/v1/tokens")
+            )
             app.include_router(create_credentials_settings_router())
             app.include_router(create_credentials_settings_router("/api/v1/niuu/credentials"))
             app.include_router(create_canonical_credentials_router(credential_service))

@@ -115,7 +115,7 @@ RUN uv pip install --system --break-system-packages --no-cache \
     gunicorn==25.1.0 \
     psycopg2-binary==2.9.11 \
     pyyaml==6.0.3 \
-    aiohttp==3.14.3
+    aiohttp==3.14.5
 
 # Install Homebrew dependencies (so users can brew install without root)
 RUN apt-get update && apt-get install -y --no-install-recommends \

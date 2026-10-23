@@ -8,6 +8,7 @@ import pytest
 import yaml
 
 CHART_DIR = Path(__file__).parent.parent.parent / "charts" / "volundr"
+RESIDENT_ISSUER = "https://kubernetes.default.svc"
 
 
 class TestChartMetadata:
@@ -1637,7 +1638,15 @@ class TestResidentWorkloadIdentityMapping:
     @staticmethod
     def _config(*extra_args: str) -> dict:
         result = subprocess.run(
-            ["helm", "template", "test", str(CHART_DIR), *extra_args],
+            [
+                "helm",
+                "template",
+                "test",
+                str(CHART_DIR),
+                "--set",
+                f"workloadIdentity.residentMapping.issuer={RESIDENT_ISSUER}",
+                *extra_args,
+            ],
             check=True,
             capture_output=True,
             text=True,
@@ -1672,6 +1681,7 @@ class TestResidentWorkloadIdentityMapping:
             == "^system:serviceaccount:[^:]+:resident-([0-9a-f-]{36})$"
         )
         assert mapping["tenant_id"] == "default"
+        assert mapping["issuer"] == RESIDENT_ISSUER
 
     def test_enabled_without_namespace_fails_the_render(self):
         result = subprocess.run(
@@ -1689,6 +1699,25 @@ class TestResidentWorkloadIdentityMapping:
         assert result.returncode != 0
         assert "workloadIdentity.residentMapping.namespace is required" in result.stderr
 
+    def test_enabled_without_issuer_fails_the_render(self):
+        """A mapping without an issuer admits no one, so the chart refuses to render one."""
+        result = subprocess.run(
+            [
+                "helm",
+                "template",
+                "test",
+                str(CHART_DIR),
+                "--set",
+                "workloadIdentity.residentMapping.enabled=true",
+                "--set",
+                "workloadIdentity.residentMapping.namespace=residents",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode != 0
+        assert "workloadIdentity.residentMapping.issuer is required" in result.stderr
+
     def test_operator_supplied_mappings_are_preserved_alongside_the_resident_one(self):
         config = self._config(
             "--set",
@@ -1705,12 +1734,9 @@ class TestResidentWorkloadIdentityMapping:
         assert names == {"other-mapping", "ravn-resident"}
 
     def test_resident_mapping_is_tried_before_operator_mappings(self):
-        """WorkloadIdentityService.exchange() returns on the FIRST match —
-        residentMapping must come first, or a broader operator mapping
-        (e.g. a catch-all "system:serviceaccount:<ns>:" with no
-        "resident-" requirement) ordered ahead of it would silently win,
-        giving every resident that operator mapping's shared owner_id
-        instead of its own."""
+        """residentMapping renders first. WorkloadIdentityService.exchange()
+        picks the most specific match rather than the first, so the order no
+        longer decides who wins, but a stable order keeps the config readable."""
         config = self._config(
             "--set",
             "workloadIdentity.residentMapping.enabled=true",

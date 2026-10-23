@@ -505,14 +505,13 @@ data:
       {{- if .Values.workloadIdentity.residentMapping.enabled }}
       {{- $rm := .Values.workloadIdentity.residentMapping }}
       {{- $rmNamespace := required "workloadIdentity.residentMapping.namespace is required when workloadIdentity.residentMapping.enabled=true" $rm.namespace }}
+      {{- $rmIssuer := required "workloadIdentity.residentMapping.issuer is required when workloadIdentity.residentMapping.enabled=true" $rm.issuer }}
       {{/*
-      WorkloadIdentityService.exchange() returns on the FIRST mapping that
-      matches — prepended, not appended, so residentMapping's specific
-      "...resident-" prefix is always tried before any broader operator
-      mapping on workloadIdentity.mappings (e.g. a catch-all
-      "system:serviceaccount:<ns>:" with no "resident-" requirement). An
-      operator mapping ordered first would otherwise silently win and every
-      resident would get that mapping's shared owner_id instead of its own.
+      WorkloadIdentityService.exchange() picks the MOST SPECIFIC matching
+      mapping (an exact subject over any prefix, a longer prefix over a
+      shorter one), so residentMapping's "...resident-" prefix wins over a
+      broader operator catch-all such as "system:serviceaccount:<ns>:".
+      It is still prepended, which keeps the rendered order readable.
 
       owner_id_claim_pattern is restricted to UUID-shaped resident ids
       (FluxPodManager names a per-runtime SA "resident-<runtime.id>", a
@@ -527,6 +526,7 @@ data:
             "name" $rm.name
             "verifier" $rm.verifier
             "subject_prefix" (printf "system:serviceaccount:%s:resident-" $rmNamespace)
+            "issuer" $rmIssuer
             "owner_id_claim" "sub"
             "owner_id_claim_pattern" "^system:serviceaccount:[^:]+:resident-([0-9a-f-]{36})$"
             "tenant_id" $rm.tenantId

@@ -473,3 +473,18 @@ class TestRequireScopeAlternatives:
         )
         assert response.status_code == 403
         assert "forge:session:create or forge:session:lifecycle" in response.json()["detail"]
+
+
+class TestTrackerIssueRoutes:
+    """Ravn platform tools exchange workload tokens without requesting scopes, so
+    residents reach the tracker API with an unscoped token; scoped credentials stay
+    confined to their own entry points and gain no tracker access."""
+
+    def test_unscoped_workload_token_may_create_and_read_issues(self) -> None:
+        token = _encode({"workload_subject": "system:serviceaccount:nats:regin"})
+        assert credential_allows_route(token, "POST", "/api/v1/tracker/issues")
+        assert credential_allows_route(token, "GET", "/api/v1/tracker/issues/NIU-1092")
+
+    def test_scoped_workload_token_cannot_create_issues(self) -> None:
+        token = _build_token(["forge:session:create"])
+        assert not credential_allows_route(token, "POST", "/api/v1/tracker/issues")

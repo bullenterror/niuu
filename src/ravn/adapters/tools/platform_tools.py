@@ -28,7 +28,11 @@ _DEFAULT_TIMEOUT = 30.0
 _DEFAULT_WORKLOAD_TOKEN_FILE = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 _DEFAULT_WORKLOAD_AUDIENCES = ["volundr-api", "forge", "ting", "mimir", "guild"]
 _FORGE_SESSIONS_PATH = "/api/v1/forge/sessions"
+# Session-scoped: a PR is opened from a Forge session, so it goes through the
+# Forge surface, which routes to the instance that owns that session.
 _FORGE_REPOS_PATH = "/api/v1/forge/repos"
+# Repository reads and PR read/merge/CI need no session; the Git host is the
+# source of truth, served by the shared Niuu repos surface.
 _NIUU_REPOS_PATH = "/api/v1/niuu/repos"
 _TRACKER_ISSUES_PATH = "/api/v1/tracker/issues"
 _TING_WORKFLOWS_PATH = "/api/v1/ting/workflows"
@@ -142,6 +146,25 @@ def _ok(data: object) -> ToolResult:
 
 def _err(message: str) -> ToolResult:
     return ToolResult(tool_call_id="", content=message, is_error=True)
+
+
+def _http_failure(exc: Exception) -> str:
+    """Describe a failed call, including the server's own explanation.
+
+    The bare ``raise_for_status`` text names only the status and URL; the
+    server's ``detail`` is what says whether the address, the credentials or
+    the host was wrong, and an agent that cannot see it guesses.
+    """
+    if not isinstance(exc, httpx.HTTPStatusError):
+        return str(exc)
+    try:
+        payload = exc.response.json()
+    except ValueError:
+        return str(exc)
+    detail = payload.get("detail") if isinstance(payload, dict) else None
+    if not detail:
+        return str(exc)
+    return f"{exc} — {detail}"
 
 
 # ---------------------------------------------------------------------------
@@ -268,7 +291,7 @@ class VolundrSessionTool(_PlatformAuthMixin, ToolPort):
             resp.raise_for_status()
             return _ok(resp.json())
         except Exception as exc:
-            return _err(f"Failed to list sessions: {exc}")
+            return _err(f"Failed to list sessions: {_http_failure(exc)}")
 
     async def _create(self, client: httpx.AsyncClient, input: dict) -> ToolResult:
         name = input.get("name", "")
@@ -283,7 +306,7 @@ class VolundrSessionTool(_PlatformAuthMixin, ToolPort):
             resp.raise_for_status()
             return _ok(resp.json())
         except Exception as exc:
-            return _err(f"Failed to create session: {exc}")
+            return _err(f"Failed to create session: {_http_failure(exc)}")
 
     async def _get(self, client: httpx.AsyncClient, session_id: str) -> ToolResult:
         if not session_id:
@@ -293,7 +316,7 @@ class VolundrSessionTool(_PlatformAuthMixin, ToolPort):
             resp.raise_for_status()
             return _ok(resp.json())
         except Exception as exc:
-            return _err(f"Failed to get session {session_id}: {exc}")
+            return _err(f"Failed to get session {session_id}: {_http_failure(exc)}")
 
     async def _start(self, client: httpx.AsyncClient, session_id: str) -> ToolResult:
         if not session_id:
@@ -303,7 +326,7 @@ class VolundrSessionTool(_PlatformAuthMixin, ToolPort):
             resp.raise_for_status()
             return _ok(resp.json())
         except Exception as exc:
-            return _err(f"Failed to start session {session_id}: {exc}")
+            return _err(f"Failed to start session {session_id}: {_http_failure(exc)}")
 
     async def _stop(self, client: httpx.AsyncClient, session_id: str) -> ToolResult:
         if not session_id:
@@ -313,7 +336,7 @@ class VolundrSessionTool(_PlatformAuthMixin, ToolPort):
             resp.raise_for_status()
             return _ok(resp.json())
         except Exception as exc:
-            return _err(f"Failed to stop session {session_id}: {exc}")
+            return _err(f"Failed to stop session {session_id}: {_http_failure(exc)}")
 
     async def _delete(self, client: httpx.AsyncClient, session_id: str) -> ToolResult:
         if not session_id:
@@ -323,7 +346,7 @@ class VolundrSessionTool(_PlatformAuthMixin, ToolPort):
             resp.raise_for_status()
             return _ok({"session_id": session_id, "status": "deleted"})
         except Exception as exc:
-            return _err(f"Failed to delete session {session_id}: {exc}")
+            return _err(f"Failed to delete session {session_id}: {_http_failure(exc)}")
 
 
 # ---------------------------------------------------------------------------
@@ -465,18 +488,18 @@ class VolundrGitTool(_PlatformAuthMixin, ToolPort):
             resp.raise_for_status()
             return _ok(resp.json())
         except Exception as exc:
-            return _err(f"Failed to list repositories: {exc}")
+            return _err(f"Failed to list repositories: {_http_failure(exc)}")
 
     async def _list_branches(self, client: httpx.AsyncClient, input: dict) -> ToolResult:
         repo_url = input.get("repo_url", "")
         if not repo_url:
             return _err("repo_url is required for list_branches")
         try:
-            resp = await client.get(f"{_FORGE_REPOS_PATH}/branches", params={"repo_url": repo_url})
+            resp = await client.get(f"{_NIUU_REPOS_PATH}/branches", params={"repo_url": repo_url})
             resp.raise_for_status()
             return _ok(resp.json())
         except Exception as exc:
-            return _err(f"Failed to list branches: {exc}")
+            return _err(f"Failed to list branches: {_http_failure(exc)}")
 
     async def _create_pr(self, client: httpx.AsyncClient, input: dict) -> ToolResult:
         session_id = input.get("session_id", "")
@@ -492,7 +515,7 @@ class VolundrGitTool(_PlatformAuthMixin, ToolPort):
             resp.raise_for_status()
             return _ok(resp.json())
         except Exception as exc:
-            return _err(f"Failed to create PR: {exc}")
+            return _err(f"Failed to create PR: {_http_failure(exc)}")
 
     async def _list_prs(self, client: httpx.AsyncClient, input: dict) -> ToolResult:
         repo_url = input.get("repo_url", "")
@@ -502,11 +525,11 @@ class VolundrGitTool(_PlatformAuthMixin, ToolPort):
         if status := input.get("status"):
             params["status"] = status
         try:
-            resp = await client.get(f"{_FORGE_REPOS_PATH}/prs", params=params)
+            resp = await client.get(f"{_NIUU_REPOS_PATH}/prs", params=params)
             resp.raise_for_status()
             return _ok(resp.json())
         except Exception as exc:
-            return _err(f"Failed to list PRs: {exc}")
+            return _err(f"Failed to list PRs: {_http_failure(exc)}")
 
     async def _get_pr(self, client: httpx.AsyncClient, input: dict) -> ToolResult:
         pr_number = input.get("pr_number")
@@ -515,13 +538,13 @@ class VolundrGitTool(_PlatformAuthMixin, ToolPort):
             return _err("pr_number and repo_url are required for get_pr")
         try:
             resp = await client.get(
-                f"{_FORGE_REPOS_PATH}/prs/{pr_number}",
+                f"{_NIUU_REPOS_PATH}/prs/{pr_number}",
                 params={"repo_url": repo_url},
             )
             resp.raise_for_status()
             return _ok(resp.json())
         except Exception as exc:
-            return _err(f"Failed to get PR #{pr_number}: {exc}")
+            return _err(f"Failed to get PR #{pr_number}: {_http_failure(exc)}")
 
     async def _merge_pr(self, client: httpx.AsyncClient, input: dict) -> ToolResult:
         pr_number = input.get("pr_number")
@@ -533,14 +556,14 @@ class VolundrGitTool(_PlatformAuthMixin, ToolPort):
             body["merge_method"] = method
         try:
             resp = await client.post(
-                f"{_FORGE_REPOS_PATH}/prs/{pr_number}/merge",
+                f"{_NIUU_REPOS_PATH}/prs/{pr_number}/merge",
                 params={"repo_url": repo_url},
                 json=body,
             )
             resp.raise_for_status()
             return _ok(resp.json())
         except Exception as exc:
-            return _err(f"Failed to merge PR #{pr_number}: {exc}")
+            return _err(f"Failed to merge PR #{pr_number}: {_http_failure(exc)}")
 
     async def _ci_status(self, client: httpx.AsyncClient, input: dict) -> ToolResult:
         pr_number = input.get("pr_number")
@@ -550,13 +573,13 @@ class VolundrGitTool(_PlatformAuthMixin, ToolPort):
             return _err("pr_number, repo_url, and branch are required for ci_status")
         try:
             resp = await client.get(
-                f"{_FORGE_REPOS_PATH}/prs/{pr_number}/ci",
+                f"{_NIUU_REPOS_PATH}/prs/{pr_number}/ci",
                 params={"repo_url": repo_url, "branch": branch},
             )
             resp.raise_for_status()
             return _ok(resp.json())
         except Exception as exc:
-            return _err(f"Failed to get CI status: {exc}")
+            return _err(f"Failed to get CI status: {_http_failure(exc)}")
 
 
 # ---------------------------------------------------------------------------
@@ -724,7 +747,7 @@ class TingSagaTool(_PlatformAuthMixin, ToolPort):
             resp.raise_for_status()
             return _ok(resp.json())
         except Exception as exc:
-            return _err(f"Failed to list sagas: {exc}")
+            return _err(f"Failed to list sagas: {_http_failure(exc)}")
 
     async def _get(self, client: httpx.AsyncClient, saga_id: str) -> ToolResult:
         if not saga_id:
@@ -734,7 +757,7 @@ class TingSagaTool(_PlatformAuthMixin, ToolPort):
             resp.raise_for_status()
             return _ok(resp.json())
         except Exception as exc:
-            return _err(f"Failed to get saga {saga_id}: {exc}")
+            return _err(f"Failed to get saga {saga_id}: {_http_failure(exc)}")
 
     async def _commit(self, client: httpx.AsyncClient, input: dict) -> ToolResult:
         name = input.get("name", "")
@@ -758,7 +781,7 @@ class TingSagaTool(_PlatformAuthMixin, ToolPort):
             resp.raise_for_status()
             return _ok(resp.json())
         except Exception as exc:
-            return _err(f"Failed to commit saga: {exc}")
+            return _err(f"Failed to commit saga: {_http_failure(exc)}")
 
     async def _dispatch(self, client: httpx.AsyncClient, input: dict) -> ToolResult:
         items = input.get("items", [])
@@ -772,7 +795,7 @@ class TingSagaTool(_PlatformAuthMixin, ToolPort):
             resp.raise_for_status()
             return _ok(resp.json())
         except Exception as exc:
-            return _err(f"Failed to dispatch: {exc}")
+            return _err(f"Failed to dispatch: {_http_failure(exc)}")
 
     async def _delete(self, client: httpx.AsyncClient, saga_id: str) -> ToolResult:
         if not saga_id:
@@ -782,7 +805,7 @@ class TingSagaTool(_PlatformAuthMixin, ToolPort):
             resp.raise_for_status()
             return _ok({"saga_id": saga_id, "status": "deleted"})
         except Exception as exc:
-            return _err(f"Failed to delete saga {saga_id}: {exc}")
+            return _err(f"Failed to delete saga {saga_id}: {_http_failure(exc)}")
 
     async def _runs(self, client: httpx.AsyncClient) -> ToolResult:
         try:
@@ -790,7 +813,7 @@ class TingSagaTool(_PlatformAuthMixin, ToolPort):
             resp.raise_for_status()
             return _ok(resp.json())
         except Exception as exc:
-            return _err(f"Failed to list active runs: {exc}")
+            return _err(f"Failed to list active runs: {_http_failure(exc)}")
 
 
 # ---------------------------------------------------------------------------
@@ -978,7 +1001,7 @@ class TingWorkflowTool(_PlatformAuthMixin, ToolPort):
             resp.raise_for_status()
             return _ok(resp.json())
         except Exception as exc:
-            return _err(f"Failed to list workflows: {exc}")
+            return _err(f"Failed to list workflows: {_http_failure(exc)}")
 
     async def _get(self, client: httpx.AsyncClient, workflow_id: str) -> ToolResult:
         if not workflow_id:
@@ -988,7 +1011,7 @@ class TingWorkflowTool(_PlatformAuthMixin, ToolPort):
             resp.raise_for_status()
             return _ok(resp.json())
         except Exception as exc:
-            return _err(f"Failed to get workflow {workflow_id}: {exc}")
+            return _err(f"Failed to get workflow {workflow_id}: {_http_failure(exc)}")
 
     async def _launch(self, client: httpx.AsyncClient, input: dict) -> ToolResult:
         launch_input = await self._launch_input_with_alias(client, input)
@@ -1040,7 +1063,7 @@ class TingWorkflowTool(_PlatformAuthMixin, ToolPort):
                 await self._join_launched_session(payload)
             return _ok(payload)
         except Exception as exc:
-            return _err(f"Failed to launch workflow {workflow_id}: {exc}")
+            return _err(f"Failed to launch workflow {workflow_id}: {_http_failure(exc)}")
 
     async def _join_launched_session(self, payload: dict[str, Any]) -> None:
         manager = self._session_join_manager
@@ -1282,7 +1305,7 @@ class TingResearchTool(TingWorkflowTool):
             resp.raise_for_status()
             return _ok(resp.json())
         except Exception as exc:
-            return _err(f"Failed to list research campaigns: {exc}")
+            return _err(f"Failed to list research campaigns: {_http_failure(exc)}")
 
     async def _get_campaign(self, client: httpx.AsyncClient, slug: str) -> ToolResult:
         if not slug:
@@ -1299,9 +1322,9 @@ class TingResearchTool(TingWorkflowTool):
                     f"No research campaign {slug!r} exists. It was never created, "
                     "or the launch failed — do not treat it as pending."
                 )
-            return _err(f"Failed to get research campaign {slug}: {exc}")
+            return _err(f"Failed to get research campaign {slug}: {_http_failure(exc)}")
         except Exception as exc:
-            return _err(f"Failed to get research campaign {slug}: {exc}")
+            return _err(f"Failed to get research campaign {slug}: {_http_failure(exc)}")
         return _ok(resp.json())
 
     async def _campaign_artifacts(self, client: httpx.AsyncClient, slug: str) -> ToolResult:
@@ -1316,9 +1339,13 @@ class TingResearchTool(TingWorkflowTool):
                     f"No research campaign {slug!r} exists. It was never created, "
                     "or the launch failed — do not treat it as pending."
                 )
-            return _err(f"Failed to list artifacts for research campaign {slug}: {exc}")
+            return _err(
+                f"Failed to list artifacts for research campaign {slug}: {_http_failure(exc)}"
+            )
         except Exception as exc:
-            return _err(f"Failed to list artifacts for research campaign {slug}: {exc}")
+            return _err(
+                f"Failed to list artifacts for research campaign {slug}: {_http_failure(exc)}"
+            )
         return _ok(resp.json())
 
     async def _launch(self, client: httpx.AsyncClient, input: dict) -> ToolResult:
@@ -1485,11 +1512,15 @@ def _with_default_workflow_alias(
 
 
 class TrackerIssueTool(_PlatformAuthMixin, ToolPort):
-    """Search, view, and update issues via Volundr's tracker integration.
+    """Search, view, create, and update issues via Volundr's tracker integration.
 
     Actions:
-    - ``search``        — search issues across connected trackers (requires ``query``).
-    - ``get``           — get issue details (requires ``issue_id``).
+    - ``search``        — search issues across connected trackers (requires ``query``);
+      results omit issue bodies (``description`` is null).
+    - ``get``           — get issue details including the ``description`` body with
+      acceptance criteria (requires ``issue_id``).
+    - ``create``        — create an issue (requires ``title``, ``description``,
+      ``team``; optional ``labels``, ``priority``, ``connection_id``).
     - ``update_status`` — update issue status (requires ``issue_id``, ``status``).
     """
 
@@ -1518,9 +1549,12 @@ class TrackerIssueTool(_PlatformAuthMixin, ToolPort):
     @property
     def description(self) -> str:
         return (
-            "Search, view, and update issues in connected trackers (Linear, Jira, etc.) "
-            "via Volundr. Actions: search (query), get (issue_id), "
-            "update_status (issue_id + status)."
+            "Search, view, create, and update issues in connected trackers (Linear, Jira, "
+            "etc.) via Volundr. Actions: search (query) — matching issues without their "
+            "bodies; get (issue_id) — full issue including its description (the ticket body "
+            "with acceptance criteria, as Markdown); create (title + description + team, "
+            "optional labels, priority, connection_id) — files a new issue and returns it; "
+            "labels must already exist in the tracker; update_status (issue_id + status)."
         )
 
     @property
@@ -1530,7 +1564,7 @@ class TrackerIssueTool(_PlatformAuthMixin, ToolPort):
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["search", "get", "update_status"],
+                    "enum": ["search", "get", "create", "update_status"],
                     "description": "Operation to perform.",
                 },
                 "issue_id": {
@@ -1544,6 +1578,42 @@ class TrackerIssueTool(_PlatformAuthMixin, ToolPort):
                 "status": {
                     "type": "string",
                     "description": "New status value (required for update_status).",
+                },
+                "title": {
+                    "type": "string",
+                    "description": "Issue title (required for create).",
+                },
+                "description": {
+                    "type": "string",
+                    "description": (
+                        "Issue body as Markdown, including acceptance criteria "
+                        "(required for create)."
+                    ),
+                },
+                "team": {
+                    "type": "string",
+                    "description": (
+                        "Team key (Linear, e.g. NIU) or Jira project key to create the "
+                        "issue in (required for create)."
+                    ),
+                },
+                "labels": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Existing label names to apply (optional, create).",
+                },
+                "priority": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 4,
+                    "description": "Priority 0=none, 1=urgent … 4=low (optional, create).",
+                },
+                "connection_id": {
+                    "type": "string",
+                    "description": (
+                        "Tracker connection to create in; required when more than one "
+                        "issue tracker is connected (optional, create)."
+                    ),
                 },
             },
             "required": ["action"],
@@ -1561,6 +1631,8 @@ class TrackerIssueTool(_PlatformAuthMixin, ToolPort):
                     return await self._search(client, input.get("query", ""))
                 case "get":
                     return await self._get(client, input.get("issue_id", ""))
+                case "create":
+                    return await self._create(client, input)
                 case "update_status":
                     return await self._update_status(
                         client, input.get("issue_id", ""), input.get("status", "")
@@ -1577,7 +1649,7 @@ class TrackerIssueTool(_PlatformAuthMixin, ToolPort):
             resp.raise_for_status()
             return _ok(resp.json())
         except Exception as exc:
-            return _err(f"Failed to search issues: {exc}")
+            return _err(f"Failed to search issues: {_http_failure(exc)}")
 
     async def _get(self, client: httpx.AsyncClient, issue_id: str) -> ToolResult:
         if not issue_id:
@@ -1587,7 +1659,28 @@ class TrackerIssueTool(_PlatformAuthMixin, ToolPort):
             resp.raise_for_status()
             return _ok(resp.json())
         except Exception as exc:
-            return _err(f"Failed to get issue {issue_id}: {exc}")
+            return _err(f"Failed to get issue {issue_id}: {_http_failure(exc)}")
+
+    async def _create(self, client: httpx.AsyncClient, input: dict) -> ToolResult:
+        missing = [key for key in ("title", "description", "team") if not input.get(key)]
+        if missing:
+            return _err(f"{', '.join(missing)} required for create action")
+        body: dict[str, object] = {
+            "title": input["title"],
+            "description": input["description"],
+            "team": input["team"],
+        }
+        for key in ("labels", "priority", "connection_id"):
+            if input.get(key) is not None:
+                body[key] = input[key]
+        try:
+            resp = await client.post(_TRACKER_ISSUES_PATH, json=body)
+            resp.raise_for_status()
+            return _ok(resp.json())
+        except httpx.HTTPStatusError as exc:
+            return _err(f"Failed to create issue: {exc.response.status_code} {exc.response.text}")
+        except Exception as exc:
+            return _err(f"Failed to create issue: {_http_failure(exc)}")
 
     async def _update_status(
         self, client: httpx.AsyncClient, issue_id: str, status: str
@@ -1602,7 +1695,7 @@ class TrackerIssueTool(_PlatformAuthMixin, ToolPort):
             resp.raise_for_status()
             return _ok(resp.json())
         except Exception as exc:
-            return _err(f"Failed to update issue {issue_id}: {exc}")
+            return _err(f"Failed to update issue {issue_id}: {_http_failure(exc)}")
 
 
 # ---------------------------------------------------------------------------
@@ -1764,7 +1857,7 @@ class TingPlanTool(TingWorkflowTool):
                 await self._join_launched_session(payload)
             return _ok(payload)
         except Exception as exc:
-            return _err(f"Failed to spawn planning session: {exc}")
+            return _err(f"Failed to spawn planning session: {_http_failure(exc)}")
 
     async def _list_campaigns(self, client: httpx.AsyncClient) -> ToolResult:
         try:
@@ -1772,7 +1865,7 @@ class TingPlanTool(TingWorkflowTool):
             resp.raise_for_status()
             return _ok(resp.json())
         except Exception as exc:
-            return _err(f"Failed to list planning sessions: {exc}")
+            return _err(f"Failed to list planning sessions: {_http_failure(exc)}")
 
     async def _get_campaign(
         self, client: httpx.AsyncClient, input: dict, suffix: str
@@ -1785,7 +1878,7 @@ class TingPlanTool(TingWorkflowTool):
             resp.raise_for_status()
             return _ok(resp.json())
         except Exception as exc:
-            return _err(f"Failed to fetch plan {slug}{suffix or ''}: {exc}")
+            return _err(f"Failed to fetch plan {slug}{suffix or ''}: {_http_failure(exc)}")
 
     async def _feedback(self, client: httpx.AsyncClient, input: dict) -> ToolResult:
         slug = str(input.get("slug") or "").strip()
@@ -1801,7 +1894,7 @@ class TingPlanTool(TingWorkflowTool):
             resp.raise_for_status()
             return _ok(resp.json() if resp.text else {"status": "accepted"})
         except Exception as exc:
-            return _err(f"Failed to send plan feedback for {slug}: {exc}")
+            return _err(f"Failed to send plan feedback for {slug}: {_http_failure(exc)}")
 
     async def _cancel(self, client: httpx.AsyncClient, input: dict) -> ToolResult:
         slug = str(input.get("slug") or "").strip()
@@ -1812,7 +1905,7 @@ class TingPlanTool(TingWorkflowTool):
             resp.raise_for_status()
             return _ok({"cancelled": slug})
         except Exception as exc:
-            return _err(f"Failed to cancel plan {slug}: {exc}")
+            return _err(f"Failed to cancel plan {slug}: {_http_failure(exc)}")
 
 
 # ---------------------------------------------------------------------------
@@ -1983,7 +2076,7 @@ class TingSpecTool(TingWorkflowTool):
                 await self._join_launched_session(payload)
             return _ok(payload)
         except Exception as exc:
-            return _err(f"Failed to launch spec campaign: {exc}")
+            return _err(f"Failed to launch spec campaign: {_http_failure(exc)}")
 
     async def _list_campaigns(self, client: httpx.AsyncClient) -> ToolResult:
         try:
@@ -1991,7 +2084,7 @@ class TingSpecTool(TingWorkflowTool):
             resp.raise_for_status()
             return _ok(resp.json())
         except Exception as exc:
-            return _err(f"Failed to list spec campaigns: {exc}")
+            return _err(f"Failed to list spec campaigns: {_http_failure(exc)}")
 
     async def _get_campaign(
         self, client: httpx.AsyncClient, input: dict, suffix: str
@@ -2004,7 +2097,7 @@ class TingSpecTool(TingWorkflowTool):
             resp.raise_for_status()
             return _ok(resp.json())
         except Exception as exc:
-            return _err(f"Failed to fetch spec campaign {slug}{suffix or ''}: {exc}")
+            return _err(f"Failed to fetch spec campaign {slug}{suffix or ''}: {_http_failure(exc)}")
 
     async def _artifact(self, client: httpx.AsyncClient, input: dict) -> ToolResult:
         slug = str(input.get("slug") or "").strip()
@@ -2019,7 +2112,7 @@ class TingSpecTool(TingWorkflowTool):
             resp.raise_for_status()
             return _ok(resp.json())
         except Exception as exc:
-            return _err(f"Failed to read artifact {path} for {slug}: {exc}")
+            return _err(f"Failed to read artifact {path} for {slug}: {_http_failure(exc)}")
 
     async def _review(self, client: httpx.AsyncClient, input: dict) -> ToolResult:
         slug = str(input.get("slug") or "").strip()
@@ -2034,4 +2127,4 @@ class TingSpecTool(TingWorkflowTool):
             resp.raise_for_status()
             return _ok(resp.json())
         except Exception as exc:
-            return _err(f"Failed to review spec campaign {slug}: {exc}")
+            return _err(f"Failed to review spec campaign {slug}: {_http_failure(exc)}")

@@ -2083,3 +2083,102 @@ def test_read_state_is_forwarded_to_owning_instance(method, status_code):
     assert "x-auth-user-id" not in route.calls[0].request.headers
     if method == "PATCH":
         assert json.loads(route.calls[0].request.content) == body
+
+
+SESSION_UUID = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+
+
+@respx.mock
+def test_create_pr_is_opened_on_the_instance_that_owns_the_session() -> None:
+    """A resident pointed at the Guild must reach the Forge holding the session."""
+    client = _client(
+        [
+            _instance("alpha", base_url="http://alpha"),
+            _instance("beta", base_url="http://beta"),
+        ]
+    )
+    respx.get(f"http://alpha/api/v1/forge/sessions/{SESSION_UUID}").mock(return_value=Response(404))
+    respx.get(f"http://beta/api/v1/forge/sessions/{SESSION_UUID}").mock(
+        return_value=Response(200, json={"id": SESSION_UUID})
+    )
+    alpha_create = respx.post("http://alpha/api/v1/forge/repos/prs")
+    beta_create = respx.post("http://beta/api/v1/forge/repos/prs").mock(
+        return_value=Response(201, json={"number": 12, "url": "https://github.com/o/r/pull/12"})
+    )
+
+    response = client.post(
+        "/api/v1/forge/repos/prs",
+        headers=_headers(),
+        json={
+            "session_id": SESSION_UUID,
+            "title": "feat: thing",
+            "target_branch": "dev",
+            "instance_id": "alpha-hint",
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["number"] == 12
+    assert response.json()["instance_id"] == "beta"
+    assert not alpha_create.called
+    sent = json.loads(beta_create.calls.last.request.content)
+    assert sent == {"session_id": SESSION_UUID, "title": "feat: thing", "target_branch": "dev"}
+    assert beta_create.calls.last.request.headers["authorization"] == "Bearer test-token"
+
+
+def test_create_pr_without_a_session_uuid_says_what_it_needs() -> None:
+    client = _client([_instance("alpha", base_url="http://alpha")])
+
+    missing = client.post("/api/v1/forge/repos/prs", headers=_headers(), json={"title": "x"})
+    malformed = client.post(
+        "/api/v1/forge/repos/prs", headers=_headers(), json={"session_id": "sess-123"}
+    )
+
+    assert missing.status_code == 422
+    assert "create_pr needs the UUID of a Forge session" in missing.json()["detail"]
+    assert malformed.status_code == 422
+    assert "'sess-123'" in malformed.json()["detail"]
+
+
+def test_create_pr_with_no_registered_instance_is_unavailable_not_missing() -> None:
+    client = _client([])
+
+    response = client.post(
+        "/api/v1/forge/repos/prs", headers=_headers(), json={"session_id": SESSION_UUID}
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "No enabled Volundr instances are registered for this user"
+
+
+@respx.mock
+def test_create_pr_for_a_session_no_visible_instance_owns_names_the_session() -> None:
+    client = _client([_instance("alpha", base_url="http://alpha")])
+    respx.get(f"http://alpha/api/v1/forge/sessions/{SESSION_UUID}").mock(return_value=Response(404))
+
+    response = client.post(
+        "/api/v1/forge/repos/prs", headers=_headers(), json={"session_id": SESSION_UUID}
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"].startswith(
+        f"Session {SESSION_UUID} is not owned by any Forge instance visible to you"
+    )
+
+
+@respx.mock
+def test_create_pr_preserves_the_owning_instances_refusal() -> None:
+    client = _client([_instance("alpha", base_url="http://alpha")])
+    respx.get(f"http://alpha/api/v1/forge/sessions/{SESSION_UUID}").mock(
+        return_value=Response(200, json={"id": SESSION_UUID})
+    )
+    respx.post("http://alpha/api/v1/forge/repos/prs").mock(
+        return_value=Response(400, json={"detail": "Session has no repository configured"})
+    )
+
+    response = client.post(
+        "/api/v1/forge/repos/prs", headers=_headers(), json={"session_id": SESSION_UUID}
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Session has no repository configured"

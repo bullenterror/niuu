@@ -812,6 +812,45 @@ class TestSendMessage:
         campaign = next(iter(campaigns._campaigns.values()))
         assert campaign.metadata["workflow_execution_id"] == str(ledger.execution.id)
 
+    def test_campaign_names_the_workload_that_sent_the_task(self) -> None:
+        """A resident's exchanged token (act.sub) is recorded on the campaign it launches."""
+        workflow = _make_workflow()
+        client, campaigns, _ = _make_client(
+            workflow_repo=InMemoryWorkflowRepository([workflow]),
+        )
+        token = jwt.encode(
+            {"sub": "user-1", "act": {"sub": "system:serviceaccount:nats:regin"}},
+            "test-only-hmac-key-at-least-32-bytes-long",
+            algorithm="HS256",
+        )
+
+        response = _rpc(
+            client, "SendMessage", _send_params(str(workflow.id)), headers=_headers(token=token)
+        )
+
+        import asyncio
+
+        task_id = response.json()["result"]["task"]["id"]
+        campaign = asyncio.run(campaigns.get_campaign_by_slug(task_id))
+        assert campaign is not None
+        assert campaign.owner_id == "user-1"
+        assert campaign.metadata["actor_id"] == "system:serviceaccount:nats:regin"
+
+    def test_campaign_sent_by_its_owner_has_no_actor(self) -> None:
+        workflow = _make_workflow()
+        client, campaigns, _ = _make_client(
+            workflow_repo=InMemoryWorkflowRepository([workflow]),
+        )
+
+        response = _rpc(client, "SendMessage", _send_params(str(workflow.id)))
+
+        import asyncio
+
+        task_id = response.json()["result"]["task"]["id"]
+        campaign = asyncio.run(campaigns.get_campaign_by_slug(task_id))
+        assert campaign is not None
+        assert "actor_id" not in campaign.metadata
+
     def test_task_lifecycle_drives_send_get_and_cancel_over_jsonrpc(self) -> None:
         """Exercise all required task operations against one launched workflow."""
         workflow = _make_workflow()
@@ -922,6 +961,9 @@ class TestSendMessage:
         previous_level = a2a_logger.level
         a2a_logger.setLevel(logging.INFO)
         traceparent = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"
+        # The OTLP pipeline is process-global; another test on this worker may
+        # have left one active with a different fingerprint. Start clean.
+        shutdown_observability()
         try:
             telemetry = configure_observability(
                 ObservabilityConfig(
@@ -1587,6 +1629,72 @@ class TestGetTask:
         )
 
         assert response.status_code == 403
+
+    def test_scoped_launcher_reads_the_task_its_workload_launched(self) -> None:
+        """build_tool follows the task it started, with the token it started it with."""
+        regin = "system:serviceaccount:nats:regin"
+        campaign = _make_campaign(slug="task-built-by-regin", metadata={"actor_id": regin})
+        client, _, _ = _make_client(campaign_repo=InMemoryCampaignRepository([campaign]))
+        client.app.state.identity = EnvoyHeaderAuthenticationAdapter()
+        token = _build_token(["ting:workflow:launch"], act={"sub": regin})
+
+        response = _rpc(client, "GetTask", {"id": campaign.slug}, headers=_headers(token=token))
+
+        assert response.status_code == 200
+        assert response.json()["result"]["id"] == campaign.slug
+
+    def test_scoped_launcher_cannot_read_another_workloads_task(self) -> None:
+        campaign = _make_campaign(
+            slug="task-built-by-ivaldi",
+            metadata={"actor_id": "system:serviceaccount:nats:ivaldi"},
+        )
+        client, _, _ = _make_client(campaign_repo=InMemoryCampaignRepository([campaign]))
+        client.app.state.identity = EnvoyHeaderAuthenticationAdapter()
+        token = _build_token(
+            ["ting:workflow:launch"], act={"sub": "system:serviceaccount:nats:regin"}
+        )
+
+        response = _rpc(client, "GetTask", {"id": campaign.slug}, headers=_headers(token=token))
+
+        assert response.status_code == 403
+        assert "tasks its workload launched" in response.json()["detail"]
+
+    def test_scoped_launcher_cannot_read_tasks_its_owner_launched_directly(self) -> None:
+        """No recorded actor means the owner launched it; a scoped token gets nothing."""
+        campaign = _make_campaign(slug="task-by-owner")
+        client, _, _ = _make_client(campaign_repo=InMemoryCampaignRepository([campaign]))
+        client.app.state.identity = EnvoyHeaderAuthenticationAdapter()
+        token = _build_token(
+            ["ting:workflow:launch"], act={"sub": "system:serviceaccount:nats:regin"}
+        )
+
+        response = _rpc(client, "GetTask", {"id": campaign.slug}, headers=_headers(token=token))
+
+        assert response.status_code == 403
+
+    def test_actor_match_without_launch_scope_is_denied(self) -> None:
+        regin = "system:serviceaccount:nats:regin"
+        campaign = _make_campaign(slug="task-built-by-regin", metadata={"actor_id": regin})
+        client, _, _ = _make_client(campaign_repo=InMemoryCampaignRepository([campaign]))
+        client.app.state.identity = EnvoyHeaderAuthenticationAdapter()
+        token = _build_token(["forge:session:create"], act={"sub": regin})
+
+        response = _rpc(client, "GetTask", {"id": campaign.slug}, headers=_headers(token=token))
+
+        assert response.status_code == 403
+
+    def test_scoped_launcher_cancels_the_task_its_workload_launched(self) -> None:
+        regin = "system:serviceaccount:nats:regin"
+        campaign = _make_campaign(slug="task-built-by-regin", metadata={"actor_id": regin})
+        client, _, port = _make_client(campaign_repo=InMemoryCampaignRepository([campaign]))
+        client.app.state.identity = EnvoyHeaderAuthenticationAdapter()
+        token = _build_token(["ting:workflow:launch"], act={"sub": regin})
+
+        response = _rpc(client, "CancelTask", {"id": campaign.slug}, headers=_headers(token=token))
+
+        assert response.status_code == 200
+        assert response.json()["result"]["status"]["state"] == "TASK_STATE_CANCELED"
+        assert port.stopped == ["session-123"]
 
     def test_execution_gateway_token_is_bound_to_exact_ledger_task(self) -> None:
         execution_id = uuid4()

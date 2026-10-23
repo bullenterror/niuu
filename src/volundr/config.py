@@ -1758,7 +1758,8 @@ def _default_integration_definitions() -> list[IntegrationDefinitionConfig]:
                         "label": "Issue type for new work",
                         "type": "string",
                         "description": (
-                            "Issue type used when Ting creates Jira work. Defaults to Task."
+                            "Issue type used when Ting or the tracker API creates Jira "
+                            "work. Defaults to Task."
                         ),
                     },
                 },
@@ -2624,6 +2625,16 @@ class Settings(BaseSettings):
             "Ceiling for the connect leg of every outbound Guild call "
             "(niuu.adapters.outbound.guild_transport), and the timeout for the bare "
             "handshake that fetches a pinned instance's live certificate."
+        ),
+    )
+    guild_workload_delegation_url: str = Field(
+        default="",
+        description=(
+            "Platform URL serving /api/v1/tokens/workload/delegations (niuu-shared, e.g. "
+            "https://yggdrasil.niuu.world). When set, the Guild records the delegation that "
+            "lets a resident's own ServiceAccount act for the person deploying it, and "
+            "revokes it when the resident is deleted, for instances whose config names a "
+            "workload_verifier. Empty: no delegation is recorded."
         ),
     )
     guild_owner_probe_timeout_seconds: float = Field(
