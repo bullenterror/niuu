@@ -1149,23 +1149,31 @@ class BuildTool(ToolPort):
         manifest = prepared.get("manifest")
         manifest = manifest if isinstance(manifest, dict) else {}
         tool_name = str(manifest.get("name") or "").strip()
+        original = {
+            key: value
+            for key, value in prepared.items()
+            if key
+            not in {
+                "_build_continuation",
+                "_build_operation_id",
+                "continuation_task_id",
+                "continuation_answer",
+                "continuation_metadata",
+            }
+        }
         existing = None if replace_current else self._pending_commission(tool_name)
+        if existing is not None and existing.get("input") != original:
+            # The operation id is the A2A messageId, and the peer rejects a
+            # reused messageId carrying different launch content. Resuming is
+            # only right for the same request; a changed request under the
+            # same tool name supersedes the stale commission instead of
+            # inheriting its id (NIU-1144).
+            self._delete_commission(str(existing["operation_id"]))
+            existing = None
         if existing is not None:
             operation_id = str(existing["operation_id"])
         else:
             operation_id = str(uuid4())
-            original = {
-                key: value
-                for key, value in prepared.items()
-                if key
-                not in {
-                    "_build_continuation",
-                    "_build_operation_id",
-                    "continuation_task_id",
-                    "continuation_answer",
-                    "continuation_metadata",
-                }
-            }
             self._write_commission(
                 operation_id,
                 {
