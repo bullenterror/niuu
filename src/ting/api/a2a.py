@@ -1361,7 +1361,7 @@ class WorkflowTaskHandler(RequestHandler):
 
         A resident's build_tool starts a task with a ``ting:workflow:launch``
         scoped token and then has to read, answer and cancel it with the same
-        token. That token carries no developer-child lineage, so it is bound
+        token. That token carries no child-attempt lineage, so it is bound
         to the task the other way round: the task's owner must be the token's
         owner (``_owned_campaign`` enforces that), and the workload recorded
         as the task's ``actor_id`` at launch must be this token's actor. A
