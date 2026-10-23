@@ -13,6 +13,7 @@ from ravn.config import InitiativeConfig, Settings
 from ravn.domain.models import AgentTask, OutputMode, TokenUsage, ToolCall, ToolResult, TurnResult
 from ravn.domain.resident_continuation import (
     ContinuationDecisionKind,
+    ResidentA2ATaskRecord,
     ResidentScheduledWakeRecord,
     ResidentWorkingStateRecord,
     validate_resident_working_state,
@@ -1804,3 +1805,35 @@ async def test_hud_status_carries_the_health_snapshot(tmp_path) -> None:
 
     assert status["health"]["cases_live"] == 1
     assert status["health"]["inbox_pending"] == 1
+
+
+@pytest.mark.asyncio
+async def test_active_a2a_handles_reach_the_prompt_without_their_mandates(tmp_path) -> None:
+    """Each handle stores its launching case's whole mandate; the prompt must not.
+
+    Regin's handles carried ~32k-char mandates. Rendered verbatim, a few active
+    ones put the first message of every turn past the prompt budget.
+    """
+    state = LocalResidentState(tmp_path)
+    for index in range(4):
+        await state.write_a2a_task(
+            ResidentA2ATaskRecord(
+                task_id=f"a2a-{index}",
+                agent_id="agent-ting",
+                skill_id="skill-delivery",
+                state="TASK_STATE_INPUT_REQUIRED",
+                prompt="Fix platform-defect NIU-1140. " + "brief " * 2000,
+                mandate="MANDATE " * 4000,
+                case_id=f"case-{index}",
+                push_registered=True,
+            )
+        )
+    runtime = ResidentRuntime(state=state, resident_id="resident-alpha", context_max_chars=12000)
+
+    context = await runtime.prepare_context(_task(task_id="task-next"))
+
+    assert "a2a-3" in context
+    assert "TASK_STATE_INPUT_REQUIRED" in context
+    assert "Fix platform-defect NIU-1140." in context
+    assert "MANDATE" not in context
+    assert len(context) < 4 * 12000
