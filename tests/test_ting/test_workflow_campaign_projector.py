@@ -729,3 +729,55 @@ async def test_reconnect_attributes_a_missed_peer_failure_by_persona() -> None:
     assert failed.status == WorkflowCampaignStatus.FAILED
     assert failed.metadata["failure_stage_id"] == "research-coordinate"
     assert failed.stage_state[1].status == "failed"
+
+@pytest.mark.asyncio
+async def test_authoritative_publish_supersedes_blocked_help_gate_without_attestation() -> None:
+    """A retry that publishes a tool must close the earlier help-needed gate."""
+    campaign = _campaign(completion_event="capability.ready")
+    adapter = _Adapter()
+    projector, repo, _ = _projector(adapter)
+    repo.get_active_campaign_by_session.return_value = campaign
+
+    recorded = await projector.record_help_needed(
+        {"summary": "Publisher needs the durable artifact path."},
+        campaign.owner_id,
+        session_id=campaign.session_id,
+        gate={"node_id": "capability-publish", "status": "blocked"},
+    )
+
+    assert recorded is True
+    blocked = repo.save_campaign.await_args.args[0]
+    assert blocked.status == WorkflowCampaignStatus.BLOCKED
+
+    repo.get_active_campaign_by_session.return_value = blocked
+    handled = await projector.handle_activity(
+        ActivityEvent(
+            session_id=campaign.session_id,
+            state="idle",
+            metadata={
+                "completion_source": "ravn_flock",
+                "completion_event_type": "capability.ready",
+                "completion_peer_id": "workflow-stop:capability-complete",
+                "outcome_valid": True,
+                "structured_outcome": {
+                    "verdict": "approve",
+                    "authoritative": True,
+                    "checks": [
+                        {
+                            "persona": "capability-publisher",
+                            "event_type": "capability.ready",
+                            "verdict": "published",
+                        }
+                    ],
+                },
+            },
+            owner_id=campaign.owner_id,
+        ),
+        campaign.owner_id,
+    )
+
+    assert handled is True
+    completed = repo.save_campaign.await_args_list[1].args[0]
+    assert completed.status == WorkflowCampaignStatus.COMPLETED
+    assert completed.completed_at is not None
+    assert adapter.stopped == [campaign.session_id]
