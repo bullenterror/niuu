@@ -170,6 +170,11 @@ def ensure_codex_tool_shims(
                     "write",
                     "Create or update a Mimir wiki page.",
                 ),
+                "mimir_publish_artifact": (
+                    "ravn.cli.mimir_bridge",
+                    "publish-artifact",
+                    "Publish a JSON capability artifact to the durable artifact store.",
+                ),
                 "mimir_publish_files": (
                     "ravn.cli.mimir_bridge",
                     "publish-files",
