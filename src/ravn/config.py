@@ -2797,6 +2797,146 @@ class LearningCurationConfig(BaseModel):
     )
 
 
+class FrictionConfig(BaseModel):
+    """What a resident records about the walls it hits.
+
+    Friction is captured from each session's own record: tool calls that failed
+    and stayed failed, retries of the same call, timeouts, an exhausted
+    iteration budget, route recoveries (a workaround), and from the outcome
+    contract: operator escalations, declared capability gaps, and blocked
+    decisions. Signals are clustered by meaning into a ledger of Mímir pages so
+    "how often does this keep happening" has an answer. Needs semantic
+    matching; enabling it without embeddings is a startup error.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description="Record friction from every session into the friction ledger.",
+    )
+    max_signals: int = Field(
+        default=10,
+        ge=0,
+        description="Tool-level friction signals carried on ravn.session.ended per session.",
+    )
+    similarity_threshold: float = Field(
+        default=0.8,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Cosine similarity at or above which a new signal is another occurrence "
+            "of a recorded friction of the same kind."
+        ),
+    )
+    max_occurrences_kept: int = Field(
+        default=50,
+        ge=1,
+        description="Most recent occurrences kept on one friction record (the total is kept).",
+    )
+    ledger_prefix: str = Field(
+        default="friction",
+        min_length=1,
+        description="Mímir path prefix for friction records.",
+    )
+
+
+class SelfImprovementConfig(BaseModel):
+    """The proactive loop that acts on recorded friction without being asked.
+
+    Runs in the resident consolidation dream after learning curation. It
+    judges whether past improvements worked, then chooses at most
+    ``max_actions`` new ones for recurring friction, each with an explicit
+    expected benefit. Learning actions (promote, rewrite, retire) use Ravn's
+    evidence gates. A tool commission or a defect ticket is dispatched as an
+    ordinary resident task, so it passes the same persona tool permissions,
+    build_tool autonomy/review, and branch rules as any other turn — this loop
+    has no privileged path of its own. Needs friction capture and learning
+    curation.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description="Choose and take self-improvement actions during consolidation dreams.",
+    )
+    max_actions: int = Field(
+        default=2,
+        ge=1,
+        description="Most improvement actions one pass may take.",
+    )
+    min_occurrences: int = Field(
+        default=2,
+        ge=1,
+        description="Occurrences before a friction counts as recurring and is worth acting on.",
+    )
+    max_candidates: int = Field(
+        default=8,
+        ge=1,
+        description="Recurring frictions shown to the planner in one pass.",
+    )
+    allowed_actions: list[
+        Literal[
+            "promote_learning",
+            "rewrite_learning",
+            "retire_belief",
+            "commission_tool",
+            "file_defect",
+        ]
+    ] = Field(
+        default_factory=lambda: [
+            "promote_learning",
+            "rewrite_learning",
+            "retire_belief",
+            "commission_tool",
+            "file_defect",
+        ],
+        description="Improvement actions the planner may choose.",
+    )
+    evaluation_window_seconds: float = Field(
+        default=3 * 24 * 3600.0,
+        gt=0.0,
+        description="How long after an action its friction is watched before it is judged.",
+    )
+    recurrence_threshold: int = Field(
+        default=2,
+        ge=1,
+        description=(
+            "Recurrences inside the evaluation window that make an action ineffective. "
+            "Ineffective learnings are demoted and the action is never retried for that "
+            "friction."
+        ),
+    )
+    redirect_delay_seconds: float = Field(
+        default=60.0,
+        ge=0.0,
+        description=(
+            "When the resident asks the operator about friction it already addressed, "
+            "it is woken again this many seconds later with the known resolution instead; "
+            "asking again in the same case reaches the operator and counts against the fix."
+        ),
+    )
+    task_persona: str = Field(
+        default="",
+        description="Persona for dispatched improvement tasks; empty uses the resident's default.",
+    )
+    task_priority: int = Field(
+        default=10,
+        description="Drive-loop priority of dispatched improvement tasks.",
+    )
+    defect_team: str = Field(
+        default="NIU",
+        min_length=1,
+        description="Tracker team for platform-defect tickets.",
+    )
+    defect_labels: list[str] = Field(
+        default_factory=lambda: ["platform-defect"],
+        description="Labels for platform-defect tickets.",
+    )
+    audit_prefix: str = Field(
+        default="self-improvement",
+        min_length=1,
+        description="Mímir path prefix for the 'what I improved and why' records.",
+    )
+
+
 class PostSessionReflectionConfig(BaseModel):
     """Post-session reflection configuration (NIU-588).
 
@@ -2864,6 +3004,8 @@ class PostSessionReflectionConfig(BaseModel):
     matching: LearningMatchingConfig = Field(default_factory=LearningMatchingConfig)
     verified_promotion: VerifiedPromotionConfig = Field(default_factory=VerifiedPromotionConfig)
     curation: LearningCurationConfig = Field(default_factory=LearningCurationConfig)
+    friction: FrictionConfig = Field(default_factory=FrictionConfig)
+    self_improvement: SelfImprovementConfig = Field(default_factory=SelfImprovementConfig)
 
 
 class RecapConfig(BaseModel):

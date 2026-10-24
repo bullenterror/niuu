@@ -1,10 +1,14 @@
-# Resident Learning Consolidation
+# Resident Learning and Self-Improvement
 
-A resident learns from its own sessions without anyone editing its persona.
-After every session, post-session reflection records one candidate lesson.
-This page covers how candidates become promoted, in-prompt learnings: matching
-by meaning, evidence-weighted promotion, the curation pass in the
-consolidation dream, and the injection budget.
+A resident learns from its own sessions and acts on its own friction without
+anyone editing its persona. These are two halves of one loop. The **learning
+loop** decides what the resident has learned. After every session, reflection
+records a candidate lesson, which is matched by meaning, promoted on evidence,
+curated in the dream, and injected within a budget. The **self-improvement
+loop** uses that to act. It records the friction the resident keeps hitting,
+chooses a few improvements with an explicit expected benefit, checks whether
+they helped, and stops the resident from asking the operator about walls it
+has already dealt with.
 
 ## Why
 
@@ -67,6 +71,72 @@ the next turn still reported that it could not inspect the patch.
    capped at `learning_entry_max_chars`, all within `learning_token_budget`
    and `max_learnings_injected`.
 
+## The self-improvement loop
+
+5. **Friction capture** (`reflection.friction.enabled`). Every session's
+   friction is read from its own record, never from the model's account of it:
+   - from tool results: `tool_failure`, `timeout`, `retry`,
+     `budget_exhausted`, and `route_recovery`, which is a workaround (a failed
+     route that was bypassed);
+   - from the outcome contract: `escalation` (`continuation: ask_operator` or
+     `decision: escalate`), `capability_gap` (`working_state.capability_gaps`)
+     and `blocked`.
+
+   Signals of the same kind that embed at or above `similarity_threshold` are
+   occurrences of one friction record at `friction/<kind>/<slug>.md`. Reflection
+   lists the session's friction to the model, and the model says which items the
+   lesson would prevent (`addresses_friction`). Those friction records are
+   linked to the lesson.
+6. **Self-improvement pass** (`reflection.self_improvement.enabled`). This runs
+   in the consolidation dream, right after curation:
+   - **Judge earlier actions.** An action is *ineffective* when its friction
+     comes back `recurrence_threshold` times inside
+     `evaluation_window_seconds`. For escalations this means the operator was
+     asked anyway after the resident was redirected. Ineffective learnings are
+     demoted (`status: demoted`), and the same action is never retried for that
+     friction. An action whose friction stays quiet for the whole window is
+     *effective*. That is recorded as evidence on the learning it relied on, and
+     the friction is `resolved`.
+   - **Adopt learnings.** A friction linked to a promoted learning is now
+     addressed by that learning (action `learned`).
+   - **Choose at most `max_actions`** for recurring friction (`min_occurrences`)
+     that nothing addresses yet. Each choice needs an expected benefit:
+     - `promote_learning` and `rewrite_learning`;
+     - `retire_belief`, for a stale belief or capability-gap claim;
+     - `commission_tool`, for a recurring need no capability covers, via
+       `build_tool`;
+     - `file_defect`, when the platform itself is at fault (`tracker_issue`,
+       team `defect_team`, labels `defect_labels`).
+
+     Proposals the model gets wrong are rejected and listed, not acted on: an
+     unknown friction, a disallowed action, a missing benefit, or an action
+     already tried.
+7. **No new privileged path.** Learning actions go through Ravn's own evidence
+   gates. A tool commission or a ticket is dispatched to the drive loop as an
+   ordinary resident task. It runs with the persona's tool permissions, through
+   `build_tool`'s autonomy, review and canary policy, and under the persona's
+   branch rule, like any other turn.
+8. **No repeat escalations.** Before a question reaches the operator, the
+   resident runtime asks the friction ledger whether the resident already
+   addressed that friction. If so, the case sleeps for `redirect_delay_seconds`
+   and wakes with the resolution: the learned procedure, the commissioned
+   tool's task, or the filed defect. This happens once per case. A second ask
+   in the same case reaches the operator, and it counts against the
+   resolution.
+9. **Audit and telemetry.** Every pass that does anything writes
+   `self-improvement/<ts>.md`, a "what I improved and why" brief. It has four
+   parts: did earlier improvements help, what changed and the expected benefit,
+   proposals not acted on, and recurring friction still open. The following
+   counters are emitted, each with a matching span event:
+   - `ravn.friction.recorded`
+   - `ravn.self_improvement.{chosen,acted,rejected,evaluated}`
+   - `ravn.resident.escalations_redirected`
+   - `ravn.resident.escalations_despite_resolution`
+
+Ownership stays in Ravn (`.claude/rules/ravn-niuu-boundary.md`). Ravn makes
+the friction judgment, picks the improvements, and decides the learning
+policy. Niuu only supplies the Mímir and embedding adapters.
+
 ## Configuration
 
 ```yaml
@@ -95,6 +165,27 @@ reflection:
     route_recovery_promotes: true
     max_route_recoveries: 5
     excerpt_chars: 240
+  friction:
+    enabled: true
+    max_signals: 10                   # tool-level signals per session
+    similarity_threshold: 0.8
+    max_occurrences_kept: 50
+    ledger_prefix: friction
+  self_improvement:
+    enabled: true                     # needs friction + curation
+    max_actions: 2
+    min_occurrences: 2
+    max_candidates: 8
+    allowed_actions: [promote_learning, rewrite_learning, retire_belief,
+                      commission_tool, file_defect]
+    evaluation_window_seconds: 259200 # 3 days
+    recurrence_threshold: 2
+    redirect_delay_seconds: 60
+    task_persona: ""                  # empty = the resident's default persona
+    task_priority: 10
+    defect_team: NIU
+    defect_labels: [platform-defect]
+    audit_prefix: self-improvement
   curation:
     enabled: true                     # needs resident_wakefulness.enabled
     min_interval_seconds: 86400
@@ -113,7 +204,11 @@ These are startup errors, never a silent fall back to lexical matching:
 - `matching.mode: semantic` or `curation.enabled: true` without
   `embedding.enabled: true`;
 - either one on a runtime with no native LLM for the judge;
-- `curation.enabled: true` when resident wakefulness is not running.
+- `curation.enabled: true` when resident wakefulness is not running;
+- `friction.enabled` without embeddings;
+- `self_improvement.enabled` without `friction` and `curation`;
+- `self_improvement.enabled` with `commission_tool` or `file_defect` allowed
+  but no drive loop to dispatch them.
 
 When the judge returns malformed output after `judge_attempts` tries, the
 reflection or curation pass raises instead of recording a duplicate. A failed
@@ -142,3 +237,9 @@ procedural rewrites.
 
 Before trusting the result, check the audit page for supersessions. Each line
 says which evidence decided the contradiction.
+
+The friction ledger starts empty. Friction is recorded from sessions that end
+after `friction.enabled` is turned on; past escalations are not replayed into
+it. Once the backfill has promoted a procedure, its friction is linked to that
+procedure as soon as the resident hits it again, and the next dream adopts it.
+

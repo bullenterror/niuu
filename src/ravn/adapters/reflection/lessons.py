@@ -224,15 +224,24 @@ class LessonIndex:
 
     async def max_similarity(self, text: str, others: list[str]) -> float:
         """Highest cosine similarity between *text* and any of *others*."""
+        return max(await self.similarities(text, others), default=0.0)
+
+    async def similarities(self, text: str, others: list[str]) -> list[float]:
+        """Cosine similarity of *text* to each of *others*, in order."""
         if not others:
-            return 0.0
-        vectors = await self._embedding.embed_batch([text, *others])
-        if len(vectors) != len(others) + 1:
-            raise RuntimeError(
-                f"embedding adapter returned {len(vectors)} vectors for "
-                f"{len(others) + 1} texts; refusing to compare evidence on a misaligned batch"
-            )
-        return max(cosine(vectors[0], vector) for vector in vectors[1:])
+            return []
+        texts = [text, *others]
+        vectors: list[list[float]] = []
+        for start in range(0, len(texts), self._batch_size):
+            chunk = texts[start : start + self._batch_size]
+            embedded = await self._embedding.embed_batch(chunk)
+            if len(embedded) != len(chunk):
+                raise RuntimeError(
+                    f"embedding adapter returned {len(embedded)} vectors for "
+                    f"{len(chunk)} texts; refusing to compare on a misaligned batch"
+                )
+            vectors.extend(embedded)
+        return [cosine(vectors[0], vector) for vector in vectors[1:]]
 
     async def similar_pairs(
         self,

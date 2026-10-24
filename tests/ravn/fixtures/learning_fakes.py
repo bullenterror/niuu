@@ -87,15 +87,30 @@ def is_github(text: str) -> bool:
 class ScriptedLLM:
     """Reflection answers from a script; judge answers by rule over the prompt."""
 
-    def __init__(self, reflections: list[dict | None] | None = None) -> None:
+    def __init__(
+        self,
+        reflections: list[dict | None] | None = None,
+        plan: object = None,
+    ) -> None:
         self.reflections = list(reflections or [])
         self.prompts: list[str] = []
         self.judge_calls = 0
+        # A planner answer (dict) or a callable(prompt) -> dict; default: commission
+        # a tool for every recurring capability gap, nothing else.
+        self.plan = plan
 
     async def generate(self, messages, tools, system, model, max_tokens):  # noqa: ARG002
         prompt = messages[0]["content"]
         self.prompts.append(prompt)
-        if "Recorded lessons:" in prompt:
+        if "reviewing friction you keep hitting" in prompt:
+            self.judge_calls += 1
+            if callable(self.plan):
+                answer = self.plan(prompt)
+            elif self.plan is not None:
+                answer = self.plan
+            else:
+                answer = commission_capability_gaps(prompt)
+        elif "Recorded lessons:" in prompt:
             self.judge_calls += 1
             answer: object = _match(prompt)
         elif "Compare two lessons" in prompt:
@@ -109,6 +124,26 @@ class ScriptedLLM:
         response = MagicMock()
         response.content = json.dumps(answer)
         return response
+
+
+def commission_capability_gaps(prompt: str) -> dict:
+    """Planner rule: a recurring capability gap gets a tool commission."""
+    actions = [
+        {
+            "friction": f"F{number}",
+            "action": "commission_tool",
+            "lesson": None,
+            "need": subject.strip(),
+            "expected_benefit": "the need is met by a tool instead of an operator",
+            "rationale": "no existing capability covers this recurring need",
+        }
+        for number, subject in re.findall(
+            r"^\[F(\d+)\] capability_gap, seen \d+ time\(s\), last [^:]*: (.*)$",
+            prompt,
+            flags=re.MULTILINE,
+        )
+    ]
+    return {"actions": actions}
 
 
 def _same_family(left: str, right: str) -> bool:

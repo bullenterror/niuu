@@ -178,8 +178,10 @@ from ravn.cli.runtime_builders import (  # noqa: E402, F401
     _RealmBuildConfig,
     _attach_agent_build_tool,
     _build_executor,
+    _build_friction_ledger,
     _build_learning_consolidation,
     _build_learning_curator,
+    _build_self_improvement,
     _build_llm,
     _build_memory,
     _build_mimir,
@@ -589,6 +591,9 @@ def _build_agent(
         learning_entry_max_chars=settings.reflection.learning_entry_max_chars,
         max_route_recoveries=settings.reflection.verified_promotion.max_route_recoveries,
         route_excerpt_chars=settings.reflection.verified_promotion.excerpt_chars,
+        max_friction_signals=(
+            settings.reflection.friction.max_signals if settings.reflection.friction.enabled else 0
+        ),
         episode_summary_max_chars=settings.agent.episode_summary_max_chars,
         episode_task_max_chars=settings.agent.episode_task_max_chars,
         iteration_budget=iteration_budget,
@@ -740,6 +745,9 @@ async def _run_with_signals(
                 config=settings.effective_post_session_reflection_config(),
                 lessons=_refl_consolidation.lessons if _refl_consolidation else None,
                 judge=_refl_consolidation.judge if _refl_consolidation else None,
+                friction=_build_friction_ledger(
+                    settings, mimir=_refl_mimir, consolidation=_refl_consolidation
+                ),
             )
             await reflection_svc.start()
 

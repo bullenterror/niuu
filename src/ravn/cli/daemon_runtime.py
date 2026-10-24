@@ -65,6 +65,9 @@ async def _run_daemon(
     daemon_mimir = _build_mimir(settings)
     memory = _with_mimir_fact_capture(memory, daemon_mimir)
     learning_consolidation = _build_learning_consolidation(settings, llm)
+    friction_ledger = _build_friction_ledger(
+        settings, mimir=daemon_mimir, consolidation=learning_consolidation
+    )
 
     # Resolve the resident's charter once, before any consumer (this runtime,
     # EnvironmentSignalRuntime's triage prompts, resident context, the HUD
@@ -97,6 +100,9 @@ async def _run_daemon(
             settings,
             state=resident_state,
             inbox=resident_inbox,
+            known_resolutions=(
+                friction_ledger if settings.reflection.self_improvement.enabled else None
+            ),
         )
 
     # What the resident wants its owner to hear about (questions it waits on, its
@@ -337,6 +343,11 @@ async def _run_daemon(
             learning_entry_max_chars=settings.reflection.learning_entry_max_chars,
             max_route_recoveries=settings.reflection.verified_promotion.max_route_recoveries,
             route_excerpt_chars=settings.reflection.verified_promotion.excerpt_chars,
+            max_friction_signals=(
+                settings.reflection.friction.max_signals
+                if settings.reflection.friction.enabled
+                else 0
+            ),
             episode_summary_max_chars=settings.agent.episode_summary_max_chars,
             episode_task_max_chars=settings.agent.episode_task_max_chars,
             iteration_budget=budget,
@@ -620,12 +631,25 @@ async def _run_daemon(
         mimir=daemon_mimir,
         consolidation=learning_consolidation,
     )
+    self_improvement = _build_self_improvement(
+        settings,
+        mimir=daemon_mimir,
+        consolidation=learning_consolidation,
+        ledger=friction_ledger,
+        drive_loop=drive_loop,
+        resident_id=(
+            resident_runtime.resident_id
+            if resident_runtime is not None
+            else settings.environment.resident_name or settings.environment.id
+        ),
+    )
     resident_wakefulness = _build_resident_wakefulness(
         settings,
         resident_learning_runtime=resident_learning_runtime,
         publisher=environment_signal_publisher,
         memory=memory,
         learning_curator=learning_curator,
+        self_improvement=self_improvement,
     )
     if learning_curator is not None and resident_wakefulness is None:
         raise RuntimeError(
@@ -764,6 +788,7 @@ async def _run_daemon(
             config=settings.effective_post_session_reflection_config(),
             lessons=learning_consolidation.lessons if learning_consolidation else None,
             judge=learning_consolidation.judge if learning_consolidation else None,
+            friction=friction_ledger,
         )
         await daemon_reflection_svc.start()
 

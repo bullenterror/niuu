@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING
 
 from niuu.domain.mimir import MimirPage
 from niuu.ports.mimir import MimirPort
+from ravn.adapters.reflection.friction import friction_signals
 from ravn.adapters.reflection.lessons import (
     CANDIDATE_CATEGORY,
     LEARNING_CATEGORY,
@@ -42,6 +43,7 @@ from ravn.ports.llm import LLMPort
 from ravn.resident_text import compact_line, significant_words, texts_overlap, texts_similar
 
 if TYPE_CHECKING:
+    from ravn.adapters.reflection.friction import FrictionLedger, FrictionSignal
     from ravn.adapters.reflection.lesson_judge import LessonJudge
     from sleipnir.domain.events import SleipnirEvent
     from sleipnir.ports.events import SleipnirSubscriber, Subscription
@@ -111,6 +113,10 @@ Route recoveries recorded from this session's own tool results (a tool call \
 failed, then the same tool succeeded with different input):
 {route_recoveries}
 
+Friction recorded in this session (operator escalations, declared capability \
+gaps, failed, retried or timed-out tool routes):
+{friction}
+
 Questions to consider:
 {questions}
 
@@ -122,7 +128,9 @@ Respond with a single JSON object:
   "tags":     ["tag1", "tag2"],
   "evidence": "one sentence describing what this session revealed",
   "verified_by_recovery": number of the route recovery above that this learning \
-restates, or null
+restates, or null,
+  "addresses_friction": [numbers of the friction items above that acting on this \
+learning would prevent next time]
 }}
 
 Only cite a route recovery when the learning is exactly what it shows: the \
@@ -172,6 +180,7 @@ class PostSessionReflectionService:
         *,
         lessons: LessonIndex | None = None,
         judge: LessonJudge | None = None,
+        friction: FrictionLedger | None = None,
     ) -> None:
         if config.matching.mode == "semantic" and (lessons is None or judge is None):
             raise ValueError(
@@ -179,6 +188,13 @@ class PostSessionReflectionService:
                 "provided; enable embedding (embedding.enabled: true) so lessons can be "
                 "compared by meaning, or set reflection.matching.mode: lexical"
             )
+        if config.friction.enabled and friction is None:
+            raise ValueError(
+                "reflection.friction.enabled is true but no friction ledger was provided; "
+                "friction is clustered by meaning, so enable embedding and semantic "
+                "matching, or set reflection.friction.enabled: false"
+            )
+        self._friction = friction
         self._subscriber = subscriber
         self._mimir = mimir
         self._llm = llm
@@ -306,21 +322,38 @@ class PostSessionReflectionService:
         session_id = payload.get("session_id", "unknown")
         logger.info("PostSessionReflectionService: reflecting on session %s", session_id)
 
-        learning = await self._run_reflection(payload)
+        signals = (
+            friction_signals(payload, excerpt_chars=self._config.verified_promotion.excerpt_chars)
+            if self._friction is not None
+            else []
+        )
+        learning = await self._run_reflection(payload, signals)
+        lesson_path = ""
         if learning is None:
             logger.info(
                 "PostSessionReflectionService: no learning extracted for session %s",
                 session_id,
             )
-            return
+        else:
+            lesson_path = await self._write_learning(learning, payload)
 
-        await self._write_learning(learning, payload)
+        if self._friction is not None:
+            links = (
+                {index: lesson_path for index in _addressed_friction(learning, len(signals))}
+                if learning is not None and lesson_path
+                else {}
+            )
+            await self._friction.record(signals, session_id=str(session_id), links=links)
 
     # ------------------------------------------------------------------
     # LLM reflection
     # ------------------------------------------------------------------
 
-    async def _run_reflection(self, payload: dict) -> dict | None:
+    async def _run_reflection(
+        self,
+        payload: dict,
+        signals: list[FrictionSignal] | None = None,
+    ) -> dict | None:
         """Call the LLM and parse the structured learning JSON."""
         repo_slug = str(payload.get("repo_slug") or "").strip()
         work_context = {
@@ -346,6 +379,7 @@ class PostSessionReflectionService:
             repo_line=f"  repo_slug:   {repo_slug}" if repo_slug else "",
             work_context=rendered_context,
             route_recoveries=_render_route_recoveries(_route_recoveries(payload)),
+            friction=_render_friction(signals or []),
             questions=_REPO_QUESTIONS if repo_slug else _GENERIC_QUESTIONS,
         )
 
@@ -405,12 +439,16 @@ class PostSessionReflectionService:
     # Mímir write
     # ------------------------------------------------------------------
 
-    async def _write_learning(self, learning: dict, payload: dict) -> None:
-        """Record a candidate and promote it only when evidence qualifies."""
+    async def _write_learning(self, learning: dict, payload: dict) -> str:
+        """Record a candidate and promote it only when evidence qualifies.
+
+        Returns the path of the lesson the observation landed on (the new or
+        merged candidate, or the confirmed learning), or ``""`` if none.
+        """
         title = learning.get("title", "").strip()
         if not title:
             logger.warning("PostSessionReflectionService: LLM returned learning without title")
-            return
+            return ""
 
         repo_slug = payload.get("repo_slug", "")
         session_id = payload.get("session_id", "unknown")
@@ -426,7 +464,7 @@ class PostSessionReflectionService:
         if existing_page is not None:
             if existing_page.meta.category == LEARNING_CATEGORY:
                 await self._confirm_learning(existing_page, session_id=session_id, date=now)
-                return
+                return existing_page.meta.path
             evidence = str(learning.get("evidence", "") or "")
             updated = _merge_timeline_entry(
                 existing_page.content,
@@ -457,7 +495,7 @@ class PostSessionReflectionService:
                 payload=payload,
                 verified_recovery=recovery is not None,
             )
-            return
+            return existing_page.meta.path
 
         page_path = _build_candidate_path(title, repo_slug)
         content = _build_candidate_content(
@@ -481,6 +519,7 @@ class PostSessionReflectionService:
             payload=payload,
             verified_recovery=recovery is not None,
         )
+        return page_path
 
     async def _evidence_is_new_by_meaning(self, content: str, evidence: str) -> bool:
         """Whether *evidence* says something the lesson's timeline does not, by meaning."""
@@ -776,6 +815,32 @@ def _render_route_recoveries(recoveries: list[dict]) -> str:
         f"-> {item['failed_result']}; then succeeded with input {item['succeeded_input']}"
         for number, item in enumerate(recoveries, start=1)
     )
+
+
+def _render_friction(signals: list[FrictionSignal]) -> str:
+    if not signals:
+        return "(none recorded)"
+    return "\n".join(
+        f"[{number}] {signal.kind}: {signal.subject}"
+        + (f" ({compact_line(signal.detail, limit=160)})" if signal.detail else "")
+        for number, signal in enumerate(signals, start=1)
+    )
+
+
+def _addressed_friction(learning: dict, count: int) -> list[int]:
+    """0-based indices of the session's friction the reflection says this lesson prevents."""
+    raw = learning.get("addresses_friction")
+    if not isinstance(raw, list):
+        return []
+    indices: list[int] = []
+    for item in raw:
+        text = str(item).strip()
+        if isinstance(item, bool) or not text.isdigit():
+            continue
+        number = int(text)
+        if 1 <= number <= count and number - 1 not in indices:
+            indices.append(number - 1)
+    return indices
 
 
 def _cited_route_recovery(learning: dict, payload: dict) -> dict | None:

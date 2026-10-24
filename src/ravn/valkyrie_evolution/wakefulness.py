@@ -70,6 +70,7 @@ class ResidentWakefulness:
         memory: Any | None = None,
         review_requester: ReviewRequester | None = None,
         learning_curator: Any | None = None,
+        self_improvement: Any | None = None,
         tick_interval_seconds: float = DEFAULT_TICK_INTERVAL_SECONDS,
         wakeful_window_seconds: float = DEFAULT_WAKEFUL_WINDOW_SECONDS,
         dream_interval_seconds: float = DEFAULT_DREAM_INTERVAL_SECONDS,
@@ -86,6 +87,7 @@ class ResidentWakefulness:
         self._memory = memory
         self._review_requester = review_requester
         self._learning_curator = learning_curator
+        self._self_improvement = self_improvement
         self._tick_interval_seconds = tick_interval_seconds
         self._wakeful_window_seconds = wakeful_window_seconds
         self._dream_interval_seconds = dream_interval_seconds
@@ -292,7 +294,12 @@ class ResidentWakefulness:
         if self._learning_curator is None or not self._learning_curator.due():
             return {}
         report = await self._learning_curator.curate()
-        return report.summary()
+        summary = report.summary()
+        if self._self_improvement is not None:
+            # Acts on friction with the learnings this pass just curated.
+            improvement = await self._self_improvement.run()
+            summary["self_improvement"] = improvement.summary()
+        return summary
 
     async def _file_promotion_review(
         self,

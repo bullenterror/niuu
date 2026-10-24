@@ -181,6 +181,10 @@ class LessonJudge:
             )
         return procedure
 
+    async def ask_json(self, prompt: str) -> dict:
+        """Ask the judge model a structured question; the answer is a JSON object."""
+        return await self._ask(prompt)
+
     def _describe(self, title: str, claim: str) -> str:
         return f"title: {compact_line(title, limit=self._excerpt_chars)}\n" + (
             f"claim: {compact_line(claim, limit=self._excerpt_chars)}"

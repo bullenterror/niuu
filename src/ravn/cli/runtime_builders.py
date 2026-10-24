@@ -637,14 +637,23 @@ def _build_learning_consolidation(settings: Settings, llm: Any) -> LearningConso
     instead is the paraphrase blindness the operator configured away from.
     """
     reflection = settings.effective_post_session_reflection_config()
-    if reflection.matching.mode != "semantic" and not reflection.curation.enabled:
+    wanted = [
+        name
+        for name, on in (
+            ("reflection.matching.mode: semantic", reflection.matching.mode == "semantic"),
+            ("reflection.curation.enabled", reflection.curation.enabled),
+            ("reflection.friction.enabled", reflection.friction.enabled),
+            ("reflection.self_improvement.enabled", reflection.self_improvement.enabled),
+        )
+        if on
+    ]
+    if not wanted:
         return None
     if not settings.embedding.enabled:
         raise RuntimeError(
-            "reflection.matching.mode is 'semantic' or reflection.curation.enabled is "
-            "true, but embedding.enabled is false. Lessons are compared by embedding; "
-            "enable and configure embedding, or set reflection.matching.mode: lexical "
-            "and reflection.curation.enabled: false."
+            f"{', '.join(wanted)} compare lessons and friction by embedding, but "
+            "embedding.enabled is false. Enable and configure embedding, or turn those "
+            "settings off (reflection.matching.mode: lexical)."
         )
     if llm is None:
         raise RuntimeError(
@@ -667,6 +676,65 @@ def _build_learning_consolidation(settings: Settings, llm: Any) -> LearningConso
             attempts=reflection.matching.judge_attempts,
             excerpt_chars=reflection.matching.judge_excerpt_chars,
         ),
+    )
+
+
+def _build_friction_ledger(
+    settings: Settings,
+    *,
+    mimir: Any,
+    consolidation: LearningConsolidation | None,
+) -> Any | None:
+    """Build the friction ledger when friction capture is enabled."""
+    reflection = settings.effective_post_session_reflection_config()
+    if not reflection.friction.enabled:
+        return None
+    if consolidation is None or mimir is None:
+        raise RuntimeError(
+            "reflection.friction.enabled is true but there is no Mímir mount or lesson "
+            "index to record friction in; configure mimir and embedding, or set "
+            "reflection.friction.enabled: false"
+        )
+    from ravn.adapters.reflection.friction import FrictionLedger  # noqa: PLC0415
+
+    return FrictionLedger(mimir=mimir, lessons=consolidation.lessons, config=reflection.friction)
+
+
+def _build_self_improvement(
+    settings: Settings,
+    *,
+    mimir: Any,
+    consolidation: LearningConsolidation | None,
+    ledger: Any | None,
+    drive_loop: Any | None,
+    resident_id: str,
+) -> Any | None:
+    """Build the self-improvement pass when it is enabled.
+
+    It acts on recorded friction with curated learnings, so it needs friction
+    capture and learning curation; either missing is a startup error.
+    """
+    reflection = settings.effective_post_session_reflection_config()
+    if not reflection.self_improvement.enabled:
+        return None
+    if ledger is None or consolidation is None or not reflection.curation.enabled:
+        raise RuntimeError(
+            "reflection.self_improvement.enabled is true but it acts on recorded friction "
+            "with curated learnings: enable reflection.friction and reflection.curation "
+            "(with embedding), or set reflection.self_improvement.enabled: false"
+        )
+    from ravn.adapters.reflection.self_improvement import SelfImprovementPass  # noqa: PLC0415
+
+    return SelfImprovementPass(
+        mimir=mimir,
+        ledger=ledger,
+        lessons=consolidation.lessons,
+        judge=consolidation.judge,
+        config=reflection.self_improvement,
+        procedure_max_chars=reflection.curation.procedure_max_chars,
+        resident_id=resident_id,
+        # Improvements that need a tool or a ticket run as ordinary resident tasks.
+        dispatch=drive_loop.enqueue if drive_loop is not None else None,
     )
 
 
