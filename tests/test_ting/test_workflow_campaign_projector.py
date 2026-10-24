@@ -730,6 +730,7 @@ async def test_reconnect_attributes_a_missed_peer_failure_by_persona() -> None:
     assert failed.metadata["failure_stage_id"] == "research-coordinate"
     assert failed.stage_state[1].status == "failed"
 
+
 @pytest.mark.asyncio
 async def test_authoritative_publish_supersedes_blocked_help_gate_without_attestation() -> None:
     """A retry that publishes a tool must close the earlier help-needed gate."""

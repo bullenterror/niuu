@@ -92,9 +92,7 @@ class WorkflowCampaignProjector:
         authoritative_completion = _authoritative_completion(
             event.metadata, completion_event=completion_event
         )
-        delivery = _authoritative_delivery(
-            event.metadata, completion_event=completion_event
-        )
+        delivery = _authoritative_delivery(event.metadata, completion_event=completion_event)
         if event.state == "error" or event.session_status in {"failed", "cancelled", "canceled"}:
             error = str(event.metadata.get("error") or event.metadata.get("message") or "").strip()
             if not error:
@@ -206,9 +204,7 @@ class WorkflowCampaignProjector:
         authoritative_completion = _authoritative_completion(
             activity_metadata, completion_event=completion_event
         )
-        delivery = _authoritative_delivery(
-            activity_metadata, completion_event=completion_event
-        )
+        delivery = _authoritative_delivery(activity_metadata, completion_event=completion_event)
         if (
             next_status != WorkflowCampaignStatus.FAILED
             and authoritative_completion is not None
