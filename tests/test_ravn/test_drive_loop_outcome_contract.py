@@ -2343,9 +2343,12 @@ rationale: delivery_evidence approval was denied
         dl._skuld_channel.emit.assert_awaited_once()
         error = dl._skuld_channel.emit.await_args.args[0]
         assert error.type == RavnEventType.ERROR
-        assert error.payload["failure_kind"] == "outcome_rejected"
-        assert "verdict 'blocked'" in error.payload["message"]
-        assert "delivery_evidence approval was denied" in error.payload["message"]
+        # A declared block is reported as one, with the agent's reason; it used
+        # to read as a malformed outcome ("cannot be accepted").
+        assert error.payload["failure_kind"] == "blocked"
+        assert error.payload["message"] == (
+            "Workflow node delivery-coordinate is blocked: delivery_evidence approval was denied"
+        )
 
     @pytest.mark.asyncio
     async def test_merges_tool_metadata_into_canonical_outcome(self) -> None:
