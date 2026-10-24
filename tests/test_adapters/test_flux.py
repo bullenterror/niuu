@@ -2855,3 +2855,15 @@ class TestStatusDetail:
         core_api.list_namespaced_event.return_value = SimpleNamespace(items=[])
         with patch.object(pod_manager, "_get_helmrelease", AsyncMock(return_value=None)):
             assert await pod_manager.status_detail(sample_session) is None
+
+    async def test_forbidden_events_name_the_missing_grant(
+        self, pod_manager: FluxPodManager, sample_session: Session, core_api: AsyncMock
+    ) -> None:
+        forbidden = Exception("Forbidden")
+        forbidden.status = 403
+        core_api.list_namespaced_event.side_effect = forbidden
+        with (
+            patch.object(pod_manager, "_get_helmrelease", AsyncMock(return_value=None)),
+            pytest.raises(RuntimeError, match="grant events get/list"),
+        ):
+            await pod_manager.status_detail(sample_session)

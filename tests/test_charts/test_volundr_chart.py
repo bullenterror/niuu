@@ -1095,6 +1095,25 @@ class TestConfigMapTemplate:
         cluster_role = next(doc for doc in documents if doc["kind"] == "ClusterRole")
         assert all("secrets" not in rule["resources"] for rule in cluster_role["rules"])
 
+    def test_cluster_wide_flux_may_read_session_pod_events(self):
+        """status_detail reads the pods' Warning events. valhalla runs
+        cluster-wide RBAC with no events rule: the read got 403 during
+        startup reconciliation and Völundr crash-looped."""
+        documents = self._rbac(
+            "--set",
+            "podManager.adapter=volundr.adapters.outbound.flux.FluxPodManager",
+            "--set",
+            "podManager.kwargs.namespace=skuld",
+            "--set",
+            "rbac.clusterWide=true",
+        )
+        cluster_role = next(doc for doc in documents if doc["kind"] == "ClusterRole")
+        assert {
+            "apiGroups": [""],
+            "resources": ["events"],
+            "verbs": ["get", "list", "watch"],
+        } in cluster_role["rules"]
+
     @pytest.mark.parametrize(
         "controller",
         [

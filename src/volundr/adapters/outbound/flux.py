@@ -407,10 +407,19 @@ class FluxPodManager(
 
     async def _latest_pod_warning(self, release_name: str) -> str | None:
         core = await self._get_core_api()
-        events = await core.list_namespaced_event(
-            self._namespace,
-            field_selector="type=Warning,involvedObject.kind=Pod",
-        )
+        try:
+            events = await core.list_namespaced_event(
+                self._namespace,
+                field_selector="type=Warning,involvedObject.kind=Pod",
+            )
+        except Exception as exc:
+            if getattr(exc, "status", None) != 403:
+                raise
+            raise RuntimeError(
+                f"Völundr may not list events in namespace {self._namespace!r}, which it "
+                "reads to say why a session did not start; grant events get/list there "
+                "(the volundr chart's Role, or its ClusterRole with rbac.clusterWide)"
+            ) from exc
         prefix = f"{release_name}-"
         mine = [
             event
