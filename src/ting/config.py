@@ -942,6 +942,40 @@ class EventsConfig(BaseModel):
     )
 
 
+class StaleCampaignConfig(BaseModel):
+    """When an unfinished workflow campaign is given up on, and how often to look.
+
+    A campaign that waits for an answer nobody sends, or whose session sits
+    idle, keeps its session pod. On a node shared by one owner's sessions
+    those pods starved every later launch: eight idle builder sessions held
+    93% of the node's memory for up to 19 hours. Expired campaigns fail with
+    the reason, which notifies the caller and stops the session. 0 disables a
+    check.
+    """
+
+    sweep_interval_seconds: float = Field(
+        default=300.0,
+        ge=0.0,
+        description="Seconds between sweeps of active campaigns; 0 disables the sweep.",
+    )
+    input_wait_timeout_seconds: float = Field(
+        default=6 * 3600.0,
+        ge=0.0,
+        description=(
+            "Fail a campaign that has waited this long for an answer to its "
+            "input request (A2A INPUT_REQUIRED); 0 never expires a wait."
+        ),
+    )
+    idle_timeout_seconds: float = Field(
+        default=2 * 3600.0,
+        ge=0.0,
+        description=(
+            "Fail a submitted or working campaign whose session has been idle, "
+            "or is gone, for this long; a busy session is never expired. 0 disables."
+        ),
+    )
+
+
 class A2AConfig(BaseModel):
     """Agent-to-Agent protocol surface (agent card + task endpoint)."""
 
@@ -1063,6 +1097,10 @@ class A2AConfig(BaseModel):
             "Public origin used for interface URLs on the agent card. "
             "Falls back to the request base URL when empty."
         ),
+    )
+    stale_campaigns: StaleCampaignConfig = Field(
+        default_factory=StaleCampaignConfig,
+        description="Expiry of campaigns stuck waiting for input or idle.",
     )
 
 

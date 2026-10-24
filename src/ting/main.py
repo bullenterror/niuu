@@ -1300,11 +1300,15 @@ def create_app(
             app.dependency_overrides[resolve_event_bus] = _resolve_event_bus
             app.dependency_overrides[dispatcher_resolve_event_bus] = _resolve_event_bus
 
+            stale_campaigns = settings.a2a.stale_campaigns
             workflow_campaign_projector = WorkflowCampaignProjector(
                 repo=workflow_campaign_repo,
                 volundr_factory=app.state.volundr_factory,
                 event_bus=event_bus,
                 push_dispatcher=a2a_push_dispatcher,
+                sweep_interval_seconds=stale_campaigns.sweep_interval_seconds,
+                input_wait_timeout_seconds=stale_campaigns.input_wait_timeout_seconds,
+                idle_timeout_seconds=stale_campaigns.idle_timeout_seconds,
             )
             app.state.workflow_campaign_projector = workflow_campaign_projector
             await workflow_campaign_projector.start()

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from niuu.domain.models import Principal
 from niuu.observability import get_observability
@@ -37,11 +38,18 @@ class WorkflowCampaignProjector:
         volundr_factory: VolundrFactory,
         event_bus: EventBusPort,
         push_dispatcher: A2APushDispatcherPort | None = None,
+        sweep_interval_seconds: float = 0.0,
+        input_wait_timeout_seconds: float = 0.0,
+        idle_timeout_seconds: float = 0.0,
     ) -> None:
         self._repo = repo
         self._volundr_factory = volundr_factory
         self._event_bus = event_bus
         self._push_dispatcher = push_dispatcher
+        self._sweep_interval = sweep_interval_seconds
+        self._input_wait_timeout = input_wait_timeout_seconds
+        self._idle_timeout = idle_timeout_seconds
+        self._sweep_task: asyncio.Task[None] | None = None
         self._running = False
 
     @property
@@ -50,11 +58,80 @@ class WorkflowCampaignProjector:
 
     async def start(self) -> None:
         self._running = True
+        if self._sweep_interval > 0 and (self._input_wait_timeout > 0 or self._idle_timeout > 0):
+            self._sweep_task = asyncio.create_task(self._sweep_forever())
         logger.info("Event-driven workflow campaign projector started")
 
     async def stop(self) -> None:
         self._running = False
+        if self._sweep_task is not None:
+            self._sweep_task.cancel()
+            try:
+                await self._sweep_task
+            except asyncio.CancelledError:
+                pass
+            self._sweep_task = None
         logger.info("Event-driven workflow campaign projector stopped")
+
+    async def _sweep_forever(self) -> None:
+        while True:
+            await asyncio.sleep(self._sweep_interval)
+            expired = await self.expire_stale_campaigns(now=datetime.now(UTC))
+            if expired:
+                logger.info("Expired %d stale workflow campaign(s)", expired)
+
+    async def expire_stale_campaigns(self, *, now: datetime) -> int:
+        """Fail campaigns stuck waiting for input or idle; return how many.
+
+        Events drive every other transition. Nothing emits an event for a
+        campaign nobody answers or a session that stops doing anything, so
+        those were never closed and their sessions held their nodes for good.
+        """
+        expired = 0
+        for campaign in await self._repo.list_active_campaigns():
+            try:
+                reason = await self._stale_reason(campaign, now=now)
+                if reason:
+                    await self._save_failure(campaign, {"error": reason})
+                    expired += 1
+            except Exception:
+                logger.error(
+                    "Could not check workflow campaign %s for expiry",
+                    campaign.slug,
+                    exc_info=True,
+                )
+        return expired
+
+    async def _stale_reason(self, campaign: WorkflowCampaign, *, now: datetime) -> str:
+        since = campaign.last_activity_at or campaign.updated_at
+        if campaign.status == WorkflowCampaignStatus.BLOCKED:
+            wait = timedelta(seconds=self._input_wait_timeout)
+            if self._input_wait_timeout <= 0 or now - since <= wait:
+                return ""
+            return (
+                f"No answer to the input request within {_hours(wait)}; the task was "
+                "closed and its session stopped. Start a new task to retry."
+            )
+        if campaign.status not in {WorkflowCampaignStatus.PENDING, WorkflowCampaignStatus.RUNNING}:
+            return ""
+        idle = timedelta(seconds=self._idle_timeout)
+        if self._idle_timeout <= 0 or now - since <= idle:
+            return ""
+        adapter = await self._campaign_adapter(campaign)
+        if adapter is None:
+            return ""
+        session = await adapter.get_session(campaign.session_id)
+        if session is None:
+            return f"Session {campaign.session_id} no longer exists; the task cannot finish."
+        if str(session.activity_state or "").lower() in _BUSY_ACTIVITY_STATES:
+            return ""
+        last_active = session.last_active or since
+        if now - last_active <= idle:
+            return ""
+        return (
+            f"Session idle for over {_hours(idle)} without finishing; the task was "
+            "closed and its session stopped."
+        )
 
     async def list_active_owner_ids(self) -> list[str]:
         return await self._repo.list_active_owner_ids()
@@ -381,6 +458,14 @@ class WorkflowCampaignProjector:
             if terminal_session_cleanup_needed(saved):
                 await self.cleanup_terminal_session(saved)
         _record_a2a_state_transition(saved)
+
+
+_BUSY_ACTIVITY_STATES = frozenset({"active", "tool_executing"})
+
+
+def _hours(span: timedelta) -> str:
+    hours = span.total_seconds() / 3600
+    return f"{hours:g} hour" + ("" if hours == 1 else "s")
 
 
 _PENDING_BLOCKER_STATUSES = frozenset({"", "pending", "open", "waiting", "help_needed", "blocked"})
