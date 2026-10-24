@@ -32,6 +32,7 @@ from ravn.domain.resident_continuation import (
 )
 from ravn.domain.resident_state import ResidentStatePort
 from ravn.odin.review import ReviewItem, ReviewKind, ReviewRequester
+from ravn.ports.known_resolutions import KnownResolutionPort
 from ravn.ports.resident_notifications import ResidentNotificationOutboxPort
 from ravn.ports.trigger import TriggerPort
 from ravn.resident_continuation import (
@@ -146,8 +147,12 @@ class ResidentRuntime:
         directed_messages_enabled: bool = True,
         environment_id: str = "",
         review_requester: ReviewRequester | None = None,
+        known_resolutions: KnownResolutionPort | None = None,
+        known_resolution_redirect_seconds: float = 60.0,
     ) -> None:
         self._state = state
+        self._known_resolutions = known_resolutions
+        self._known_resolution_redirect_seconds = max(0.0, float(known_resolution_redirect_seconds))
         self._inbox = inbox
         self._resident_id = resident_id.strip() or "resident"
         self._resident_personality = resident_personality.strip()
@@ -912,6 +917,20 @@ class ResidentRuntime:
                     budget_ref=budget_ref,
                     reason=budget_reason,
                 )
+            redirected = await self._redirect_to_known_resolution(
+                task=task,
+                record=record,
+                fields=fields,
+                case_id=case_id,
+                root_id=root_id,
+                turn_ref=turn_ref,
+                turn_index=turn_index,
+                mandate=mandate,
+                cumulative=cumulative,
+                budget_ref=budget_ref,
+            )
+            if redirected is not None:
+                return redirected
             return await self._ask_operator(
                 task=task,
                 record=record,
@@ -1202,6 +1221,83 @@ class ResidentRuntime:
             )
             queued += 1
         return queued
+
+    async def _redirect_to_known_resolution(
+        self,
+        *,
+        task: AgentTask,
+        record: ResidentTurnRecord,
+        fields: dict[str, Any],
+        case_id: str,
+        root_id: str,
+        turn_ref: str,
+        turn_index: int,
+        mandate: str,
+        cumulative: TokenUsage,
+        budget_ref: str,
+    ) -> ResidentTurnDisposition | None:
+        """Answer an escalation the resident already has a resolution for.
+
+        Once per case, the question goes back to the resident as a short
+        scheduled wake carrying what it already learned, commissioned, or
+        filed. Asking again in the same case reaches the operator, and that is
+        recorded against the resolution so an improvement that does not help
+        is found out and demoted.
+        """
+        if self._known_resolutions is None:
+            return None
+        question = _operator_question(fields, record)
+        resolution = await self._known_resolutions.resolution_for(question)
+        if resolution is None:
+            return None
+        telemetry = get_observability()
+        if not await self._known_resolutions.note_redirect(resolution.ref, case_id):
+            await self._known_resolutions.note_escalated_anyway(resolution.ref, case_id, question)
+            telemetry.count(
+                "ravn.resident.escalations_despite_resolution",
+                attributes={"ravn.resident.id": self._resident_id},
+                description="Escalations that reached the operator despite a known resolution.",
+            )
+            return None
+        wake_at = datetime.now(UTC) + timedelta(seconds=self._known_resolution_redirect_seconds)
+        # One line: it is stored as the wake's recorded reason and shown on waking.
+        instruction = " ".join(
+            f"Known resolution instead of asking the operator: {resolution.instruction}".split()
+        )
+        wake_ref, wake_at_text = await self._schedule_wake(
+            task=task,
+            fields={
+                **fields,
+                "next_action_timing": "scheduled_time",
+                "wake_at": wake_at.isoformat(),
+                "selected_next_action": instruction,
+            },
+            case_id=case_id,
+            root_id=root_id,
+            turn_ref=turn_ref,
+            turn_index=turn_index,
+            mandate=mandate,
+            cumulative=cumulative,
+        )
+        telemetry.count(
+            "ravn.resident.escalations_redirected",
+            attributes={"ravn.resident.id": self._resident_id},
+            description="Operator escalations answered by a resolution the resident already had.",
+        )
+        telemetry.event(
+            "ravn.resident.escalation_redirected",
+            attributes={"ravn.resident.case_id": case_id, "ravn.friction.ref": resolution.ref},
+            content={"question": question, "instruction": resolution.instruction},
+        )
+        return ResidentTurnDisposition(
+            kind=ContinuationDecisionKind.SLEEP,
+            case_id=case_id,
+            turn_ref=turn_ref,
+            budget_ref=budget_ref,
+            reason=f"known resolution ({resolution.ref}) instead of asking the operator",
+            wake_ref=wake_ref,
+            wake_at=wake_at_text,
+        )
 
     async def _ask_operator(
         self,
