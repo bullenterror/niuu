@@ -49,6 +49,7 @@ from ravn.ports.channel import ChannelPort
 from ravn.ports.checkpoint import CheckpointPort
 from ravn.ports.llm import LLMPort, SystemPrompt
 from ravn.ports.memory import MemoryPort
+from ravn.ports.native_compaction import NativeCompactionPort
 from ravn.ports.permission import PermissionPort
 from ravn.ports.tool import ToolPort
 from ravn.prompt_builder import PromptBuilder
@@ -125,6 +126,7 @@ class RavnAgent:
         episode_task_max_chars: int = 200,
         iteration_budget: IterationBudget | None = None,
         compressor: ContextCompressor | None = None,
+        native_compaction: NativeCompactionPort | None = None,
         prompt_builder: PromptBuilder | None = None,
         reflection_model: str = "claude-haiku-4-5-20251001",
         reflection_max_tokens: int = 4096,
@@ -192,7 +194,13 @@ class RavnAgent:
         self._episode_summary_max_chars = episode_summary_max_chars
         self._episode_task_max_chars = episode_task_max_chars
         self._iteration_budget = iteration_budget
+        if compressor is not None and native_compaction is not None:
+            raise ValueError(
+                "RavnAgent was given both a client-side compressor and native compaction; "
+                "a model's context is compacted by one of them, never both"
+            )
         self._compressor = compressor
+        self._native_compaction = native_compaction
         self._prompt_builder = prompt_builder
         # Set identity on prompt_builder if provided — this was missing and caused
         # empty system prompts when using PromptBuilder with personas.
@@ -661,6 +669,8 @@ class RavnAgent:
                             content=llm_response.content,
                             reasoning=llm_response.reasoning,
                             reasoning_details=llm_response.reasoning_details,
+                            provider_items=llm_response.provider_items,
+                            provider_protocol=llm_response.provider_protocol,
                         )
                     )
                     self._emit_native_harness_step(
@@ -685,6 +695,8 @@ class RavnAgent:
                         content=assistant_content,
                         reasoning=llm_response.reasoning,
                         reasoning_details=llm_response.reasoning_details,
+                        provider_items=llm_response.provider_items,
+                        provider_protocol=llm_response.provider_protocol,
                     )
                 )
 
@@ -1172,6 +1184,8 @@ class RavnAgent:
             to the compactor as an anchor so the structured state document can
             reference relevant past context.
         """
+        if self._native_compaction is not None:
+            return self._drop_natively_compacted_history()
         if self._compressor is None:
             return self._session.messages
 
@@ -1200,6 +1214,37 @@ class RavnAgent:
                 result.compression_count,
                 result.removed_message_count,
             )
+        return messages
+
+    def _drop_natively_compacted_history(self) -> list[Message]:
+        """Drop the history the provider's latest compaction item already carries.
+
+        With native compaction the provider compacts inside the request and
+        returns an opaque compaction item; everything before it is in that item.
+        Keeping it would grow the history — and the prompt estimate and the
+        checkpoint — without bound while the provider no longer reads it.
+        """
+        messages = self._session.messages
+        start = self._native_compaction.compaction_window_start(
+            [message.to_api_dict() for message in messages]
+        )
+        if start <= 0:
+            return messages
+        original_count = len(messages)
+        del messages[:start]
+        self._last_compression_result = CompressionResult(
+            original_count=original_count,
+            final_count=len(messages),
+            compression_count=1,
+            removed_message_count=start,
+        )
+        logger.info(
+            "Native compaction: dropped %d message(s) the provider's compaction item "
+            "supersedes (%d → %d)",
+            start,
+            original_count,
+            len(messages),
+        )
         return messages
 
     async def _maybe_save_snapshot(self, *, label: str = "") -> None:
@@ -1621,6 +1666,8 @@ class RavnAgent:
         accumulated_text = ""
         accumulated_reasoning = ""
         accumulated_reasoning_details: list[dict] = []
+        provider_items: list[dict] = []
+        provider_protocol = ""
         self._last_ttft_ms = None
         self._last_usage_available = False
         self._last_usage = None
@@ -1673,6 +1720,10 @@ class RavnAgent:
                 case StreamEventType.REASONING_DETAILS:
                     if event.reasoning_details:
                         accumulated_reasoning_details.extend(event.reasoning_details)
+                case StreamEventType.PROVIDER_ITEMS:
+                    if event.provider_items:
+                        provider_items.extend(event.provider_items)
+                        provider_protocol = event.provider_protocol
                 case StreamEventType.TOOL_CALL:
                     if event.tool_call:
                         tool_calls.append(event.tool_call)
@@ -1698,6 +1749,8 @@ class RavnAgent:
             usage=final_usage,
             reasoning=accumulated_reasoning,
             reasoning_details=accumulated_reasoning_details,
+            provider_items=provider_items,
+            provider_protocol=provider_protocol,
         )
 
     async def _execute_tool(self, tool_call: ToolCall) -> ToolResult:

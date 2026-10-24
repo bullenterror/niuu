@@ -30,6 +30,7 @@ import json
 import os
 from contextlib import suppress
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal
 
@@ -838,8 +839,36 @@ class IterationBudgetConfig(BaseModel):
     )
 
 
+class CompactionMode(StrEnum):
+    """Who compacts a model's context when it grows past the budget."""
+
+    RAVN = "ravn"
+    """Ravn's own ContextCompressor summarises older history client-side."""
+    NATIVE = "native"
+    """The provider compacts (OpenAI Responses / Anthropic compaction); Ravn never does."""
+    OFF = "off"
+    """Nobody compacts; the prompt budget check is the only guard."""
+
+
 class ContextManagementConfig(BaseModel):
     """Context compression and prompt-builder configuration."""
+
+    compaction: CompactionMode = Field(
+        default=CompactionMode.RAVN,
+        description=(
+            "Who compacts the context of models not listed in compaction_models: "
+            "'ravn' (Ravn's client-side compactor, the default), 'native' (the "
+            "provider's own compaction — the LLM adapter must support it, or startup "
+            "fails) or 'off'. Never both: with 'native' Ravn does not compact."
+        ),
+    )
+    compaction_models: dict[str, CompactionMode] = Field(
+        default_factory=dict,
+        description=(
+            "Per-model override of 'compaction', keyed by model id, e.g. "
+            "{'gpt-6-sol': 'native', 'Qwen/Qwen3.8-27B': 'ravn'}."
+        ),
+    )
 
     context_window_tokens: int = Field(
         default=0,
@@ -905,6 +934,10 @@ class ContextManagementConfig(BaseModel):
             "that overflows the model's context window."
         ),
     )
+
+    def compaction_for(self, model: str) -> CompactionMode:
+        """The compaction mode configured for *model*."""
+        return self.compaction_models.get(model, self.compaction)
 
     def effective_protect_last(self) -> int:
         """Return the protect_last value to pass to ContextCompressor.

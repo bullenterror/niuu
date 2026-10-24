@@ -70,6 +70,7 @@ class StreamEventType(StrEnum):
     MESSAGE_DONE = "message_done"
     THINKING = "thinking"  # Provider reasoning content
     REASONING_DETAILS = "reasoning_details"  # Opaque reasoning to hand back next step
+    PROVIDER_ITEMS = "provider_items"  # The turn's verbatim output in the provider's protocol
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +219,11 @@ class ToolResult:
     is_error: bool = False
 
 
+# Keys a message's api dict carries its provider items under (see Message).
+PROVIDER_ITEMS_KEY = "provider_items"
+PROVIDER_PROTOCOL_KEY = "provider_protocol"
+
+
 @dataclass(frozen=True)
 class Message:
     """A single message in a conversation.
@@ -228,12 +234,22 @@ class Message:
     kept verbatim and sent back with this message on later requests so the
     provider continues that reasoning instead of re-deriving it. Empty when the
     provider returned none, which is every provider that does not do this.
+
+    ``provider_items`` is the assistant turn exactly as the provider returned it,
+    in its own protocol (named by ``provider_protocol``): OpenAI Responses output
+    items, or Anthropic content blocks. It is kept when the adapter speaks a
+    protocol whose state lives in those items — encrypted reasoning, and the
+    opaque ``compaction`` items of provider-native compaction — and an adapter of
+    the same protocol replays it verbatim instead of rebuilding the turn from
+    ``content``. ``content`` stays Ravn's readable view of the same turn.
     """
 
     role: str  # "user" or "assistant"
     content: str | list[dict]
     reasoning: str = ""
     reasoning_details: list[dict[str, Any]] = field(default_factory=list)
+    provider_items: list[dict[str, Any]] = field(default_factory=list)
+    provider_protocol: str = ""
 
     def to_api_dict(self) -> dict[str, Any]:
         """Return the transport-neutral message representation."""
@@ -242,6 +258,9 @@ class Message:
             message["reasoning"] = self.reasoning
         if self.reasoning_details:
             message["reasoning_details"] = self.reasoning_details
+        if self.provider_items:
+            message[PROVIDER_ITEMS_KEY] = self.provider_items
+            message[PROVIDER_PROTOCOL_KEY] = self.provider_protocol
         return message
 
     @classmethod
@@ -252,6 +271,8 @@ class Message:
             content=raw["content"],
             reasoning=raw.get("reasoning", ""),
             reasoning_details=raw.get("reasoning_details", []),
+            provider_items=raw.get(PROVIDER_ITEMS_KEY, []),
+            provider_protocol=raw.get(PROVIDER_PROTOCOL_KEY, ""),
         )
 
 
@@ -265,6 +286,8 @@ class LLMResponse:
     usage: TokenUsage
     reasoning: str = ""
     reasoning_details: list[dict[str, Any]] = field(default_factory=list)
+    provider_items: list[dict[str, Any]] = field(default_factory=list)
+    provider_protocol: str = ""
 
 
 @dataclass(frozen=True)
@@ -276,6 +299,9 @@ class StreamEvent:
     tool_call: ToolCall | None = None
     usage: TokenUsage | None = None
     reasoning_details: list[dict[str, Any]] | None = None
+    # PROVIDER_ITEMS: the whole turn's output items and the protocol they are in.
+    provider_items: list[dict[str, Any]] | None = None
+    provider_protocol: str = ""
 
 
 @dataclass(frozen=True)

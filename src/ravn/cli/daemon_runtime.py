@@ -55,7 +55,10 @@ async def _run_daemon(
     cli_transport_executor = _uses_cli_transport_executor(persona_config)
     llm = None if cli_transport_executor else _build_llm(settings)
     memory = _build_memory(settings)
-    compressor = None if cli_transport_executor else _build_compressor(settings, llm)
+    # Built here for the persona's own model so an impossible compaction setting
+    # fails at startup; each task builds its own for the model it runs on.
+    if llm is not None:
+        _build_compaction(settings, llm, base_model)
     pre_hooks, post_hooks = _build_hooks(settings)
 
     mcp_manager: Any | None = None
@@ -318,6 +321,9 @@ async def _run_daemon(
             resolved_persona,
             cli_transport_executor=_uses_cli_transport_executor(resolved_persona),
         )
+        compressor, native_compaction = (
+            _build_compaction(settings, llm, resolved_model) if llm is not None else (None, None)
+        )
         agent = executor.build(
             llm=llm,
             tools=tools,
@@ -352,6 +358,7 @@ async def _run_daemon(
             episode_task_max_chars=settings.agent.episode_task_max_chars,
             iteration_budget=budget,
             compressor=compressor,
+            native_compaction=native_compaction,
             prompt_builder=_build_prompt_builder(settings),
             reflection_model=settings.effective_memory_reflection_model(),
             reflection_max_tokens=settings.memory.reflection_max_tokens,

@@ -209,6 +209,7 @@ from ravn.cli.runtime_builders import (  # noqa: E402, F401
 from ravn.cli.tool_builders import (  # noqa: E402, F401
     _MIMIR_TOOL_NAMES,
     _apply_trust_filter,
+    _build_compaction,
     _build_compressor,
     _build_hooks,
     _build_prompt_builder,
@@ -553,7 +554,9 @@ def _build_agent(
         persona_config=persona_config,
         permission=permission,
     )
-    compressor = None if cli_transport_executor else _build_compressor(settings, llm)
+    compressor, native_compaction = (
+        (None, None) if cli_transport_executor else _build_compaction(settings, llm, resolved_model)
+    )
     prompt_builder = _build_prompt_builder(settings)
     pre_hooks, post_hooks = _build_hooks(settings)
     checkpoint_port = _build_checkpoint(settings)
@@ -598,6 +601,7 @@ def _build_agent(
         episode_task_max_chars=settings.agent.episode_task_max_chars,
         iteration_budget=iteration_budget,
         compressor=compressor,
+        native_compaction=native_compaction,
         prompt_builder=prompt_builder,
         reflection_model=settings.effective_memory_reflection_model(),
         reflection_max_tokens=settings.memory.reflection_max_tokens,
@@ -1484,7 +1488,9 @@ async def _run_gateway(
     cli_transport_executor = _uses_cli_transport_executor(persona_config)
     llm = None if cli_transport_executor else _build_llm(settings)
     memory = _build_memory(settings, llm=llm)
-    compressor = None if cli_transport_executor else _build_compressor(settings, llm)
+    compressor, native_compaction = (
+        (None, None) if cli_transport_executor else _build_compaction(settings, llm, resolved_model)
+    )
     prompt_builder = _build_prompt_builder(settings)
     pre_hooks, post_hooks = _build_hooks(settings)
 
@@ -1557,6 +1563,7 @@ async def _run_gateway(
             episode_task_max_chars=settings.agent.episode_task_max_chars,
             iteration_budget=budget,
             compressor=compressor,
+            native_compaction=native_compaction,
             prompt_builder=prompt_builder,
             reflection_model=settings.effective_memory_reflection_model(),
             reflection_max_tokens=settings.memory.reflection_max_tokens,

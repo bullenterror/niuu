@@ -57,6 +57,7 @@ import httpx
 from niuu.observability import get_observability
 from niuu.ports.http_auth import HttpAuthPort
 from niuu.utils import import_class
+from ravn.adapters.llm.provider_items import refuse_foreign_compaction, without_provider_keys
 from ravn.budget import TokenEstimator
 from ravn.domain.exceptions import LLMError
 from ravn.domain.models import (
@@ -73,6 +74,8 @@ logger = logging.getLogger(__name__)
 
 _RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503})
 _DEFAULT_BASE_URL = "https://api.openai.com"
+# The protocol this adapter speaks, as provider_items name it.
+_CHAT_COMPLETIONS = "openai_chat_completions"
 
 # OpenAI reasoning-era models reject the legacy ``max_tokens`` parameter and
 # require ``max_completion_tokens`` instead. OpenAI-compatible servers (vLLM,
@@ -406,7 +409,10 @@ class OpenAICompatibleAdapter(LLMPort):
         Anthropic-format tool_use / tool_result content blocks are converted
         to OpenAI-format tool_calls and role=tool messages.
         """
-        converted = _convert_anthropic_messages(messages)
+        # Another protocol's verbatim items cannot go on a Chat Completions wire;
+        # a compaction item among them holds context that would be lost with it.
+        refuse_foreign_compaction(messages, _CHAT_COMPLETIONS, type(self).__name__)
+        converted = _convert_anthropic_messages([without_provider_keys(m) for m in messages])
 
         system_text = _system_to_string(system)
         if self._system_prefix:
