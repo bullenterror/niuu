@@ -6,6 +6,7 @@ Tools:
   mimir_query   — search the wiki and synthesise an answer
   mimir_read    — read a specific wiki page
   mimir_write   — create or update a wiki page
+  mimir_publish_artifact — publish a JSON capability artifact
   mimir_publish_files — publish workspace markdown files into the wiki
   mimir_search  — full-text search, returns list of matching pages
   mimir_lint    — health-check: orphans, contradictions, staleness, gaps
@@ -13,6 +14,7 @@ Tools:
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
@@ -566,6 +568,109 @@ class MimirWriteTool(ToolPort):
 
 
 # ---------------------------------------------------------------------------
+# mimir_publish_artifact
+# ---------------------------------------------------------------------------
+
+
+class MimirPublishArtifactTool(ToolPort):
+    """Publish a JSON capability artifact to the durable capabilities store."""
+
+    def __init__(self, adapter: MimirPort) -> None:
+        self._adapter = adapter
+
+    @property
+    def name(self) -> str:
+        return "mimir_publish_artifact"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Publish a JSON capability artifact to the durable capabilities store and verify "
+            "the exact content can be read back. This is for capabilities/*.json artifacts; "
+            "use mimir_write only for Markdown wiki pages."
+        )
+
+    @property
+    def input_schema(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": (
+                        "Capability artifact path relative to the durable store, e.g. "
+                        "'capabilities/build-widget/learned_tool.json'."
+                    ),
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Exact JSON object content to publish.",
+                },
+                "mimir": {
+                    "type": "string",
+                    "description": "Optional named Mímir instance for the durable artifact store.",
+                },
+            },
+            "required": ["path", "content"],
+        }
+
+    @property
+    def required_permission(self) -> str:
+        return _PERMISSION
+
+    async def execute(self, input: dict) -> ToolResult:
+        path = str(input.get("path") or "").strip()
+        content = input.get("content")
+        mimir = input.get("mimir")
+
+        if not path.startswith("capabilities/") or not path.endswith(".json"):
+            return ToolResult(
+                tool_call_id="",
+                content="path must be a capabilities/*.json artifact",
+                is_error=True,
+            )
+        if not isinstance(content, str):
+            return ToolResult(
+                tool_call_id="",
+                content="content must be a JSON object string",
+                is_error=True,
+            )
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError as exc:
+            return ToolResult(
+                tool_call_id="",
+                content=f"content must be valid JSON: {exc.msg}",
+                is_error=True,
+            )
+        if not isinstance(payload, dict):
+            return ToolResult(
+                tool_call_id="",
+                content="content must be a JSON object",
+                is_error=True,
+            )
+
+        try:
+            await self._adapter.upsert_page(path, content, mimir=mimir)
+            published = await self._adapter.get_page(path)
+        except Exception as exc:
+            return ToolResult(
+                tool_call_id="",
+                content=f"Failed to publish {path}: {exc}",
+                is_error=True,
+            )
+        if published.content != content:
+            return ToolResult(
+                tool_call_id="",
+                content=f"Published content did not match {path}",
+                is_error=True,
+            )
+
+        suffix = f" (routed to: {mimir})" if mimir else ""
+        return ToolResult(tool_call_id="", content=f"Artifact published: {path}{suffix}")
+
+
+# ---------------------------------------------------------------------------
 # mimir_publish_files
 # ---------------------------------------------------------------------------
 
@@ -863,6 +968,7 @@ def build_mimir_tools(
         MimirReadTool(adapter),
         MimirReadSourceTool(adapter),
         MimirWriteTool(adapter),
+        MimirPublishArtifactTool(adapter),
         MimirSearchTool(adapter),
         MimirLintTool(adapter),
     ]

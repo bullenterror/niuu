@@ -182,7 +182,7 @@ build-backend = "hatchling.build"
 # under vendor/envoy_authz_protos/ (see its README and
 # scripts/generate_envoy_authz_protos.py) instead of depending on the
 # xds-protos wheel, which bundles a colliding copy of opentelemetry/proto/**.
-packages = ["src/audit", "src/cli", "src/credentials", "src/features", "src/guild", "src/identity", "src/integrations", "src/niuu", "src/volundr", "src/ting", "src/tracker", "src/skuld", "src/sleipnir", "src/ravn", "src/bifrost", "src/mimir", "src/observatory", "src/personas", "vendor/envoy_authz_protos/envoy", "vendor/envoy_authz_protos/xds", "vendor/envoy_authz_protos/udpa", "vendor/envoy_authz_protos/validate"]
+packages = ["src/audit", "src/cli", "src/credentials", "src/features", "src/guild", "src/identity", "src/integrations", "src/niuu", "src/volundr", "src/ting", "src/tracker", "src/skuld", "src/sleipnir", "src/ravn", "src/bifrost", "src/mimir", "src/observatory", "src/personas", "src/yggdrasil", "vendor/envoy_authz_protos/envoy", "vendor/envoy_authz_protos/xds", "vendor/envoy_authz_protos/udpa", "vendor/envoy_authz_protos/validate"]
 
 [tool.hatch.metadata]
 allow-direct-references = true
@@ -218,7 +218,7 @@ force-exclude = true
 select = ["E", "F", "I", "N", "W", "UP"]
 
 [tool.coverage.run]
-source = ["src/audit", "src/volundr", "src/cli", "src/credentials", "src/features", "src/guild", "src/identity", "src/integrations", "src/ting", "src/tracker", "src/niuu", "src/skuld", "src/sleipnir", "src/ravn", "src/bifrost", "src/mimir", "src/observatory"]
+source = ["src/audit", "src/volundr", "src/cli", "src/credentials", "src/features", "src/guild", "src/identity", "src/integrations", "src/ting", "src/tracker", "src/niuu", "src/skuld", "src/sleipnir", "src/ravn", "src/bifrost", "src/mimir", "src/observatory", "src/yggdrasil"]
 branch = true
 # Textual TUI widgets require a running terminal and cannot be exercised with
 # plain pytest. They are excluded from coverage measurement until Textual

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import itertools
 import logging
 import re
@@ -28,6 +29,7 @@ from ravn.domain.exceptions import (
     PermissionDeniedError,
     PromptBudgetExceededError,
 )
+from ravn.domain.harness_telemetry import HarnessStepTelemetryRecord
 from ravn.domain.models import (
     Episode,
     LLMResponse,
@@ -41,6 +43,7 @@ from ravn.domain.models import (
     ToolResult,
     TurnResult,
 )
+from ravn.harness_telemetry import emit_harness_step
 from ravn.ports.channel import ChannelPort
 from ravn.ports.checkpoint import CheckpointPort
 from ravn.ports.llm import LLMPort, SystemPrompt
@@ -69,6 +72,20 @@ PostToolHook = Callable[[ToolCall, ToolResult], Coroutine[Any, Any, None]]
 UserInputFn = Callable[[str], Coroutine[Any, Any, str]]
 
 _ASK_USER_TOOL_NAME = "ask_user"
+
+
+def _llm_error_category(exc: BaseException) -> str:
+    """Classify a terminal provider exception without exporting its content."""
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, asyncio.CancelledError):
+            return "aborted"
+        if isinstance(current, TimeoutError) or "timeout" in type(current).__name__.lower():
+            return "timeout"
+        current = current.__cause__ or current.__context__
+    return "provider_error"
 
 
 class RavnAgent:
@@ -213,6 +230,10 @@ class RavnAgent:
         ]
         self._max_prompt_tokens = min(prompt_ceilings) if prompt_ceilings else 0
         self._last_prompt_budget_status: dict[str, int | float | bool] = {}
+        self._last_provider_duration_ms: float | None = None
+        self._last_ttft_ms: float | None = None
+        self._last_usage_available = False
+        self._last_usage: TokenUsage | None = None
         # NIU-1118: cap one tool result's contribution to history; 0 disables
         self._max_tool_result_chars = max_tool_result_chars
 
@@ -553,105 +574,145 @@ class RavnAgent:
                 explicit=explicit_thinking,
                 last_had_tool_error=last_had_tool_error,
             )
+            recovery_state = "retry_after_tool_error" if last_had_tool_error else "none"
 
-            llm_response = await self._call_llm_streaming(
-                system_prompt=effective_system,
-                messages=messages_for_llm,
-                thinking=thinking_param,
-            )
+            step_attributes = {
+                "ravn.harness.step.id": f"{self._session.id}:{self._turn_count}:{iteration}",
+                "ravn.harness.type": "native",
+                "ravn.harness.phase": "model_turn",
+            }
+            with get_observability().span("ravn harness step", attributes=step_attributes):
+                try:
+                    llm_response = await self._call_llm_streaming(
+                        system_prompt=effective_system,
+                        messages=messages_for_llm,
+                        thinking=thinking_param,
+                    )
+                except BaseException as exc:
+                    stop_reason = "aborted" if isinstance(exc, asyncio.CancelledError) else "error"
+                    self._emit_native_harness_step(
+                        iteration=iteration,
+                        prompt_sections=prompt_sections,
+                        message_count=len(messages_for_llm),
+                        response=None,
+                        tool_wall_time_ms=0.0,
+                        recovery_state=stop_reason,
+                        terminal_stop_reason=stop_reason,
+                        llm_error_category=_llm_error_category(exc),
+                    )
+                    raise
 
-            # Consume one iteration from the budget.
-            if self._iteration_budget is not None:
-                self._iteration_budget.consume()
+                # Consume one iteration from the budget.
+                if self._iteration_budget is not None:
+                    self._iteration_budget.consume()
 
-            cumulative_usage = cumulative_usage + llm_response.usage
+                cumulative_usage = cumulative_usage + llm_response.usage
 
-            if llm_response.stop_reason != StopReason.TOOL_USE:
-                if llm_response.content:
-                    await self._channel.emit(
-                        RavnEvent.response(
-                            source=self._source_id,
-                            text=llm_response.content,
-                            correlation_id=self._session.id,
-                            session_id=self._session.id,
+                if llm_response.stop_reason != StopReason.TOOL_USE:
+                    if llm_response.content:
+                        await self._channel.emit(
+                            RavnEvent.response(
+                                source=self._source_id,
+                                text=llm_response.content,
+                                correlation_id=self._session.id,
+                                session_id=self._session.id,
+                            )
+                        )
+                    final_response = llm_response.content
+                    self._session.add_message(
+                        Message(
+                            role="assistant",
+                            content=llm_response.content,
+                            reasoning=llm_response.reasoning,
                         )
                     )
-                final_response = llm_response.content
-                self._session.add_message(
+                    self._emit_native_harness_step(
+                        iteration=iteration,
+                        prompt_sections=prompt_sections,
+                        message_count=len(messages_for_llm),
+                        response=llm_response,
+                        tool_wall_time_ms=0.0,
+                        recovery_state=recovery_state,
+                    )
+                    break
+
+                # Track partial response for checkpointing during tool-call iterations.
+                if llm_response.content:
+                    final_response = llm_response.content
+
+                # Append the assistant message (with tool calls) to history.
+                assistant_content = _build_assistant_content(llm_response)
+                self._session.messages.append(
                     Message(
                         role="assistant",
-                        content=llm_response.content,
+                        content=assistant_content,
                         reasoning=llm_response.reasoning,
                     )
                 )
-                break
 
-            # Track partial response for checkpointing during tool-call iterations.
-            if llm_response.content:
-                final_response = llm_response.content
+                # Execute all tool calls sequentially and collect results.
+                tool_results_content = []
+                tool_wall_time_ms = 0.0
+                last_had_tool_error = False
+                for tool_call in llm_response.tool_calls:
+                    turn_tool_calls.append(tool_call)
 
-            # Append the assistant message (with tool calls) to history.
-            assistant_content = _build_assistant_content(llm_response)
-            self._session.messages.append(
-                Message(
-                    role="assistant",
-                    content=assistant_content,
-                    reasoning=llm_response.reasoning,
+                    # NIU-537: auto-snapshot before destructive operations.
+                    if (
+                        self._auto_checkpoint_before_destructive
+                        and tool_call.name in DESTRUCTIVE_TOOL_NAMES
+                    ):
+                        await self._maybe_save_snapshot(label=f"auto: before {tool_call.name}")
+
+                    tool_started = time.monotonic()
+                    result = await self._execute_tool(tool_call)
+                    tool_wall_time_ms += (time.monotonic() - tool_started) * 1_000
+
+                    # NIU-1118: cap the result BEFORE it enters history — one
+                    # oversized result lands in the compression-protected tail
+                    # and would make the rest of the turn unrecoverable.
+                    result = self._truncate_oversized_tool_result(
+                        tool_call, result, batch_size=len(llm_response.tool_calls)
+                    )
+
+                    # Inject budget warning into the tool result content.
+                    result = _maybe_append_budget_warning(result, self._iteration_budget)
+
+                    if result.is_error:
+                        last_had_tool_error = True
+                    turn_tool_results.append(result)
+                    tool_results_content.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_call.id,
+                            "content": result.content,
+                            "is_error": result.is_error,
+                        }
+                    )
+
+                    # Write a crash-safe checkpoint after every tool call.
+                    await self._write_checkpoint(
+                        user_input=user_input,
+                        partial_response=final_response,
+                        last_tool_call=tool_call,
+                        last_tool_result=result,
+                        interrupted_by=None,
+                    )
+
+                    # NIU-537: increment tool counter and check cadence/budget triggers.
+                    self._tool_call_count += 1
+                    await self._check_auto_snapshot_triggers(tool_call.name)
+
+                # Append tool results as a user message.
+                self._session.messages.append(Message(role="user", content=tool_results_content))
+                self._emit_native_harness_step(
+                    iteration=iteration,
+                    prompt_sections=prompt_sections,
+                    message_count=len(messages_for_llm),
+                    response=llm_response,
+                    tool_wall_time_ms=tool_wall_time_ms,
+                    recovery_state=recovery_state,
                 )
-            )
-
-            # Execute all tool calls sequentially and collect results.
-            tool_results_content = []
-            last_had_tool_error = False
-            for tool_call in llm_response.tool_calls:
-                turn_tool_calls.append(tool_call)
-
-                # NIU-537: auto-snapshot before destructive operations.
-                if (
-                    self._auto_checkpoint_before_destructive
-                    and tool_call.name in DESTRUCTIVE_TOOL_NAMES
-                ):
-                    await self._maybe_save_snapshot(label=f"auto: before {tool_call.name}")
-
-                result = await self._execute_tool(tool_call)
-
-                # NIU-1118: cap the result BEFORE it enters history — one
-                # oversized result lands in the compression-protected tail
-                # and would make the rest of the turn unrecoverable.
-                result = self._truncate_oversized_tool_result(
-                    tool_call, result, batch_size=len(llm_response.tool_calls)
-                )
-
-                # Inject budget warning into the tool result content.
-                result = _maybe_append_budget_warning(result, self._iteration_budget)
-
-                if result.is_error:
-                    last_had_tool_error = True
-                turn_tool_results.append(result)
-                tool_results_content.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": tool_call.id,
-                        "content": result.content,
-                        "is_error": result.is_error,
-                    }
-                )
-
-                # Write a crash-safe checkpoint after every tool call.
-                await self._write_checkpoint(
-                    user_input=user_input,
-                    partial_response=final_response,
-                    last_tool_call=tool_call,
-                    last_tool_result=result,
-                    interrupted_by=None,
-                )
-
-                # NIU-537: increment tool counter and check cadence/budget triggers.
-                self._tool_call_count += 1
-                await self._check_auto_snapshot_triggers(tool_call.name)
-
-            # Append tool results as a user message.
-            self._session.messages.append(Message(role="user", content=tool_results_content))
         else:
             await self._write_checkpoint(
                 user_input=user_input,
@@ -1317,6 +1378,70 @@ class RavnAgent:
 
         return None
 
+    def _emit_native_harness_step(
+        self,
+        *,
+        iteration: int,
+        prompt_sections: dict[str, int],
+        message_count: int,
+        response: LLMResponse | None,
+        tool_wall_time_ms: float,
+        recovery_state: str,
+        terminal_stop_reason: str | None = None,
+        llm_error_category: str | None = None,
+    ) -> None:
+        """Emit the normalized record without replacing established LLM telemetry."""
+        compression = self._last_compression_result
+        unavailable: dict[str, str] = {"provider_call.id": "provider_does_not_expose_request_id"}
+        observed_usage = self._last_usage if self._last_usage_available else None
+        if observed_usage is None:
+            unavailable["usage"] = (
+                "provider_call_did_not_complete"
+                if response is None
+                else "provider_did_not_report_usage"
+            )
+        if self._last_ttft_ms is None:
+            unavailable["timing.ttft_ms"] = (
+                "provider_call_terminated_before_text"
+                if response is None
+                else "no_streamed_text_token"
+            )
+        if self._last_provider_duration_ms is None:
+            unavailable["timing.provider_duration_ms"] = "provider_duration_not_observed"
+        record = HarnessStepTelemetryRecord(
+            step_id=f"{self._session.id}:{self._turn_count}:{iteration}",
+            session_id=str(self._session.id),
+            task_id=self._task_id,
+            turn=self._turn_count,
+            attempt=iteration,
+            phase="model_turn",
+            harness_type="native",
+            model=self._model,
+            provider=type(self._llm).__name__,
+            provider_call_id=None,
+            context_section_estimates=dict(prompt_sections),
+            context_message_count=message_count,
+            context_tool_schema_count=len(self._tools),
+            compaction_applied=compression.was_compressed if compression is not None else False,
+            compaction_passes=compression.compression_count if compression is not None else 0,
+            compaction_messages_removed=(
+                compression.removed_message_count if compression is not None else 0
+            ),
+            provider_duration_ms=self._last_provider_duration_ms,
+            ttft_ms=self._last_ttft_ms,
+            tool_wall_time_ms=tool_wall_time_ms,
+            tool_call_count=len(response.tool_calls) if response is not None else 0,
+            usage=observed_usage,
+            stop_reason=(
+                str(response.stop_reason) if response is not None else terminal_stop_reason
+            ),
+            llm_error_category=llm_error_category,
+            retry_index=iteration,
+            recovery_state=recovery_state,
+            unavailable=unavailable,
+        )
+        emit_harness_step(record)
+
     async def _call_llm_streaming(
         self,
         system_prompt: SystemPrompt | None = None,
@@ -1343,6 +1468,7 @@ class RavnAgent:
                 "gen_ai.agent.name",
             )
         }
+        self._last_provider_duration_ms = None
         started = time.monotonic()
         with telemetry.span(f"chat {self._model}", attributes=attributes) as span:
             telemetry.event(
@@ -1363,18 +1489,21 @@ class RavnAgent:
                     messages=messages,
                     thinking=thinking,
                 )
-            except Exception:
+            except BaseException:
+                duration = time.monotonic() - started
+                self._last_provider_duration_ms = duration * 1_000
                 telemetry.count(
                     "ravn.agent.llm.calls",
                     attributes={**metric_attributes, "error.type": "exception"},
                 )
                 telemetry.duration(
                     "gen_ai.client.operation.duration",
-                    time.monotonic() - started,
+                    duration,
                     attributes={**metric_attributes, "error.type": "exception"},
                 )
                 raise
             duration = time.monotonic() - started
+            self._last_provider_duration_ms = duration * 1_000
             span.set_attribute("gen_ai.usage.input_tokens", response.usage.input_tokens)
             span.set_attribute("gen_ai.usage.output_tokens", response.usage.output_tokens)
             span.set_attribute("ravn.llm.tool_call_count", len(response.tool_calls))
@@ -1424,6 +1553,10 @@ class RavnAgent:
         """Call the LLM with streaming and accumulate into an LLMResponse."""
         accumulated_text = ""
         accumulated_reasoning = ""
+        self._last_ttft_ms = None
+        self._last_usage_available = False
+        self._last_usage = None
+        stream_started = time.monotonic()
         tool_calls: list[ToolCall] = []
         final_usage = TokenUsage(input_tokens=0, output_tokens=0)
         stop_reason = StopReason.END_TURN
@@ -1447,6 +1580,8 @@ class RavnAgent:
             match event.type:
                 case StreamEventType.TEXT_DELTA:
                     if event.text:
+                        if self._last_ttft_ms is None:
+                            self._last_ttft_ms = (time.monotonic() - stream_started) * 1_000
                         accumulated_text += event.text
                         await self._channel.emit(
                             RavnEvent.thought(
@@ -1473,6 +1608,8 @@ class RavnAgent:
                 case StreamEventType.MESSAGE_DONE:
                     if event.usage:
                         final_usage = event.usage
+                        self._last_usage = event.usage
+                        self._last_usage_available = True
 
         # Decided after the stream rather than inside MESSAGE_DONE, because
         # MESSAGE_DONE is not the last event. Servers that send a usage chunk

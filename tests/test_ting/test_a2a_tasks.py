@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gzip
+import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -13,6 +14,7 @@ from pathlib import Path
 from threading import Thread
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
 import jwt
@@ -24,6 +26,8 @@ from grpc import server as grpc_server
 from identity.adapters.authorization import AllowAllAuthorizationAdapter
 from identity.adapters.identity import EnvoyHeaderAuthenticationAdapter
 from niuu.domain.models import Principal
+from ravn.adapters.personas.loader import FilesystemPersonaAdapter
+from ravn.adapters.tools.build_tool import BuildTool
 from ting.api.a2a import (
     _launch_digest,
     campaign_to_task,
@@ -41,10 +45,12 @@ from ting.domain.models import (
     WorkflowDefinition,
     WorkflowScope,
 )
+from ting.domain.services.workflow_campaign_projector import WorkflowCampaignProjector
 from ting.domain.workflow_snapshot import build_workflow_snapshot
-from ting.ports.volundr import SpawnRequest, VolundrPort, VolundrSession
+from ting.ports.volundr import ActivityEvent, SpawnRequest, VolundrPort, VolundrSession
 from ting.ports.workflow_campaign_repository import WorkflowCampaignRepository
 from ting.ports.workflow_repository import WorkflowRepository
+from ting.system_workflows import load_system_workflows
 
 A2A_PATH = "/api/v1/ting/a2a"
 _SIGNING_KEY = "test-only-signing-key-32-bytes-long!"
@@ -122,6 +128,28 @@ class InMemoryCampaignRepository(WorkflowCampaignRepository):
     async def get_campaign(self, campaign_id: UUID) -> WorkflowCampaign | None:
         return self._campaigns.get(campaign_id)
 
+    async def get_active_campaign_by_session(
+        self,
+        *,
+        owner_id: str,
+        session_id: str,
+        connection_id: str | None = None,
+    ) -> WorkflowCampaign | None:
+        matches = [
+            campaign
+            for campaign in self._campaigns.values()
+            if campaign.owner_id == owner_id
+            and campaign.session_id == session_id
+            and campaign.status
+            in {
+                WorkflowCampaignStatus.PENDING,
+                WorkflowCampaignStatus.RUNNING,
+                WorkflowCampaignStatus.BLOCKED,
+            }
+            and (connection_id is None or campaign.connection_id == connection_id)
+        ]
+        return matches[0] if len(matches) == 1 else None
+
     async def get_campaign_by_slug(
         self,
         slug: str,
@@ -195,6 +223,26 @@ class InMemoryA2ALaunchRepository:
                 self.by_message[key] = launched
                 return launched
         raise ValueError("missing reservation")
+
+
+class RecordingExecutionRepository:
+    def __init__(self) -> None:
+        self.reserved = []
+        self.execution = None
+
+    async def reserve_parent_launch(self, execution):
+        self.reserved.append(execution)
+        self.execution = execution
+        return execution, True
+
+    async def attach_parent_session(self, execution_id, *, session_id, connection_id):
+        assert self.execution is not None and self.execution.id == execution_id
+        self.execution = replace(
+            self.execution,
+            parent_session_id=session_id,
+            connection_id=connection_id,
+        )
+        return self.execution
 
 
 class RecordingVolundrPort(VolundrPort):
@@ -738,6 +786,57 @@ class TestSendMessage:
         assert campaign.metadata["surface"] == "a2a"
         assert campaign.metadata["a2a_message_id"] == "msg-1"
         assert campaign.metadata["a2a_workflow_slug"] == "build-the-widget-tool"
+
+    def test_fan_out_skill_binds_durable_execution_context(self) -> None:
+        workflow = next(
+            item for item in load_system_workflows() if item.name == "Research Campaign"
+        )
+        ledger = RecordingExecutionRepository()
+        client, campaigns, port = _make_client(
+            workflow_repo=InMemoryWorkflowRepository([workflow]),
+        )
+        client.app.state.persona_source = FilesystemPersonaAdapter(
+            persona_dirs=[], include_builtin=True
+        )
+        client.app.state.workflow_execution_repo = ledger
+        params = _send_params(
+            str(workflow.id),
+            prompt="Research durable context binding for this campaign",
+        )
+        params["message"]["metadata"].update(
+            {
+                "connectionId": "local",
+                "repo": "https://github.com/niuulabs/niuu",
+                "branch": "regin",
+                "traceContext": {
+                    "traceparent": "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01",
+                    "tracestate": "niuu=resident",
+                },
+            }
+        )
+
+        response = _rpc(client, "SendMessage", params)
+
+        assert response.status_code == 200, response.text
+        task = response.json()["result"]["task"]
+        assert task["status"]["state"] == "TASK_STATE_SUBMITTED"
+        assert len(ledger.reserved) == 1
+        assert ledger.execution.parent_node_id == "research-threads"
+        assert ledger.execution.parent_session_id == "session-123"
+        assert ledger.execution.connection_id == "local"
+
+        workload = port.spawned[0].workload_config
+        provenance = workload["provenance"]["workflow_execution"]
+        assert provenance["execution_id"] == str(ledger.execution.id)
+        assert provenance["parent_session_key"] == f"workflow:execution-{ledger.execution.id.hex}"
+        assert workload["ravn_config"]["workflow_execution"]["enabled"] is True
+        assert workload["provenance"]["trace_context"] == {
+            "traceparent": "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01",
+            "tracestate": "niuu=resident",
+        }
+
+        campaign = next(iter(campaigns._campaigns.values()))
+        assert campaign.metadata["workflow_execution_id"] == str(ledger.execution.id)
 
     def test_campaign_names_the_workload_that_sent_the_task(self) -> None:
         """A resident's exchanged token (act.sub) is recorded on the campaign it launches."""
@@ -2192,7 +2291,23 @@ def _mimir_workflow(root: Path) -> WorkflowDefinition:
 class TestTaskArtifacts:
     _SLUG = "build-widget"
     _JSON_PATH = "capabilities/build-widget/learned_tool.json"
-    _JSON_CONTENT = '{"manifest": {"name": "widget"}}'
+    _JSON_CONTENT = json.dumps(
+        {
+            "manifest": {
+                "name": "widget",
+                "description": "Echo a supplied payload.",
+                "input_schema": {"type": "object"},
+                "required_permission": "tool:run",
+            },
+            "tool_code": "def run(payload):\n    return {'echo': payload}\n",
+            "test_code": (
+                "import _verify_tool\n\n"
+                "def test_echo():\n"
+                "    assert _verify_tool.run({'a': 1}) == {'echo': {'a': 1}}\n"
+            ),
+            "requirements": [],
+        }
+    )
 
     def _client_with_files(
         self,
@@ -2248,6 +2363,105 @@ class TestTaskArtifacts:
         )
         assert fetched.status_code == 200
         assert fetched.json()["content"] == self._JSON_CONTENT
+
+    def test_blocked_publish_retry_completes_task_with_artifact(self, tmp_path: Path) -> None:
+        """A successful publish supersedes its earlier help-needed task state."""
+        import asyncio
+
+        workflow = _mimir_workflow(tmp_path)
+        workflow.graph["nodes"].append(
+            {
+                "id": "capability-complete",
+                "kind": "end",
+                "completionEvent": "capability.ready",
+            }
+        )
+        campaign = _make_campaign(
+            slug=self._SLUG,
+            metadata={"a2a_workflow_slug": self._SLUG},
+            workflow_snapshot=build_workflow_snapshot(workflow),
+        )
+        campaigns = InMemoryCampaignRepository([campaign])
+        port = RecordingVolundrPort()
+        settings = Settings(auth=AuthConfig(allow_anonymous_dev=False))
+        client, _, _ = _make_client(
+            campaign_repo=campaigns,
+            settings=settings,
+            volundr=port,
+        )
+        artifact_dir = tmp_path / "wiki" / "capabilities" / self._SLUG
+        artifact_dir.mkdir(parents=True)
+        (artifact_dir / "learned_tool.json").write_text(self._JSON_CONTENT, encoding="utf-8")
+
+        class Factory:
+            async def primary_for_owner(self, owner_id: str):
+                return port
+
+            async def for_connection(self, owner_id: str, connection_id: str):
+                return None
+
+        projector = WorkflowCampaignProjector(
+            repo=campaigns,
+            volundr_factory=Factory(),
+            event_bus=AsyncMock(),
+        )
+
+        async def project_publish_retry() -> None:
+            assert await projector.record_help_needed(
+                {"summary": "Publisher needs the artifact path."},
+                campaign.owner_id,
+                session_id=campaign.session_id,
+                gate={"node_id": "capability-publish", "status": "blocked"},
+            )
+            assert await projector.handle_activity(
+                ActivityEvent(
+                    session_id=campaign.session_id,
+                    state="idle",
+                    metadata={
+                        "completion_source": "ravn_flock",
+                        "completion_event_type": "capability.ready",
+                        "completion_peer_id": "workflow-stop:capability-complete",
+                        "outcome_valid": True,
+                        "structured_outcome": {
+                            "verdict": "approve",
+                            "authoritative": True,
+                            "checks": [
+                                {
+                                    "persona": "capability-publisher",
+                                    "event_type": "capability.ready",
+                                    "verdict": "published",
+                                }
+                            ],
+                        },
+                    },
+                    owner_id=campaign.owner_id,
+                ),
+                campaign.owner_id,
+            )
+
+        asyncio.run(project_publish_retry())
+
+        result = _rpc(client, "GetTask", {"id": campaign.slug}).json()["result"]
+
+        assert result["status"]["state"] == "TASK_STATE_COMPLETED"
+        artifacts = {artifact["artifactId"]: artifact for artifact in result["artifacts"]}
+        artifact = artifacts[self._JSON_PATH]["parts"][0]
+        assert artifact["text"] == self._JSON_CONTENT
+
+        installed: list = []
+        build_tool = BuildTool(
+            tools_dir=tmp_path / "tools",
+            artifacts_dir=tmp_path / "artifacts",
+            register_tool=lambda tool, replace=False: installed.append((tool, replace)),
+            autonomy_mode="autonomous",
+        )
+        installation = asyncio.run(build_tool.execute(json.loads(artifact["text"])))
+
+        assert installation.is_error is False
+        assert len(installed) == 1
+        execution = asyncio.run(installed[0][0].execute({"installed": True}))
+        assert execution.is_error is False
+        assert json.loads(execution.content) == {"echo": {"installed": True}}
 
     def test_running_task_exposes_no_artifacts(self, tmp_path: Path) -> None:
         client, campaign = self._client_with_files(

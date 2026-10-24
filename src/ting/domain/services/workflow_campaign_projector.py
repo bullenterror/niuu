@@ -88,19 +88,28 @@ class WorkflowCampaignProjector:
         if campaign is None:
             return False
 
+        completion_event = _campaign_completion_event(campaign)
+        authoritative_completion = _authoritative_completion(
+            event.metadata, completion_event=completion_event
+        )
         delivery = _authoritative_delivery(
-            event.metadata, completion_event=_campaign_completion_event(campaign)
+            event.metadata, completion_event=completion_event
         )
         if event.state == "error" or event.session_status in {"failed", "cancelled", "canceled"}:
             error = str(event.metadata.get("error") or event.metadata.get("message") or "").strip()
             if not error:
                 error = f"Session {event.session_status or event.state or 'failed'}"
             await self._save_failure(campaign, {**event.metadata, "error": error})
-        elif delivery is not None:
+        elif authoritative_completion is not None and (
+            "delivery" not in event.metadata or delivery is not None
+        ):
+            metadata = dict(campaign.metadata)
+            if delivery is not None:
+                metadata["delivery"] = delivery
             await self._save_transition(
                 campaign,
                 WorkflowCampaignStatus.COMPLETED,
-                metadata={**campaign.metadata, "delivery": delivery},
+                metadata=metadata,
             )
         elif event.session_status == "stopped":
             await self._save_transition(campaign, WorkflowCampaignStatus.BLOCKED)
@@ -193,12 +202,17 @@ class WorkflowCampaignProjector:
             else _status_from_session(session.status, fallback=campaign.status)
         )
         activity_metadata = getattr(session, "activity_metadata", {}) or {}
+        completion_event = _campaign_completion_event(campaign)
+        authoritative_completion = _authoritative_completion(
+            activity_metadata, completion_event=completion_event
+        )
+        delivery = _authoritative_delivery(
+            activity_metadata, completion_event=completion_event
+        )
         if (
             next_status != WorkflowCampaignStatus.FAILED
-            and _authoritative_delivery(
-                activity_metadata, completion_event=_campaign_completion_event(campaign)
-            )
-            is not None
+            and authoritative_completion is not None
+            and ("delivery" not in activity_metadata or delivery is not None)
         ):
             next_status = WorkflowCampaignStatus.COMPLETED
         elif next_status == WorkflowCampaignStatus.RUNNING and await self._session_awaits_input(
@@ -431,8 +445,8 @@ def _campaign_completion_event(campaign: WorkflowCampaign) -> str:
     return ""
 
 
-def _authoritative_delivery(activity_metadata: dict, *, completion_event: str) -> dict | None:
-    """Extract Skuld's terminal result without trusting generic idle metadata."""
+def _authoritative_completion(activity_metadata: dict, *, completion_event: str) -> dict | None:
+    """Validate a workflow terminal outcome before completing its campaign."""
     if not completion_event:
         return None
     if activity_metadata.get("completion_source") != "ravn_flock":
@@ -451,6 +465,16 @@ def _authoritative_delivery(activity_metadata: dict, *, completion_event: str) -
     if not isinstance(structured_payload, dict) or not structured_payload:
         return None
     if not bool(structured_payload.get("authoritative") or activity_metadata.get("outcome_valid")):
+        return None
+    return structured_payload
+
+
+def _authoritative_delivery(activity_metadata: dict, *, completion_event: str) -> dict | None:
+    """Extract an optional attested delivery result from a terminal outcome."""
+    structured_payload = _authoritative_completion(
+        activity_metadata, completion_event=completion_event
+    )
+    if structured_payload is None:
         return None
 
     envelope = activity_metadata.get("delivery")
