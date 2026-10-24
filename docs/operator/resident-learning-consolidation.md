@@ -154,7 +154,7 @@ reflection:
   learning_entry_max_chars: 600
   matching:
     mode: semantic                    # lexical | semantic
-    similarity_threshold: 0.75
+    similarity_threshold: 0.65          # Qwen3-Embedding-0.6B scores paraphrases 0.72-0.75
     max_related: 5
     embed_batch_size: 64
     evidence_duplicate_similarity: 0.9
