@@ -1974,3 +1974,64 @@ class TestStorageContributorHomePlacement:
         )
         assert kwargs["home_colocate"] is True
         assert kwargs["home_excluded_workload_types"] == ["ravn_flock"]
+
+
+def _rendered_volundr_deployment(*extra_args: str) -> dict:
+    command = ["helm", "template", "test", str(CHART_DIR), *extra_args]
+    docs = list(yaml.safe_load_all(subprocess.check_output(command)))
+    return next(
+        d
+        for d in docs
+        if d and d["kind"] == "Deployment" and d["metadata"]["name"] == "test-volundr"
+    )
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is required")
+class TestZeroDowntimeRollout:
+    """Recreate stopped Völundr before starting the new pod; every request in
+    between got a 503, which failed a resident's delivery launch."""
+
+    def test_rolls_with_a_ready_surge_pod_before_the_old_one_stops(self):
+        spec = _rendered_volundr_deployment()["spec"]
+        assert spec["strategy"] == {
+            "type": "RollingUpdate",
+            "rollingUpdate": {"maxSurge": 1, "maxUnavailable": 0},
+        }
+
+    def test_surge_pod_lands_beside_the_current_one_for_the_rwo_volume(self):
+        affinity = _rendered_volundr_deployment()["spec"]["template"]["spec"]["affinity"]
+        (term,) = affinity["podAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]
+        assert term["topologyKey"] == "kubernetes.io/hostname"
+        assert term["labelSelector"]["matchLabels"] == {
+            "app.kubernetes.io/name": "volundr",
+            "app.kubernetes.io/instance": "test",
+        }
+
+    def test_colocation_keeps_operator_affinity(self):
+        affinity = _rendered_volundr_deployment(
+            "--set",
+            "affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution[0].weight=1",
+            "--set",
+            "affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution[0]"
+            ".preference.matchExpressions[0].key=tier",
+            "--set",
+            "affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution[0]"
+            ".preference.matchExpressions[0].operator=Exists",
+        )["spec"]["template"]["spec"]["affinity"]
+        assert "nodeAffinity" in affinity and "podAffinity" in affinity
+
+    def test_serving_containers_drain_before_exiting(self):
+        pod = _rendered_volundr_deployment("--set", "envoy.enabled=true")["spec"]["template"][
+            "spec"
+        ]
+        drains = {c["name"]: c.get("lifecycle") for c in pod["containers"]}
+        assert drains["volundr"] == {"preStop": {"sleep": {"seconds": 10}}}
+        assert drains["envoy"] == {"preStop": {"sleep": {"seconds": 10}}}
+        assert pod["terminationGracePeriodSeconds"] > 10
+
+    def test_colocation_and_drain_can_be_turned_off(self):
+        pod = _rendered_volundr_deployment(
+            "--set", "rollout.colocate=false", "--set", "rollout.drainSeconds=0"
+        )["spec"]["template"]["spec"]
+        assert "affinity" not in pod
+        assert all("lifecycle" not in c for c in pod["containers"])
