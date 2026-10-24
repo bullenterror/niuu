@@ -154,6 +154,12 @@ def responses_native_only_features(body: dict[str, Any]) -> list[str]:
     features: list[str] = []
     if body.get("previous_response_id"):
         features.append("previous_response_id")
+    tools = body.get("tools")
+    if isinstance(tools, list):
+        hosted = sorted(
+            {str(tool.get("type")) for tool in tools if isinstance(tool, dict)} - {"function"}
+        )
+        features.extend(f"tool type {kind!r}" for kind in hosted)
     if body.get("context_management"):
         features.append("context_management")
     items = body.get("input")

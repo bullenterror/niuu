@@ -246,11 +246,14 @@ def responses_request_to_anthropic(
     tools: list[ToolDefinition] | None = None
     if req.tools and req.tool_choice != "none":
         function_tools = [tool for tool in req.tools if tool.get("type") == "function"]
-        skipped = [tool.get("type") for tool in req.tools if tool.get("type") != "function"]
-        if skipped:
-            logger.warning(
-                "Responses request asks for tools the gateway cannot provide, dropped: %s",
-                ", ".join(str(kind) for kind in skipped),
+        hosted = sorted({str(tool.get("type")) for tool in req.tools} - {"function"})
+        if hosted and not skip_native_only:
+            # Served without them, the model would answer a different request
+            # than the one sent; only the provider itself runs hosted tools.
+            raise UnsupportedResponsesInputError(
+                f"tools of type {', '.join(hosted)} are not supported on the canonical "
+                "translation; only function tools are. Serve the model through a provider "
+                "with passthrough: true to use the provider's own tools"
             )
         if function_tools:
             tools = [

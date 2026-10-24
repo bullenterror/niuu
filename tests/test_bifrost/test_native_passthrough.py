@@ -328,6 +328,7 @@ class TestResponsesPassthrough:
             ],
             context_management=[{"type": "compaction", "compact_threshold": 106666}],
             include=["reasoning.encrypted_content"],
+            tools=[{"type": "web_search"}, {"type": "function", "name": "f", "parameters": {}}],
         )
         resp = gateway.post("/v1/responses", body)
         assert resp.status_code == 200, resp.text
@@ -357,6 +358,7 @@ class TestResponsesPassthrough:
             {"context_management": [{"type": "compaction", "compact_threshold": 1}]},
             {"input": [COMPACTION, {"type": "message", "role": "user", "content": "x"}]},
             {"previous_response_id": "resp_0"},
+            {"tools": [{"type": "web_search"}]},
         ):
             resp = gateway.post("/v1/responses", _responses_body(**extra))
             assert resp.status_code == 400, extra
@@ -607,9 +609,11 @@ class TestNativeOnlyFeatures:
             "previous_response_id": "r",
             "context_management": [{"type": "compaction"}],
             "input": [COMPACTION, {"type": "item_reference"}, {"role": "user", "content": "x"}],
+            "tools": [{"type": "function"}, {"type": "web_search"}],
         }
         assert responses_native_only_features(body) == [
             "previous_response_id",
+            "tool type 'web_search'",
             "context_management",
             "input item type 'compaction'",
             "input item type 'item_reference'",
