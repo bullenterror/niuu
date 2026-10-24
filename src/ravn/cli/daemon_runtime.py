@@ -20,6 +20,7 @@ async def _run_daemon(
     from ravn.adapters.channels.gateway import RavnGateway
     from ravn.adapters.channels.gateway_http import HttpGateway
     from ravn.adapters.channels.gateway_telegram import TelegramGateway
+    from ravn.cli.runtime_builders import require_tool_build_push  # noqa: PLC0415
     from ravn.drive_loop import DriveLoop
     from ravn.ports.channel import ChannelPort
 
@@ -48,6 +49,7 @@ async def _run_daemon(
                 max_iterations = persona_config.iteration_budget
     base_model = _resolve_persona_model(settings, persona_config)
 
+    require_tool_build_push(settings)
     workspace = _resolve_workspace(settings)
     from ravn.cli.tool_builders import _build_learned_tool_resolver  # noqa: PLC0415
 

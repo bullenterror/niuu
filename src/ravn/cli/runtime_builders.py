@@ -17,6 +17,7 @@ import httpx
 
 from niuu.adapters.outbound.http_auth import WorkloadIdentityBearerTokenAuthAdapter
 from ravn.config import PermissionConfig, Settings, ToolGroupConfig
+from ravn.domain.exceptions import ConfigurationError
 from ravn.domain.permission_mode import PermissionMode, parse_permission_mode
 from ravn.ports.executor import ExecutorPort
 
@@ -154,9 +155,35 @@ def _attach_agent_build_tool(
         )
     except TypeError:
         logger.debug("build_tool not attached: executor does not support dynamic tools")
-    except Exception as exc:
-        logger.warning("Failed to attach build_tool to signal investigation: %s", exc)
     return agent
+
+
+def require_tool_build_push(settings: Settings) -> None:
+    """Refuse to start a resident that commissions A2A builds it cannot hear back from.
+
+    A builder that asks a question after the commissioning turn ends can only
+    reach the resident by push. Without it the question went unanswered, the
+    build held its session pod in INPUT_REQUIRED, and the resident commissioned
+    the same tool again — every Kubernetes resident on 2026-10-24.
+    """
+    adapter = settings.resident_evolution.tool_build_adapter
+    if not adapter:
+        return
+    if not _constructor_accepts_kwarg(_import_class(adapter), "push_callback_url"):
+        return
+    missing: list[str] = []
+    if not settings.gateway.platform.a2a_push_callback_url:
+        missing.append("gateway.platform.a2a_push_callback_url (the public URL of /a2a/push)")
+    http = settings.gateway.channels.http
+    if not (http.enabled and http.a2a_push_enabled):
+        missing.append("gateway.channels.http.enabled and a2a_push_enabled")
+    if missing:
+        raise ConfigurationError(
+            f"resident_evolution.tool_build_adapter {adapter} commissions builds over A2A, "
+            "but this resident cannot receive their push notifications: set "
+            + "; ".join(missing)
+            + ", or remove tool_build_adapter to build tools inline"
+        )
 
 
 def _build_tool_build_backend(
