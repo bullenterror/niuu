@@ -115,6 +115,60 @@ class TestCompletion:
         assert [b.type for b in response.content] == ["thinking", "text"]
         assert json.loads(route.calls.last.request.content)["reasoning"] == {"summary": "auto"}
 
+    async def test_reasoning_is_returned_signed_even_when_thinking_was_not_asked_for(
+        self, adapter, respx_mock
+    ):
+        respx_mock.post(TOKEN_URL).mock(return_value=_tokens())
+        respx_mock.post(RESPONSES_URL).mock(return_value=_sse("reasoning_tool_call_no_summary"))
+
+        response = await adapter.complete(_request(), "gpt-6-sol")
+
+        assert [b.type for b in response.content] == ["thinking", "tool_use", "tool_use"]
+        assert response.content[0].thinking == ""
+        assert response.content[0].signature == "REDACTED-FINAL"
+
+    async def test_a_signed_block_sent_back_is_replayed_as_a_reasoning_item(
+        self, adapter, respx_mock
+    ):
+        respx_mock.post(TOKEN_URL).mock(return_value=_tokens())
+        route = respx_mock.post(RESPONSES_URL).mock(
+            side_effect=[_sse("reasoning_tool_call_no_summary"), _sse("text")]
+        )
+        first = await adapter.complete(_request(), "gpt-6-sol")
+        calls = [b for b in first.content if isinstance(b, ToolUseBlock)]
+
+        await adapter.complete(
+            _request(
+                messages=[
+                    {"role": "user", "content": "Say hello in three words."},
+                    {"role": "assistant", "content": [b.model_dump() for b in first.content]},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": c.id, "content": "ok"}
+                            for c in calls
+                        ],
+                    },
+                ]
+            ),
+            "gpt-6-sol",
+        )
+
+        sent = json.loads(route.calls[1].request.content)["input"]
+        assert [item["type"] for item in sent] == [
+            "message",
+            "reasoning",
+            "function_call",
+            "function_call",
+            "function_call_output",
+            "function_call_output",
+        ]
+        assert sent[1] == {
+            "type": "reasoning",
+            "summary": [],
+            "encrypted_content": "REDACTED-FINAL",
+        }
+
     async def test_request_sends_the_codex_wire_format(self, respx_mock):
         respx_mock.post(TOKEN_URL).mock(return_value=_tokens())
         route = respx_mock.post(RESPONSES_URL).mock(return_value=_sse("text"))
@@ -138,6 +192,7 @@ class TestCompletion:
         assert body["max_output_tokens"] == 77
         assert body["stream"] is True
         assert body["store"] is False
+        assert body["include"] == ["reasoning.encrypted_content"]
         assert body["reasoning"] == {"effort": "high"}
         assert body["input"][0]["content"][0]["text"] == "Say hello in three words."
 

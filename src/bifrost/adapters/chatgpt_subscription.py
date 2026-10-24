@@ -17,8 +17,11 @@ Wire format (verified against the live backend):
 - the backend only streams, so :meth:`complete` consumes the stream;
 - ``temperature`` / ``top_p`` / ``top_k`` are not forwarded (refused upstream);
   ``stop_sequences`` are refused with an error rather than dropped;
-- reasoning summaries are returned as ``thinking`` blocks when the caller
-  enabled thinking.
+- every reasoning item comes back as a ``thinking`` block whose ``signature`` is
+  the item's ``encrypted_content``; the summary text is filled in when the caller
+  enabled thinking. A caller that sends the block back unchanged lets the next
+  step continue that reasoning (the request carries ``store: false``, so this is
+  the only way to carry it).
 
 Configure it on a provider (all keys under ``kwargs``)::
 

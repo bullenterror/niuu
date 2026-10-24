@@ -69,6 +69,10 @@ bifrost:
     # subscription belongs to a Völundr user: Bifröst authenticates to Völundr's
     # Codex token broker with its own workload identity (the service account must
     # map to that user) and caches the short-lived token it gets back.
+    # Reasoning carries across tool calls with no setting: each reasoning item
+    # comes back as a thinking block with a `signature`, and over /v1/chat/completions
+    # as `reasoning_details`; a client that sends the assistant message back with
+    # it lets the next step continue that reasoning.
     # chatgpt:
     #   adapter: bifrost.adapters.chatgpt_subscription.ChatGPTSubscriptionAdapter
     #   models:
@@ -81,7 +85,7 @@ bifrost:
     #       token_file: /var/run/secrets/niuu/workload/token   # projected SA token
     #       audiences: [volundr-api]
     #     # reasoning_effort: high        # default when the request names none
-    #     # reasoning_summary: auto       # summaries become thinking blocks
+    #     # reasoning_summary: auto       # summary text, when the request enables thinking
     #     # parallel_tool_calls: true
     #     # refresh_skew_seconds: 60      # renew the token this long before expiry
 

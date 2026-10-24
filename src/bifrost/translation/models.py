@@ -26,8 +26,18 @@ class TextBlock(BaseModel):
 
 
 class ThinkingBlock(BaseModel):
+    """A reasoning block.
+
+    ``signature`` is Anthropic's standard field for opaque reasoning that must
+    be echoed back unchanged on a later turn. Providers that keep their
+    reasoning private (Anthropic's signature, the ChatGPT Responses backend's
+    ``encrypted_content``) put it here; empty means the block is only the
+    visible reasoning text and cannot be replayed to such a provider.
+    """
+
     type: Literal["thinking"] = "thinking"
     thinking: str
+    signature: str = ""
 
 
 class ToolUseBlock(BaseModel):

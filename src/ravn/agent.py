@@ -624,6 +624,7 @@ class RavnAgent:
                             role="assistant",
                             content=llm_response.content,
                             reasoning=llm_response.reasoning,
+                            reasoning_details=llm_response.reasoning_details,
                         )
                     )
                     self._emit_native_harness_step(
@@ -647,6 +648,7 @@ class RavnAgent:
                         role="assistant",
                         content=assistant_content,
                         reasoning=llm_response.reasoning,
+                        reasoning_details=llm_response.reasoning_details,
                     )
                 )
 
@@ -1553,6 +1555,7 @@ class RavnAgent:
         """Call the LLM with streaming and accumulate into an LLMResponse."""
         accumulated_text = ""
         accumulated_reasoning = ""
+        accumulated_reasoning_details: list[dict] = []
         self._last_ttft_ms = None
         self._last_usage_available = False
         self._last_usage = None
@@ -1602,6 +1605,9 @@ class RavnAgent:
                                 self._session.id,
                             )
                         )
+                case StreamEventType.REASONING_DETAILS:
+                    if event.reasoning_details:
+                        accumulated_reasoning_details.extend(event.reasoning_details)
                 case StreamEventType.TOOL_CALL:
                     if event.tool_call:
                         tool_calls.append(event.tool_call)
@@ -1626,6 +1632,7 @@ class RavnAgent:
             stop_reason=stop_reason,
             usage=final_usage,
             reasoning=accumulated_reasoning,
+            reasoning_details=accumulated_reasoning_details,
         )
 
     async def _execute_tool(self, tool_call: ToolCall) -> ToolResult:

@@ -10,11 +10,20 @@ Codex backend, whose behaviour was verified live:
 - ``max_output_tokens`` is honoured and ends a cut-off answer with
   ``response.incomplete``;
 - ``store`` is sent as ``false``: nothing is kept server-side, so every
-  request carries its whole conversation.
+  request carries its whole conversation;
+- ``include: ["reasoning.encrypted_content"]`` makes the backend return each
+  reasoning item's opaque ``encrypted_content``, which is the only way to carry
+  reasoning from one request to the next when nothing is stored.
 
-Reasoning items are not replayed. An Anthropic ``thinking`` block carries only
-text, while the Responses API wants the opaque ``encrypted_content`` of the
-reasoning item back, so thinking blocks in the history are dropped.
+Reasoning is replayed through the Anthropic ``thinking`` block's ``signature``:
+an assistant ``thinking`` block that has one becomes a ``reasoning`` input item
+(``summary`` from the block's text, ``encrypted_content`` from the signature)
+in the block's position, so each step continues its own reasoning instead of
+re-deriving it from the visible history. The backend requires ``type``,
+``summary`` (an array, possibly empty; omitting it is a 400) and
+``encrypted_content`` on such an item; ``id`` is neither needed nor sent. A
+``thinking`` block without a signature has nothing the backend can resume and is
+dropped.
 """
 
 from __future__ import annotations
@@ -35,6 +44,10 @@ from bifrost.translation.models import (
     ToolResultBlock,
     ToolUseBlock,
 )
+
+# What the Responses request asks the backend to add to its output; the one
+# value needed to receive reasoning that can be replayed with ``store: false``.
+REASONING_ENCRYPTED_INCLUDE = "reasoning.encrypted_content"
 
 
 class ResponsesTranslationError(ProviderError):
@@ -119,8 +132,19 @@ def _user_items(content: str | list[ContentBlock]) -> list[dict[str, Any]]:
     return items
 
 
+def _reasoning_item(block: ThinkingBlock) -> dict[str, Any]:
+    """A signed ``thinking`` block as a replayable Responses ``reasoning`` item."""
+    summary = [{"type": "summary_text", "text": block.thinking}] if block.thinking else []
+    return {"type": "reasoning", "summary": summary, "encrypted_content": block.signature}
+
+
 def _assistant_items(content: str | list[ContentBlock]) -> list[dict[str, Any]]:
-    """An assistant turn as Responses input items (text and ``function_call``)."""
+    """An assistant turn as Responses input items.
+
+    Text becomes ``message`` items, ``tool_use`` becomes ``function_call`` and a
+    signed ``thinking`` block becomes a ``reasoning`` item, all in block order.
+    An unsigned ``thinking`` block is dropped: the backend cannot resume it.
+    """
     if isinstance(content, str):
         return (
             [_message_item("assistant", [{"type": "output_text", "text": content}])]
@@ -151,8 +175,10 @@ def _assistant_items(content: str | list[ContentBlock]) -> list[dict[str, Any]]:
                 }
             )
         elif isinstance(block, ThinkingBlock):
-            # Reasoning cannot be replayed without its encrypted content.
-            continue
+            if not block.signature:
+                continue
+            flush()
+            items.append(_reasoning_item(block))
         else:
             raise ResponsesTranslationError(
                 f"an assistant message cannot carry a {block.type!r} block for the Responses API"
@@ -263,6 +289,7 @@ def anthropic_to_responses(
         "input": items,
         "store": False,
         "stream": True,
+        "include": [REASONING_ENCRYPTED_INCLUDE],
         "max_output_tokens": request.max_tokens,
     }
     instructions = _system_text(request)

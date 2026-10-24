@@ -808,13 +808,7 @@ async def _load_checkpoint_session(
     # Reconstruct session from checkpoint messages.
     session = Session()
     for raw_msg in checkpoint.messages:
-        session.messages.append(
-            Message(
-                role=raw_msg["role"],
-                content=raw_msg["content"],
-                reasoning=raw_msg.get("reasoning", ""),
-            )
-        )
+        session.messages.append(Message.from_api_dict(raw_msg))
 
     # Restore todo list.
     for raw_todo in checkpoint.todos:

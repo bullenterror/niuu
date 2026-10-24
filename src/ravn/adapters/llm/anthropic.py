@@ -36,6 +36,9 @@ _BETA_INTERLEAVED_THINKING = "interleaved-thinking-2025-05-14"
 _RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503})
 _DEFAULT_BASE_URL = "https://api.anthropic.com"
 
+# Ravn's transport-neutral message keys that the Anthropic API does not accept.
+_INTERNAL_MESSAGE_KEYS = frozenset({"reasoning", "reasoning_details"})
+
 # Everything the Messages API accepts inside a tool_result block. Any other key
 # is rejected outright ("tool_result.name: Extra inputs are not permitted"), so
 # history carrying one — an old checkpoint, another adapter's shape — has to be
@@ -91,10 +94,14 @@ def _pruned_block(block: object) -> object:
 
 
 def _for_api(messages: list[dict]) -> list[dict]:
-    """Strip internal reasoning and non-schema tool_result keys."""
+    """Strip internal reasoning and non-schema tool_result keys.
+
+    ``reasoning_details`` is another provider's opaque payload; the Anthropic
+    API has its own thinking blocks and would reject the field.
+    """
     cleaned: list[dict] = []
     for message in messages:
-        out = {key: value for key, value in message.items() if key != "reasoning"}
+        out = {key: value for key, value in message.items() if key not in _INTERNAL_MESSAGE_KEYS}
         content = out.get("content")
         if isinstance(content, list):
             out["content"] = [_pruned_block(block) for block in content]

@@ -190,7 +190,7 @@ class TestConversation:
 
         assert payload["input"][0]["output"] == "a\n\nb"
 
-    def test_thinking_in_history_is_dropped(self):
+    def test_unsigned_thinking_in_history_is_dropped(self):
         payload = _translate(
             messages=[
                 {"role": "user", "content": "q"},
@@ -204,6 +204,7 @@ class TestConversation:
             ]
         )
 
+        assert len(payload["input"]) == 2
         assert payload["input"][1]["content"] == [{"type": "output_text", "text": "a"}]
 
     def test_user_turn_cannot_carry_tool_use(self):
@@ -225,6 +226,97 @@ class TestConversation:
                 messages=[
                     {"role": "user", "content": "q"},
                     {"role": "assistant", "content": [image]},
+                ]
+            )
+
+
+class TestReasoningReplay:
+    """Signed thinking blocks come back as `reasoning` input items (verified live)."""
+
+    def _turn(self, *blocks: dict) -> list[dict]:
+        return _translate(
+            messages=[
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": list(blocks)},
+            ]
+        )["input"][1:]
+
+    def test_the_request_asks_for_encrypted_reasoning(self):
+        assert _translate()["include"] == ["reasoning.encrypted_content"]
+
+    def test_signed_thinking_becomes_a_reasoning_item_before_the_tool_call(self):
+        items = self._turn(
+            {"type": "thinking", "thinking": "need the weather", "signature": "ENC1"},
+            {"type": "tool_use", "id": "c1", "name": "get_weather", "input": {"city": "Paris"}},
+        )
+
+        assert items == [
+            {
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "need the weather"}],
+                "encrypted_content": "ENC1",
+            },
+            {
+                "type": "function_call",
+                "call_id": "c1",
+                "name": "get_weather",
+                "arguments": '{"city": "Paris"}',
+            },
+        ]
+
+    def test_reasoning_item_has_exactly_the_fields_the_backend_requires(self):
+        # Live: omitting `summary` is a 400 and `id` is not needed under store=false.
+        [item, _] = self._turn(
+            {"type": "thinking", "thinking": "t", "signature": "ENC"},
+            {"type": "text", "text": "a"},
+        )
+
+        assert set(item) == {"type", "summary", "encrypted_content"}
+
+    def test_a_summaryless_reasoning_item_keeps_an_empty_summary_list(self):
+        [item, _] = self._turn(
+            {"type": "thinking", "thinking": "", "signature": "ENC"},
+            {"type": "text", "text": "a"},
+        )
+
+        assert item["summary"] == []
+        assert item["encrypted_content"] == "ENC"
+
+    def test_blocks_keep_their_order_around_text(self):
+        items = self._turn(
+            {"type": "text", "text": "first"},
+            {"type": "thinking", "thinking": "t", "signature": "ENC"},
+            {"type": "tool_use", "id": "c", "name": "n", "input": {}},
+        )
+
+        assert [item["type"] for item in items] == ["message", "reasoning", "function_call"]
+
+    def test_several_signed_blocks_are_all_replayed_in_order(self):
+        items = self._turn(
+            {"type": "thinking", "thinking": "one", "signature": "ENC1"},
+            {"type": "thinking", "thinking": "two", "signature": "ENC2"},
+            {"type": "text", "text": "a"},
+        )
+
+        assert [i.get("encrypted_content") for i in items[:2]] == ["ENC1", "ENC2"]
+
+    def test_unsigned_thinking_is_dropped_next_to_signed(self):
+        items = self._turn(
+            {"type": "thinking", "thinking": "plain"},
+            {"type": "thinking", "thinking": "signed", "signature": "ENC"},
+            {"type": "text", "text": "a"},
+        )
+
+        assert [i["type"] for i in items] == ["reasoning", "message"]
+
+    def test_user_turn_still_cannot_carry_thinking(self):
+        with pytest.raises(ResponsesTranslationError, match="thinking"):
+            _translate(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [{"type": "thinking", "thinking": "t", "signature": "S"}],
+                    }
                 ]
             )
 

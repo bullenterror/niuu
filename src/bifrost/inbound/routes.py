@@ -28,6 +28,7 @@ from bifrost.config import AgentPermissions, AuditDetailLevel, BifrostConfig, Bu
 from bifrost.domain.models import RequestLog, TokenUsage
 from bifrost.domain.routing import RuleRejectError
 from bifrost.inbound.chat_completions import (
+    InvalidReasoningDetailsError,
     OpenAIChatRequest,
     anthropic_response_to_openai,
     anthropic_stream_to_openai,
@@ -1447,7 +1448,11 @@ def create_router(
                 422, f"Invalid request body: {reason}", "invalid_request_error"
             )
 
-        request = openai_request_to_anthropic(oai_request)
+        try:
+            request = openai_request_to_anthropic(oai_request)
+        except InvalidReasoningDetailsError as exc:
+            logger.warning("Rejected /v1/chat/completions request: %s", exc)
+            return openai_error_response(400, str(exc), "invalid_request_error")
 
         # --- Model access control ---
         agent_perms = config.permissions_for_agent(identity.agent_id)
