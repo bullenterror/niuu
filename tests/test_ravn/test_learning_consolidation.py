@@ -631,7 +631,7 @@ def test_a_failure_then_success_with_other_input_is_a_recovery() -> None:
 
     assert len(recoveries) == 1
     assert recoveries[0]["tool"] == "web_fetch"
-    assert "api.github.com" in recoveries[0]["failed_input"]
+    assert "check-runs" in recoveries[0]["failed_input"]
     assert "pull/1.diff" in recoveries[0]["succeeded_input"]
     assert agent_route_recoveries(calls, results, limit=0, excerpt_chars=60) == []
 
