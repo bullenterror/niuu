@@ -180,6 +180,10 @@ storage:
     size: 1Gi
     # -- Mount path inside session pods
     mountPath: /volundr/home
+    # -- Workload types that never mount the user's home (e.g. ravn_flock
+    # workflow sessions). With a ReadWriteOnce home, every pod that mounts it
+    # must share one node; leaving workflows out lets them schedule anywhere.
+    excludeWorkloadTypes: []
 
 # Tool-result image preview cache (config.preview_cache_dir). The root
 # filesystem is read-only, so this needs a writable mount; previews are

@@ -1926,3 +1926,32 @@ class TestGuildMembership:
         assert "guild" not in self._config("guild")
         config = self._config("guild", "--set", "guild.url=https://yggdrasil.niuu.world")
         assert config["guild"] == {"url": "https://yggdrasil.niuu.world"}
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is required")
+class TestStorageContributorHomePlacement:
+    """The storage contributor's home placement comes from storage.home."""
+
+    @staticmethod
+    def _storage_kwargs(*extra: str) -> dict:
+        config = _rendered_configmap(*extra)
+        return next(
+            c["kwargs"]
+            for c in config["session_contributors"]
+            if c["adapter"].endswith("contributors.storage.StorageContributor")
+        )
+
+    def test_shared_home_mounts_everywhere_without_colocation(self):
+        kwargs = self._storage_kwargs()
+        assert kwargs["home_colocate"] is False
+        assert kwargs["home_excluded_workload_types"] == []
+
+    def test_rwo_home_colocates_and_excludes_configured_workloads(self):
+        kwargs = self._storage_kwargs(
+            "--set",
+            "storage.home.accessMode=ReadWriteOnce",
+            "--set",
+            "storage.home.excludeWorkloadTypes={ravn_flock}",
+        )
+        assert kwargs["home_colocate"] is True
+        assert kwargs["home_excluded_workload_types"] == ["ravn_flock"]
