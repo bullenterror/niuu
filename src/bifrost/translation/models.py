@@ -68,7 +68,22 @@ class ImageBlock(BaseModel):
     cache_control: CacheControl | None = None
 
 
-ContentBlock = TextBlock | ThinkingBlock | ImageBlock | ToolUseBlock | ToolResultBlock
+class CompactionBlock(BaseModel):
+    """Anthropic's server-side compaction summary (beta ``compact-2026-01-12``).
+
+    The provider returns it in an assistant turn when it compacted the context;
+    the caller sends it back unchanged and the provider ignores every block
+    before it. Only a provider that compacts natively can read one.
+    """
+
+    type: Literal["compaction"] = "compaction"
+    content: str = ""
+    cache_control: CacheControl | None = None
+
+
+ContentBlock = (
+    TextBlock | ThinkingBlock | ImageBlock | ToolUseBlock | ToolResultBlock | CompactionBlock
+)
 
 # A message content value is either a plain string or a list of blocks.
 MessageContent = str | list[ContentBlock]
@@ -184,6 +199,13 @@ class AnthropicRequest(BaseModel):
     _routed_provider: str | None = PrivateAttr(default=None)
     _routing_prepared: bool = PrivateAttr(default=False)
     _response_format: dict[str, Any] | None = PrivateAttr(default=None)
+    # Set when a strip_images rule removed image blocks, so the native
+    # passthrough path can strip them from the provider's own payload too.
+    _images_stripped: bool = PrivateAttr(default=False)
+    # The (provider, model) candidates ModelRouter.route chose, so a request
+    # routes once even when the inbound layer inspects the route before
+    # handing the request back to the router.
+    _routed_candidates: list[tuple[str, str]] | None = PrivateAttr(default=None)
 
     @model_validator(mode="before")
     @classmethod
@@ -262,6 +284,21 @@ class AnthropicRequest(BaseModel):
     # receive it verbatim, the Anthropic adapter excludes it from its payload.
     reasoning_effort: str | None = None
     chat_template_kwargs: dict[str, Any] | None = None
+    # Anthropic context management (compaction, context editing). Only an
+    # adapter that speaks the Messages API natively can honour it; the router
+    # refuses it for any other (see ProviderPort.accepts_context_management).
+    context_management: dict[str, Any] | None = None
+
+    def uses_context_management(self) -> bool:
+        """Whether the request carries Anthropic context management or its blocks."""
+        if self.context_management:
+            return True
+        return any(
+            isinstance(block, CompactionBlock)
+            for message in self.messages
+            if isinstance(message.content, list)
+            for block in message.content
+        )
 
 
 # ---------------------------------------------------------------------------

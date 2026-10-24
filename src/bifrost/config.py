@@ -83,6 +83,18 @@ class ProviderConfig(BaseModel):
             "provider are passed as well."
         ),
     )
+    passthrough: bool = Field(
+        default=False,
+        description=(
+            "Serve this provider in its native protocol. A caller that speaks the "
+            "protocol the adapter does natively (OpenAI Responses for the ChatGPT "
+            "subscription adapter, Chat Completions for OpenAI-compatible servers) has "
+            "its request forwarded verbatim apart from the model name, instead of being "
+            "translated to the Anthropic format and back. Callers on other protocols keep "
+            "the canonical translation. The adapter must implement "
+            "bifrost.ports.native.NativePassthroughPort, or startup fails."
+        ),
+    )
 
     @model_validator(mode="after")
     def _kwargs_need_adapter(self) -> ProviderConfig:

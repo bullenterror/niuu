@@ -167,9 +167,19 @@ class _Conversation:
         self._append("assistant", blocks)
 
 
-def responses_request_to_anthropic(req: ResponsesRequest) -> AnthropicRequest:
-    """Convert a Responses API request to the Anthropic canonical format."""
-    if req.previous_response_id:
+def responses_request_to_anthropic(
+    req: ResponsesRequest, *, skip_native_only: bool = False
+) -> AnthropicRequest:
+    """Convert a Responses API request to the Anthropic canonical format.
+
+    With *skip_native_only* the result is a policy view for a request that may
+    be served natively: ``previous_response_id`` and input items only the
+    provider can interpret (compaction items, item references …) are left out
+    instead of refused. The caller must refuse them itself if the request ends
+    up on the canonical path (see
+    :func:`bifrost.inbound.native.responses_native_only_features`).
+    """
+    if req.previous_response_id and not skip_native_only:
         raise UnsupportedResponsesInputError(
             "previous_response_id is not supported: the gateway keeps no response state; "
             "send the full conversation in input"
@@ -227,6 +237,8 @@ def responses_request_to_anthropic(req: ResponsesRequest) -> AnthropicRequest:
             )
         elif kind == "reasoning":
             # Reasoning items round-trip OpenAI-side state; there is none here.
+            continue
+        elif skip_native_only:
             continue
         else:
             raise UnsupportedResponsesInputError(f"unsupported input item type {kind!r}")

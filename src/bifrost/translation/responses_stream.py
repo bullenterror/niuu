@@ -34,6 +34,7 @@ import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
+from bifrost.domain.usage import responses_usage
 from bifrost.ports.provider import ProviderError
 from bifrost.translation.models import (
     AnthropicResponse,
@@ -107,9 +108,19 @@ def _failure_message(payload: dict[str, Any]) -> str:
     return f"{code}: {message}"
 
 
-def _usage_of(response: dict[str, Any]) -> tuple[int, int]:
-    usage = response.get("usage") or {}
-    return int(usage.get("input_tokens") or 0), int(usage.get("output_tokens") or 0)
+def _usage_of(response: dict[str, Any]) -> dict[str, int]:
+    """The response's usage as Anthropic ``message_delta`` usage.
+
+    Mapped by :func:`bifrost.domain.usage.responses_usage`, the same function
+    the native passthrough path meters with, so a request costs the same on
+    either path.
+    """
+    usage = responses_usage(response.get("usage"))
+    return {
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "reasoning_tokens": usage.reasoning_tokens,
+    }
 
 
 async def responses_to_anthropic_events(
@@ -196,13 +207,12 @@ async def responses_to_anthropic_events(
                     )
             else:
                 stop_reason = "tool_use" if saw_tool_call else "end_turn"
-            input_tokens, output_tokens = _usage_of(response)
             yield (
                 "message_delta",
                 {
                     "type": "message_delta",
                     "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                    "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+                    "usage": _usage_of(response),
                 },
             )
             yield ("message_stop", {"type": "message_stop"})

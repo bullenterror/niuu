@@ -75,7 +75,11 @@ class TestRecordedStreams:
         text = "".join(e["delta"]["text"] for e in events if e["type"] == "content_block_delta")
         assert text == "Hello to you."
         assert events[-2]["delta"] == {"stop_reason": "end_turn", "stop_sequence": None}
-        assert events[-2]["usage"] == {"input_tokens": 22, "output_tokens": 8}
+        assert events[-2]["usage"] == {
+            "input_tokens": 22,
+            "output_tokens": 8,
+            "reasoning_tokens": 0,
+        }
 
     async def test_tool_call(self):
         events = await _translate(_fixture("tool_call"))

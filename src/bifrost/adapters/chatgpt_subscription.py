@@ -23,6 +23,15 @@ Wire format (verified against the live backend):
   step continue that reasoning (the request carries ``store: false``, so this is
   the only way to carry it).
 
+Native passthrough: with ``passthrough: true`` on the provider, a caller that
+speaks the Responses API (``POST /v1/responses``) is served without the
+Anthropic round trip — its body goes to the backend verbatim apart from the
+model name and ``stream: true`` (the backend only streams). That is the path
+that carries ``context_management`` compaction, which this backend accepts
+(verified live: ``compaction`` output items with ``encrypted_content``);
+``POST /responses/compact`` answers 404 here, so standalone compaction is not
+offered.
+
 Configure it on a provider (all keys under ``kwargs``)::
 
     providers:
@@ -41,6 +50,7 @@ Configure it on a provider (all keys under ``kwargs``)::
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import uuid
 from collections.abc import AsyncIterator
@@ -53,7 +63,8 @@ from bifrost.adapters.codex_token_broker import (
     CodexSubscriptionError,
     CodexTokenBroker,
 )
-from bifrost.ports.provider import ProviderPort
+from bifrost.ports.native import NativePassthroughPort, NativeProtocol
+from bifrost.ports.provider import ProviderError, ProviderPort
 from bifrost.translation.models import AnthropicRequest, AnthropicResponse
 from bifrost.translation.responses_stream import (
     new_message_id,
@@ -71,8 +82,16 @@ DEFAULT_BROKER_TOKEN_PATH = "/api/v1/internal/credentials/codex/tokens"
 _ERROR_BODY_LIMIT = 500
 
 
-class ChatGPTSubscriptionAdapter(ProviderPort):
+# Responses stream events that end the response, and the one that fails it.
+_TERMINAL_EVENTS = frozenset({"response.completed", "response.incomplete", "response.failed"})
+_FAILED_EVENT = "response.failed"
+
+
+class ChatGPTSubscriptionAdapter(ProviderPort, NativePassthroughPort):
     """Provider adapter for OpenAI models served over a ChatGPT/Codex subscription."""
+
+    native_protocol = NativeProtocol.OPENAI_RESPONSES
+    supports_native_compaction = True
 
     def __init__(
         self,
@@ -203,9 +222,57 @@ class ChatGPTSubscriptionAdapter(ProviderPort):
             ):
                 yield event
 
+    async def native_stream(self, payload: dict[str, Any], model: str) -> AsyncIterator[str]:
+        body = {**payload, "model": model, "stream": True}
+        async with contextlib.aclosing(self._response_lines(body)) as lines:
+            async for line in lines:
+                yield f"{line}\n"
+
+    async def native_complete(self, payload: dict[str, Any], model: str) -> dict[str, Any]:
+        """Consume the stream and return the terminal event's ``response``.
+
+        The backend only streams. Its ``response.completed`` object does not
+        always list the output, so the items announced by
+        ``response.output_item.done`` are put in when it arrives empty.
+        """
+        items: list[dict[str, Any]] = []
+        body = {**payload, "model": model, "stream": True}
+        async with contextlib.aclosing(self._response_lines(body)) as lines:
+            async for line in lines:
+                event = _sse_event(line)
+                if event is None:
+                    continue
+                kind = event.get("type")
+                if kind == "response.output_item.done" and isinstance(event.get("item"), dict):
+                    items.append(event["item"])
+                    continue
+                if kind not in _TERMINAL_EVENTS:
+                    continue
+                response = dict(event.get("response") or {})
+                if kind == _FAILED_EVENT:
+                    error = response.get("error") or {}
+                    raise ProviderError(
+                        f"ChatGPT backend failed the response: {error.get('message') or error}"
+                    )
+                if not response.get("output"):
+                    response["output"] = items
+                return response
+        raise ProviderError("ChatGPT backend ended the stream without a terminal response event")
+
     async def close(self) -> None:
         await self._client.aclose()
         await self._broker.close()
+
+
+def _sse_event(line: str) -> dict[str, Any] | None:
+    """The JSON object on an SSE ``data:`` line, or ``None`` for any other line."""
+    if not line.startswith("data: "):
+        return None
+    try:
+        event = json.loads(line[len("data: ") :])
+    except json.JSONDecodeError:
+        return None
+    return event if isinstance(event, dict) else None
 
 
 def _error_detail(response: httpx.Response) -> str:
