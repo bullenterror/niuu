@@ -147,6 +147,25 @@ async def test_backfill_merges_regins_paraphrases_and_supersedes_the_403_claim(
     assert ALL_ROUTES_BLOCKED[1] not in injected
 
 
+async def test_backfill_leaves_lesson_pages_another_writer_put_there(tmp_path: Path) -> None:
+    """Regin's backfill stopped on a tool-build note under learnings/tools/.
+
+    The note had no frontmatter, curation judged it the same lesson as a
+    candidate, and retiring it raised: the pass died after 659 judgments.
+    """
+    mimir = MarkdownMimirAdapter(root=tmp_path)
+    await _seed_regin(mimir)
+    note_path = "learnings/tools/github-diff-route-build.md"
+    note = f"# github diff route build\n\n{DIFF_ROUTE[1]}\n"
+    await mimir.upsert_page(note_path, note)
+
+    report = await _curator(mimir).curate()
+
+    assert await mimir.read_page(note_path) == note
+    assert note_path not in report.paths("merged")
+    assert len(report.paths("merged")) == 2
+
+
 async def test_a_second_pass_finds_nothing_left_to_do(tmp_path: Path) -> None:
     mimir = MarkdownMimirAdapter(root=tmp_path)
     await _seed_regin(mimir)

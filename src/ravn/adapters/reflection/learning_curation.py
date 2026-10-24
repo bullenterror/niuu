@@ -169,7 +169,7 @@ class LearningCurator:
         pool = [
             lesson
             for lesson in await self._lessons.load(self._mimir)
-            if _matchable(lesson) and _reflection_owns(lesson.path)
+            if _matchable(lesson) and _reflection_owns(lesson.path, lesson.content)
         ]
         report.lessons_reviewed = len(pool)
         state = _PassState({lesson.path: lesson for lesson in pool})

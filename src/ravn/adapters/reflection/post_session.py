@@ -539,7 +539,9 @@ class PostSessionReflectionService:
         learnings by how recently they were confirmed: a lesson the resident
         keeps relearning is the one it most needs in front of it.
         """
-        if self._config.matching.mode != "semantic" or not _reflection_owns(page.meta.path):
+        if self._config.matching.mode != "semantic" or not _reflection_owns(
+            page.meta.path, page.content
+        ):
             logger.info(
                 "PostSessionReflectionService: trusted learning %r already exists; "
                 "reflection %s cannot mutate it",
@@ -778,8 +780,19 @@ def _matchable(lesson: Lesson) -> bool:
     return not (lesson.category == CANDIDATE_CATEGORY and lesson.status == "promoted")
 
 
-def _reflection_owns(path: str) -> bool:
-    """Whether reflection and curation may rewrite the lesson page at *path*."""
+def _reflection_owns(path: str, content: str) -> bool:
+    """Whether reflection and curation may rewrite the lesson page at *path*.
+
+    The path says where reflection writes; the page's own frontmatter says
+    whether reflection wrote it. Other writers also put pages under
+    ``learnings/`` — tool-build notes, operator pages, the shared mount — with
+    no ``status`` to mark, so those are read as lessons but never rewritten.
+    """
+    return _reflection_writes_at(path) and bool(frontmatter_values(content).get("status"))
+
+
+def _reflection_writes_at(path: str) -> bool:
+    """Whether *path* is where reflection keeps the lessons it writes."""
     if path.startswith(f"{CANDIDATE_CATEGORY}/"):
         return True
     return path.startswith(f"{LEARNING_CATEGORY}/") and not path.startswith(

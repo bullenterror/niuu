@@ -53,6 +53,7 @@ from ravn.adapters.reflection.post_session import (
     _escape_yaml,
     _insert_timeline_entry,
     _reflection_owns,
+    _reflection_writes_at,
     _set_frontmatter_value,
     promote_candidate,
     set_procedure,
@@ -254,7 +255,7 @@ class SelfImprovementPass:
 
     async def _demote(self, path: str, by_path: dict[str, Lesson], reason: str) -> None:
         lesson = by_path.get(path)
-        if lesson is None or not lesson.active or not _reflection_owns(path):
+        if lesson is None or not lesson.active or not _reflection_writes_at(path):
             return
         content = _set_frontmatter_value(lesson.content, "status", "demoted")
         content = _set_frontmatter_value(
@@ -275,7 +276,7 @@ class SelfImprovementPass:
     ) -> None:
         """Record an improvement that worked as evidence on the lesson it relied on."""
         lesson = by_path.get(action.get("target", ""))
-        if lesson is None or not lesson.active or not _reflection_owns(lesson.path):
+        if lesson is None or not lesson.active or not _reflection_owns(lesson.path, lesson.content):
             return
         note = f"friction {record.path} stopped recurring: {reason}"
         content = _insert_timeline_entry(
@@ -419,7 +420,11 @@ class SelfImprovementPass:
             promoted = await self._mimir.read_page(target)
             instruction = _learned_instruction(lesson, body=promoted)
         elif kind == "rewrite_learning":
-            if lesson is None or not lesson.is_learning or not _reflection_owns(lesson.path):
+            if (
+                lesson is None
+                or not lesson.is_learning
+                or not _reflection_owns(lesson.path, lesson.content)
+            ):
                 return "rewrite_learning needs a shown learning this resident owns"
             procedure = await self._judge.procedure(lesson, max_chars=self._procedure_max_chars)
             content = set_procedure(lesson.content, procedure)
@@ -430,7 +435,7 @@ class SelfImprovementPass:
             target = lesson.path
             instruction = f"You already learned this: {procedure} Apply it before asking."
         elif kind == "retire_belief":
-            if lesson is None or not _reflection_owns(lesson.path):
+            if lesson is None or not _reflection_owns(lesson.path, lesson.content):
                 return "retire_belief needs a shown lesson this resident owns"
             content = _set_frontmatter_value(lesson.content, "status", "superseded")
             content = _set_frontmatter_value(content, "superseded_by", f'"{record.path}"')

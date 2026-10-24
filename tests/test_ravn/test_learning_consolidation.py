@@ -426,11 +426,19 @@ def test_promotion_reason_ranks_route_recovery_below_explicit_evidence() -> None
 
 
 def test_reflection_owns_only_its_own_lesson_pages() -> None:
-    assert _reflection_owns("learning-candidates/general/x.md")
-    assert _reflection_owns("learnings/general/x.md")
-    assert not _reflection_owns("learnings/shared/x.md")
-    assert not _reflection_owns("learnings/flock/flock-k8s/x.md")
-    assert not _reflection_owns("technical/x.md")
+    written = "---\nstatus: candidate\n---\n\n# Lesson\n"
+    assert _reflection_owns("learning-candidates/general/x.md", written)
+    assert _reflection_owns("learnings/general/x.md", written)
+    assert not _reflection_owns("learnings/shared/x.md", written)
+    assert not _reflection_owns("learnings/flock/flock-k8s/x.md", written)
+    assert not _reflection_owns("technical/x.md", written)
+
+
+def test_reflection_does_not_own_lesson_pages_another_writer_put_there() -> None:
+    """A tool-build note under learnings/ carries no status for curation to mark."""
+    note = "# patch_node_labels build\n\nBuilt and self-verified learned_tool.json.\n"
+    assert not _reflection_owns("learnings/tools/patch_node_labels-build.md", note)
+    assert not _reflection_owns("learnings/general/x.md", "---\ntitle: x\n---\n")
 
 
 def test_set_procedure_inserts_then_replaces() -> None:
