@@ -193,6 +193,62 @@ class TestContextCompressorCompression:
         assert result_msgs[-2].content == "Last 1"
 
     @pytest.mark.asyncio
+    async def test_tool_calls_and_their_results_stay_on_one_side_of_the_cut(self):
+        """Regin's resumed turns: the protected head kept six tool calls and the
+        middle summarised their results, which the Responses backend rejects."""
+
+        def _calls(ids: list[str]) -> Message:
+            return Message(
+                role="assistant",
+                content=[{"type": "tool_use", "id": i, "name": "t", "input": {}} for i in ids],
+            )
+
+        def _results(ids: list[str]) -> Message:
+            return Message(
+                role="user",
+                content=[
+                    {"type": "tool_result", "tool_use_id": i, "content": "r " * 40} for i in ids
+                ],
+            )
+
+        compressor = ContextCompressor(
+            _make_llm(_long_doc()),
+            model="gpt-6-sol",
+            context_window=100,
+            compression_threshold=0.1,
+            protect_first=2,
+            protect_last=1,
+        )
+        msgs = [
+            Message(role="user", content="Resume the case with the operator's answer."),
+            _calls(["a1", "a2", "a3", "a4", "a5", "a6"]),
+            _results(["a1", "a2", "a3", "a4", "a5", "a6"]),
+            _calls(["b1"]),
+            _results(["b1"]),
+        ]
+
+        result_msgs, result = await compressor.maybe_compress(msgs)
+
+        assert result.was_compressed
+        calls = [
+            b["id"]
+            for m in result_msgs
+            if isinstance(m.content, list)
+            for b in m.content
+            if b["type"] == "tool_use"
+        ]
+        results = [
+            b["tool_use_id"]
+            for m in result_msgs
+            if isinstance(m.content, list)
+            for b in m.content
+            if b["type"] == "tool_result"
+        ]
+        assert calls == results == ["b1"]
+        assert result_msgs[0].content == "Resume the case with the operator's answer."
+        assert result_msgs[-2:] == msgs[-2:]
+
+    @pytest.mark.asyncio
     async def test_no_compression_when_protected_zone_covers_all(self):
         """When protect_first + protect_last >= total messages, no middle to compact."""
         llm = _make_llm()

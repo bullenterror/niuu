@@ -779,6 +779,26 @@ findings: "[{severity: high}]"
         assert validation_errors == []
 
     @pytest.mark.asyncio
+    async def test_an_empty_resident_turn_is_not_repaired_into_an_outcome(self) -> None:
+        """Repairing nothing invented "No previous outcome or supporting evidence
+        was supplied", closed the case and consumed the operator's answer."""
+        dl = _make_drive_loop()
+        dl._persona_config = SimpleNamespace(
+            name="k8s-valkyrie",
+            produces=_valkyrie_judgment_produces(),
+        )
+        task = _make_agent_task(task_id="task-valkyrie-empty")
+
+        class RepairAgent:
+            async def repair_outcome(self, prompt: str) -> TurnResult:
+                raise AssertionError("an empty turn must not reach repair")
+
+        with pytest.raises(RuntimeError, match="produced no output"):
+            await dl._maybe_repair_resident_valkyrie_outcome(
+                agent=RepairAgent(), task=task, response_text="  "
+            )
+
+    @pytest.mark.asyncio
     async def test_repair_unroutable_workflow_outcome_reuses_same_agent(self) -> None:
         dl = _make_drive_loop()
         dl._persona_config = SimpleNamespace(

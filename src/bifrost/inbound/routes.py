@@ -34,6 +34,7 @@ from bifrost.inbound.chat_completions import (
     anthropic_stream_to_openai,
     openai_error_response,
     openai_request_to_anthropic,
+    openai_stream_errors_reported,
 )
 from bifrost.inbound.ollama import (
     OllamaChatRequest,
@@ -1489,25 +1490,27 @@ def create_router(
             if request.stream:
                 message_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
                 stream_resp = StreamingResponse(
-                    anthropic_stream_to_openai(
-                        _stream_with_tracking(
-                            router.stream(request, routing_ctx),
-                            request.model,
-                            start,
-                            identity,
-                            store,
-                            pricing_overrides,
-                            request_id,
-                            provider=provider,
-                            emitter=event_emitter,
-                            agent_budget_limit=agent_budget_limit,
-                            budget_warning_threshold_pct=config.events.budget_warning_threshold_pct,
-                            sleipnir_publisher=getattr(
-                                raw_request.app.state, "sleipnir_publisher", None
+                    openai_stream_errors_reported(
+                        anthropic_stream_to_openai(
+                            _stream_with_tracking(
+                                router.stream(request, routing_ctx),
+                                request.model,
+                                start,
+                                identity,
+                                store,
+                                pricing_overrides,
+                                request_id,
+                                provider=provider,
+                                emitter=event_emitter,
+                                agent_budget_limit=agent_budget_limit,
+                                budget_warning_threshold_pct=config.events.budget_warning_threshold_pct,
+                                sleipnir_publisher=getattr(
+                                    raw_request.app.state, "sleipnir_publisher", None
+                                ),
                             ),
-                        ),
-                        message_id=message_id,
-                        model=request.model,
+                            message_id=message_id,
+                            model=request.model,
+                        )
                     ),
                     media_type="text/event-stream",
                     headers={

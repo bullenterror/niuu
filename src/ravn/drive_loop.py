@@ -3605,6 +3605,15 @@ class DriveLoop:
         )
         if not canonical_event_type or not validation_errors:
             return None
+        # Repair reformats an answer; it cannot supply one. Given an empty turn
+        # it invented a whole outcome ("No previous outcome or supporting
+        # evidence was supplied"), closed the case and consumed the operator's
+        # reply, so every answer to a resumed question was lost.
+        if not response_text.strip():
+            raise RuntimeError(
+                f"resident task {task.task_id} produced no output, so there is no outcome "
+                "to repair; the model turn failed and must be diagnosed, not reformatted"
+            )
         repair_outcome = getattr(agent, "repair_outcome", None)
         if repair_outcome is None or not asyncio.iscoroutinefunction(repair_outcome):
             return None

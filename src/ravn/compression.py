@@ -299,6 +299,15 @@ class ContextCompressor:
 
         middle_start = protect_first
         middle_end = total - protect_last if protect_last > 0 else total
+        # A tool call and its result must stay on the same side of the cut.
+        # Protecting the first two messages of a turn kept the assistant's tool
+        # calls while their results were summarised away, and the ChatGPT
+        # Responses backend rejects a call with no output ("No tool output
+        # found for function call") — every resumed resident turn failed so.
+        while middle_start > 0 and _has_block(messages[middle_start - 1], "tool_use"):
+            middle_start -= 1
+        while middle_start < middle_end < total and _has_block(messages[middle_end], "tool_result"):
+            middle_end -= 1
         middle = messages[middle_start:middle_end]
 
         if not middle:
@@ -312,8 +321,8 @@ class ContextCompressor:
             content=_COMPACTED_PLACEHOLDER.format(document=document),
         )
 
-        head = messages[:protect_first]
-        tail = messages[total - protect_last :] if protect_last > 0 else []
+        head = messages[:middle_start]
+        tail = messages[middle_end:]
         # middle (len M) is replaced by 1 compacted message → removed = M - 1
         removed = len(middle) - 1
         return head + [compacted_msg] + tail, removed
@@ -351,6 +360,15 @@ class ContextCompressor:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _has_block(message: Message, block_type: str) -> bool:
+    """Whether *message* carries a content block of *block_type*."""
+    if isinstance(message.content, str):
+        return False
+    return any(
+        isinstance(block, dict) and block.get("type") == block_type for block in message.content
+    )
 
 
 def _extract_content_text(content: str | list[dict]) -> str:

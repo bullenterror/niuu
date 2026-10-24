@@ -21,6 +21,7 @@ step. The ``format`` Bifröst labels them with is fixed at
 from __future__ import annotations
 
 import json
+import logging
 import time
 from collections.abc import AsyncIterator
 from typing import Any, Literal
@@ -44,6 +45,8 @@ from bifrost.translation.models import (
 )
 from bifrost.translation.to_anthropic import _openai_tool_calls_to_blocks
 from bifrost.translation.to_openai import _extract_tool_calls
+
+logger = logging.getLogger(__name__)
 
 REASONING_ENCRYPTED_TYPE = "reasoning.encrypted"
 REASONING_DETAILS_FORMAT = "openai-responses-v1"
@@ -419,6 +422,24 @@ def _openai_chunk(
     if usage is not None:
         payload["usage"] = usage
     return f"data: {json.dumps(payload)}\n\n"
+
+
+async def openai_stream_errors_reported(source: AsyncIterator[str]) -> AsyncIterator[str]:
+    """Report a failure after the 200 as an OpenAI ``error`` event.
+
+    Streaming responses commit their status before the provider answers, so a
+    provider that rejects the request (an orphaned tool call, an exhausted
+    quota) can only fail mid-stream. Raising out of the generator just closed
+    the connection: the client saw a stream with no text, no tool call and no
+    end, and Ravn read that as an empty answer.
+    """
+    try:
+        async for chunk in source:
+            yield chunk
+    except Exception as exc:
+        logger.error("Streaming chat completion failed after the response started: %s", exc)
+        error = {"error": {"message": str(exc), "type": "server_error"}}
+        yield f"data: {json.dumps(error)}\n\n"
 
 
 async def anthropic_stream_to_openai(

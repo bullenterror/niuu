@@ -592,25 +592,29 @@ class OpenAICompatibleAdapter(LLMPort):
             # inside the very branch meant to report an empty stream, so a
             # resident turn failed with a Python error instead of a diagnosis.
             finish_reason: str | None = None
-
-            # Bound here, not only inside the loop: a stream can end without ever
-            # delivering a chunk that carries `choices` — every chunk usage-only,
-            # or nothing at all — and the post-loop recovery and logging all read
-            # this. Leaving it unbound made that case die with UnboundLocalError
-            # inside the very branch meant to report an empty stream, so a
-            # resident turn failed with a Python error instead of a diagnosis.
+            saw_done = False
 
             async for line in response.aiter_lines():
                 if not line.startswith("data: "):
                     continue
                 raw = line[len("data: ") :]
                 if raw == "[DONE]":
+                    saw_done = True
                     break
 
                 try:
                     event_data = json.loads(raw)
                 except json.JSONDecodeError:
                     continue
+
+                upstream_error = event_data.get("error")
+                if upstream_error:
+                    message = (
+                        upstream_error.get("message")
+                        if isinstance(upstream_error, dict)
+                        else str(upstream_error)
+                    )
+                    raise LLMError(f"OpenAI-compatible stream error: {message}")
 
                 # Usage-only chunk (stream_options: include_usage)
                 usage_raw = event_data.get("usage")
@@ -706,6 +710,17 @@ class OpenAICompatibleAdapter(LLMPort):
             # Same reasoning as the non-streaming path: a stream that produced
             # neither text nor a tool call leaves the agent loop with nothing to
             # act on, and the cause is not recoverable after the fact.
+            # A stream that ends with neither [DONE] nor a finish_reason was cut
+            # off, not answered. Bifröst used to end the stream this way when the
+            # provider rejected the request after the 200 was sent; reading that
+            # as an empty answer let a resident's schema repair invent an outcome
+            # and consume the operator's reply.
+            if not saw_done and finish_reason is None:
+                raise LLMError(
+                    f"OpenAI-compatible stream for {model or self._default_model!r} ended "
+                    "before completion (no [DONE] and no finish_reason); the server "
+                    "aborted the response"
+                )
             if not "".join(accumulated_text).strip() and not tool_names:
                 logger.warning(
                     "openai-compatible: empty stream model=%s finish_reason=%s "
