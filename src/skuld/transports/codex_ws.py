@@ -76,6 +76,12 @@ def codex_gateway_overrides(gateway_url: str) -> list[tuple[str, str]]:
         (f"{base}.base_url", json.dumps(f"{url}/v1")),
         (f"{base}.env_key", json.dumps(CODEX_GATEWAY_TOKEN_ENV)),
         (f"{base}.wire_api", json.dumps("responses")),
+        # The gateway serves self-hosted models through Bifröst's canonical
+        # translation, which carries function tools only and refuses the rest.
+        # Codex otherwise asks for hosted web search (on by default) and the
+        # multi-agent tool namespace (verified against Codex 0.157.1).
+        ("web_search", json.dumps("disabled")),
+        ("features.multi_agent", "false"),
     ]
 
 
@@ -342,6 +348,13 @@ class CodexWebSocketTransport(CLITransport):
         self._model_gateway_url = model_gateway_url.strip()
         self._model_gateway_token = model_gateway_token
         self._gateway_overrides = codex_gateway_overrides(self._model_gateway_url)
+        if self._model_gateway_url and multi_agent_enabled:
+            raise ValueError(
+                "multi_agent_enabled is set for a Codex session routed through the model "
+                f"gateway at {self._model_gateway_url!r}; the gateway serves function tools "
+                "only, so Codex's multi-agent tool namespace cannot reach the model. Unset "
+                "multi_agent_enabled for gateway sessions, or run the model without the gateway"
+            )
         # Default every OpenAI Codex model to high unless launch configuration
         # overrides it. A model behind the gateway is whatever the operator
         # serves; only an explicit session setting asks it for reasoning.

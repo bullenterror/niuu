@@ -3765,8 +3765,19 @@ class TestModelGateway:
             "model_providers.niuu.base_url": '"http://niuu:8080/api/v1/bifrost/v1"',
             "model_providers.niuu.env_key": '"NIUU_MODEL_GATEWAY_TOKEN"',
             "model_providers.niuu.wire_api": '"responses"',
+            "web_search": '"disabled"',
+            "features.multi_agent": "false",
         }
         assert codex_gateway_overrides("  ") == []
+
+    def test_multi_agent_cannot_be_asked_of_the_gateway(self, tmp_path):
+        with pytest.raises(ValueError, match="multi-agent tool namespace"):
+            _make_transport(
+                tmp_path,
+                model_gateway_url="http://niuu:8080/api/v1/bifrost",
+                model_gateway_token="niuu-gateway",
+                multi_agent_enabled=True,
+            )
 
     @pytest.mark.asyncio
     async def test_spawn_passes_the_overrides_and_the_token(self, tmp_path):
@@ -3796,6 +3807,8 @@ class TestModelGateway:
         assert 'model_provider="niuu"' in args
         assert 'model_providers.niuu.base_url="http://niuu:8080/api/v1/bifrost/v1"' in args
         assert 'model_providers.niuu.wire_api="responses"' in args
+        assert 'web_search="disabled"' in args
+        assert "features.multi_agent=false" in args
         assert mock_exec.call_args.kwargs["env"]["NIUU_MODEL_GATEWAY_TOKEN"] == "niuu-gateway"
 
     @pytest.mark.asyncio
