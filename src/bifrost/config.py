@@ -66,6 +66,32 @@ class ProviderConfig(BaseModel):
             "routing strategy to prefer cheaper providers. Lower is cheaper."
         ),
     )
+    adapter: str = Field(
+        default="",
+        description=(
+            "Fully-qualified class path of the provider adapter, e.g. "
+            "'bifrost.adapters.chatgpt_subscription.ChatGPTSubscriptionAdapter'. "
+            "When empty the adapter is chosen from the provider name (anthropic, "
+            "openai, ollama, otherwise OpenAI-compatible)."
+        ),
+    )
+    kwargs: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Constructor keyword arguments passed to the adapter class. Only valid "
+            "together with 'adapter'; base_url and timeout configured on the "
+            "provider are passed as well."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _kwargs_need_adapter(self) -> ProviderConfig:
+        if self.kwargs and not self.adapter:
+            raise ValueError(
+                "provider 'kwargs' are constructor arguments for a dynamic adapter: "
+                "set 'adapter' to the adapter's class path, or remove 'kwargs'"
+            )
+        return self
 
     @property
     def api_key(self) -> str:

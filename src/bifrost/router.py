@@ -22,6 +22,7 @@ from bifrost.ports.rules import RoutingContext, RuleEnginePort
 from bifrost.ports.selection import SelectionPort
 from bifrost.translation.models import AnthropicRequest, AnthropicResponse
 from niuu.observability import get_observability
+from niuu.utils import import_class
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +85,33 @@ _PROVIDER_ADAPTER_MAP: dict[str, str] = {
     "ollama": "bifrost.adapters.ollama.OllamaAdapter",
 }
 
+# ProviderConfig.timeout's default: adapters keep their own default unless the
+# operator changed it.
+_DEFAULT_PROVIDER_TIMEOUT = ProviderConfig.model_fields["timeout"].default
+
+
+def _dynamic_adapter_kwargs(provider_name: str, cfg: ProviderConfig, base_url: str) -> dict:
+    """Constructor kwargs for an adapter named by ``cfg.adapter``.
+
+    The provider's ``kwargs`` are the adapter's own configuration. ``base_url``
+    and ``timeout`` set on the provider are passed too; naming either in both
+    places is ambiguous and refused rather than resolved by silently preferring
+    one.
+    """
+    kwargs = dict(cfg.kwargs)
+    inherited: dict = {}
+    if base_url:
+        inherited["base_url"] = base_url
+    if cfg.timeout != _DEFAULT_PROVIDER_TIMEOUT:
+        inherited["timeout"] = cfg.timeout
+    clashes = sorted(set(inherited) & set(kwargs))
+    if clashes:
+        raise ValueError(
+            f"provider '{provider_name}' sets {', '.join(clashes)} both on the provider "
+            "and in its adapter kwargs: keep it in one place"
+        )
+    return {**inherited, **kwargs}
+
 
 def _load_adapter(
     provider_name: str,
@@ -93,10 +121,19 @@ def _load_adapter(
 ) -> ProviderPort:
     """Instantiate the appropriate adapter for *provider_name*.
 
-    When a *key_vault* is provided, the provider's API key is read from
-    the vault (which holds the cached, rotatable value).  Otherwise the
-    key is read directly from ``cfg.api_key`` for backwards compatibility.
+    When ``cfg.adapter`` names a class it is imported and built from
+    ``cfg.kwargs`` (dynamic adapter configuration). Otherwise the adapter is
+    chosen from the provider name. When a *key_vault* is provided, the
+    provider's API key is read from the vault (which holds the cached,
+    rotatable value); otherwise the key is read directly from ``cfg.api_key``
+    for backwards compatibility.
     """
+    api_key = key_vault.get_key(provider_name) if key_vault else cfg.api_key
+    if cfg.adapter:
+        kwargs = _dynamic_adapter_kwargs(provider_name, cfg, base_url)
+        if api_key:
+            kwargs["api_key"] = api_key
+        return import_class(cfg.adapter)(**kwargs)
     dotted = _PROVIDER_ADAPTER_MAP.get(
         provider_name,
         "bifrost.adapters.openai_compat.OpenAICompatAdapter",
@@ -107,10 +144,9 @@ def _load_adapter(
     kwargs: dict = {}
     if base_url:
         kwargs["base_url"] = base_url
-    api_key = key_vault.get_key(provider_name) if key_vault else cfg.api_key
     if api_key:
         kwargs["api_key"] = api_key
-    if cfg.timeout != 120.0:
+    if cfg.timeout != _DEFAULT_PROVIDER_TIMEOUT:
         kwargs["timeout"] = cfg.timeout
     if cfg.chat_template_kwargs:
         kwargs["chat_template_kwargs"] = cfg.chat_template_kwargs
