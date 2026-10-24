@@ -381,6 +381,47 @@ class FluxPodManager(
 
         return self._map_status(obj)
 
+    async def status_detail(self, session: Session) -> str | None:
+        """Say why a session's pods are not running, from the cluster's own record.
+
+        A failed install used to surface as "infrastructure reported failure":
+        Flux uninstalls the release and its pods, taking the reason with them.
+        Pod Warning events outlive the pods, so they still say what happened
+        (e.g. FailedScheduling: Insufficient memory). A Ready release has no
+        detail to report.
+        """
+        release_name = self._release_name(session)
+        obj = await self._get_helmrelease(release_name)
+        conditions = (obj or {}).get("status", {}).get("conditions", [])
+        ready = next((c for c in conditions if c.get("type") == "Ready"), None)
+        if ready is not None and ready.get("status") == "True":
+            return None
+
+        parts: list[str] = []
+        warning = await self._latest_pod_warning(release_name)
+        if warning:
+            parts.append(warning)
+        if ready is not None and ready.get("message"):
+            parts.append(f"HelmRelease {ready.get('reason') or 'NotReady'}: {ready['message']}")
+        return "; ".join(parts) or None
+
+    async def _latest_pod_warning(self, release_name: str) -> str | None:
+        core = await self._get_core_api()
+        events = await core.list_namespaced_event(
+            self._namespace,
+            field_selector="type=Warning,involvedObject.kind=Pod",
+        )
+        prefix = f"{release_name}-"
+        mine = [
+            event
+            for event in events.items or []
+            if (event.involved_object.name or "").startswith(prefix)
+        ]
+        if not mine:
+            return None
+        latest = max(mine, key=_event_time)
+        return f"pod {latest.involved_object.name}: {latest.reason}: {latest.message}"
+
     @staticmethod
     def _map_status(obj: dict) -> SessionStatus:
         """Map HelmRelease .status.conditions to SessionStatus."""
@@ -1759,3 +1800,11 @@ def _inject_codex_auth_env(values: dict) -> None:
 
 def _has_env(env: list, name: str) -> bool:
     return any(isinstance(entry, dict) and entry.get("name") == name for entry in env)
+
+
+def _event_time(event: Any) -> datetime:
+    """When a Kubernetes event last happened; events carry one of three stamps."""
+    stamp = event.last_timestamp or event.event_time or event.first_timestamp
+    if stamp is None:
+        return datetime.min.replace(tzinfo=UTC)
+    return stamp

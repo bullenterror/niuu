@@ -924,10 +924,14 @@ class VolundrHTTPAdapter(VolundrPort):
                                 continue
                             status = data.get("status", "")
                             if status in ("stopped", "failed"):
+                                # Carry Völundr's reason: without it a session
+                                # that could not even be scheduled failed its
+                                # A2A task as a bare "Session failed".
+                                error = str(data.get("error") or "").strip()
                                 yield ActivityEvent(
                                     session_id=data.get("id", ""),
                                     state="",
-                                    metadata={},
+                                    metadata={"error": error} if error else {},
                                     owner_id=data.get("owner_id", ""),
                                     session_status=status,
                                 )
