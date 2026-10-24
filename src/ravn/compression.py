@@ -59,14 +59,12 @@ log, expose via events, or surface to the user.
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 
 from ravn.budget import TokenEstimator
+from ravn.domain.exceptions import ContextCompressionError, LLMError
 from ravn.domain.models import LLMResponse, Message, TodoItem
 from ravn.ports.llm import LLMPort
-
-logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # LLM prompt constants
@@ -98,18 +96,6 @@ _MEMORY_ANCHOR_TEMPLATE = (
 
 _COMPACTED_PLACEHOLDER = "[Compacted context]\n\n{document}"
 
-_FALLBACK_DOCUMENT = (
-    "## Active task\n"
-    "Unknown\n\n"
-    "## Decisions made\n"
-    "- [summary unavailable]\n\n"
-    "## Errors encountered\n"
-    "- None\n\n"
-    "## Actions completed\n"
-    "- None\n\n"
-    "## Open questions\n"
-    "- None"
-)
 
 # ---------------------------------------------------------------------------
 # Result dataclass
@@ -351,10 +337,19 @@ class ContextCompressor:
                 model=self._model,
                 max_tokens=self._max_tokens,
             )
-            return response.content.strip() or _FALLBACK_DOCUMENT
-        except Exception as exc:
-            logger.warning("Compaction document generation failed: %s", exc)
-            return _FALLBACK_DOCUMENT
+        except LLMError as exc:
+            raise ContextCompressionError(
+                f"compaction of {len(messages)} message(s) failed: the state document "
+                f"could not be generated with {self._model!r}: {exc}. Fix the model call, "
+                "or set context_management.compaction to 'native' or 'off' for this model"
+            ) from exc
+        document = response.content.strip()
+        if not document:
+            raise ContextCompressionError(
+                f"compaction of {len(messages)} message(s) failed: {self._model!r} returned "
+                "an empty state document; history was left as it was"
+            )
+        return document
 
 
 # ---------------------------------------------------------------------------
