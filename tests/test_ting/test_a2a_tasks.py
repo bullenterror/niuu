@@ -1970,6 +1970,27 @@ class TestCancelTask:
         followup = _rpc(client, "GetTask", {"id": campaign.slug})
         assert followup.json()["result"]["status"]["state"] == "TASK_STATE_CANCELED"
 
+    def test_cancel_is_recorded_before_the_session_stops(self) -> None:
+        """Stopping the session emits events; a projector reading the campaign
+        while it was still active wrote it back over the cancellation."""
+        campaign = _make_campaign(status=WorkflowCampaignStatus.BLOCKED)
+        repo = InMemoryCampaignRepository([campaign])
+        client, _, port = _make_client(campaign_repo=repo)
+        states_at_stop: list[str] = []
+        original_stop = port.stop_session
+
+        async def _stop(session_id, **kwargs):
+            stored = await repo.get_campaign_by_slug(campaign.slug)
+            states_at_stop.append(stored.status.value)
+            await original_stop(session_id, **kwargs)
+
+        port.stop_session = _stop
+
+        response = _rpc(client, "CancelTask", {"id": campaign.slug})
+
+        assert response.json()["result"]["status"]["state"] == "TASK_STATE_CANCELED"
+        assert states_at_stop == ["failed"]
+
     def test_cancel_terminal_task_is_not_cancelable(self) -> None:
         campaign = _make_campaign(status=WorkflowCampaignStatus.COMPLETED)
         client, _, port = _make_client(

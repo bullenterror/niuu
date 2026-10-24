@@ -681,12 +681,9 @@ class WorkflowTaskHandler(RequestHandler):
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="No Volundr connection is available for this user",
             )
-        await adapter.stop_session(
-            campaign.session_id,
-            auth_token=self._downstream_auth_token(),
-            principal=self._principal,
-        )
-
+        # Record the cancellation before stopping the session: the stop emits
+        # events, and a projector that read the campaign while it was still
+        # active used to write it back over the cancellation.
         now = datetime.now(UTC)
         updated = WorkflowCampaign(
             **{
@@ -699,6 +696,11 @@ class WorkflowTaskHandler(RequestHandler):
             }
         )
         saved = await self._campaign_repo.save_campaign(updated)
+        await adapter.stop_session(
+            campaign.session_id,
+            auth_token=self._downstream_auth_token(),
+            principal=self._principal,
+        )
         await _emit_campaign_event(self._request, "workflow.campaign.updated", saved)
         await self._queue_push(saved)
         return campaign_to_task(saved)

@@ -18,6 +18,7 @@ from ting.domain.services.workflow_campaign_projector import (
     _status_from_session,
 )
 from ting.ports.volundr import ActivityEvent
+from ting.ports.workflow_campaign_repository import CampaignAlreadyTerminalError
 
 
 def _campaign(
@@ -930,3 +931,21 @@ async def test_one_campaign_failing_its_check_does_not_stop_the_sweep() -> None:
     projector._campaign_adapter = AsyncMock(side_effect=[RuntimeError("unreachable"), _Adapter()])
 
     assert await projector.expire_stale_campaigns(now=datetime.now(UTC)) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_stale_event_does_not_reopen_a_finished_campaign() -> None:
+    projector, repo, event_bus = _projector(_Adapter())
+    blocked = _campaign(WorkflowCampaignStatus.RUNNING)
+    repo.get_active_campaign_by_session.return_value = blocked
+    repo.save_campaign = AsyncMock(side_effect=CampaignAlreadyTerminalError("already failed"))
+
+    handled = await projector.record_help_needed(
+        {"summary": "need input"},
+        "user-1",
+        session_id="session-123",
+        gate={"node_id": "gate"},
+    )
+
+    assert handled is True
+    event_bus.emit.assert_not_awaited()

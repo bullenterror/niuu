@@ -18,7 +18,10 @@ from ting.domain.services.workflow_campaign_lifecycle import (
 from ting.ports.a2a_push import A2APushDispatcherPort
 from ting.ports.event_bus import EventBusPort, TingEvent
 from ting.ports.volundr import ActivityEvent, VolundrFactory
-from ting.ports.workflow_campaign_repository import WorkflowCampaignRepository
+from ting.ports.workflow_campaign_repository import (
+    CampaignAlreadyTerminalError,
+    WorkflowCampaignRepository,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -220,13 +223,14 @@ class WorkflowCampaignProjector:
         metadata = dict(campaign.metadata)
         metadata["pending_workflow_gates"] = [gate]
         metadata["latest_help_needed"] = dict(payload)
-        await self._save_transition(
+        if not await self._save_transition(
             campaign,
             WorkflowCampaignStatus.BLOCKED,
             metadata=metadata,
             active_stage_id=str(gate.get("node_id") or campaign.active_stage_id or "") or None,
             force=True,
-        )
+        ):
+            return True
         await self._event_bus.emit(
             TingEvent(
                 event="workflow.campaign.feedback_requested",
@@ -391,35 +395,46 @@ class WorkflowCampaignProjector:
         stage_state: list[CampaignStageState] | None = None,
         active_stage_id: str | None = None,
         force: bool = False,
-    ) -> None:
+    ) -> bool:
+        """Persist a transition; return whether it was written."""
         resolved_name = session_name or campaign.session_name
         if not force and next_status == campaign.status and resolved_name == campaign.session_name:
-            return
+            return False
 
         now = datetime.now(UTC)
         resolved_metadata = dict(campaign.metadata) if metadata is None else metadata
         if failure_error:
             resolved_metadata["failure_error"] = failure_error
-        saved = await self._repo.save_campaign(
-            replace(
-                campaign,
-                session_name=resolved_name,
-                status=next_status,
-                metadata=resolved_metadata,
-                stage_state=stage_state if stage_state is not None else campaign.stage_state,
-                active_stage_id=(
-                    active_stage_id if active_stage_id is not None else campaign.active_stage_id
-                ),
-                updated_at=now,
-                last_activity_at=now,
-                completed_at=(
-                    now
-                    if next_status == WorkflowCampaignStatus.COMPLETED
-                    and campaign.completed_at is None
-                    else campaign.completed_at
-                ),
+        try:
+            saved = await self._repo.save_campaign(
+                replace(
+                    campaign,
+                    session_name=resolved_name,
+                    status=next_status,
+                    metadata=resolved_metadata,
+                    stage_state=stage_state if stage_state is not None else campaign.stage_state,
+                    active_stage_id=(
+                        active_stage_id if active_stage_id is not None else campaign.active_stage_id
+                    ),
+                    updated_at=now,
+                    last_activity_at=now,
+                    completed_at=(
+                        now
+                        if next_status == WorkflowCampaignStatus.COMPLETED
+                        and campaign.completed_at is None
+                        else campaign.completed_at
+                    ),
+                )
             )
-        )
+        except CampaignAlreadyTerminalError:
+            # The campaign finished (e.g. CancelTask) after this copy was read.
+            # The terminal state stands; this event no longer applies.
+            logger.info(
+                "Workflow campaign %s already finished; ignoring %s from a stale read",
+                campaign.slug,
+                next_status.value,
+            )
+            return False
         event_name = "workflow.campaign.updated"
         if next_status == WorkflowCampaignStatus.COMPLETED:
             event_name = "workflow.campaign.completed"
@@ -458,6 +473,7 @@ class WorkflowCampaignProjector:
             if terminal_session_cleanup_needed(saved):
                 await self.cleanup_terminal_session(saved)
         _record_a2a_state_transition(saved)
+        return True
 
 
 _BUSY_ACTIVITY_STATES = frozenset({"active", "tool_executing"})
