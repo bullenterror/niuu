@@ -110,7 +110,7 @@ class TestStorageContributor:
 
         c = StorageContributor(storage=storage, home_enabled=False)
         result = await c.contribute(session, SessionContext())
-        assert "homeVolume" not in result.values
+        assert result.values["homeVolume"] == {"enabled": False}
         assert result.values["persistence"]["existingClaim"] == "ws-pvc"
         storage.provision_user_storage.assert_not_called()
 
@@ -122,7 +122,7 @@ class TestStorageContributor:
         admin_settings = {"storage": {"home_enabled": False}}
         c = StorageContributor(storage=storage, home_enabled=True, admin_settings=admin_settings)
         result = await c.contribute(session, SessionContext())
-        assert "homeVolume" not in result.values
+        assert result.values["homeVolume"] == {"enabled": False}
         storage.provision_user_storage.assert_not_called()
 
     async def test_cleanup_noop_without_storage(self, session):
@@ -143,7 +143,9 @@ class TestStorageContributor:
             session.model_copy(update={"workload_type": "ravn_flock"}), SessionContext()
         )
 
-        assert "homeVolume" not in result.values
+        # Explicitly off: valhalla's session defaults enable the home volume,
+        # and without a claim every flock pod failed Deployment admission.
+        assert result.values["homeVolume"] == {"enabled": False}
         assert "affinity" not in result.values
         assert result.values["persistence"]["existingClaim"] == "ws-pvc"
         storage.provision_user_storage.assert_not_awaited()

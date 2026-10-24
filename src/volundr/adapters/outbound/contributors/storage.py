@@ -97,6 +97,11 @@ class StorageContributor(SessionContributor):
             }
             if self._home_colocate:
                 values.update(_home_colocation_values(home_pvc))
+        else:
+            # Session defaults may enable the home volume; without a claim the
+            # chart renders an empty PVC and every mount of "home" fails
+            # admission, as every excluded (ravn_flock) session did.
+            values["homeVolume"] = {"enabled": False}
         if workspace_pvc:
             values["persistence"] = {
                 "existingClaim": workspace_pvc,
