@@ -178,6 +178,8 @@ from ravn.cli.runtime_builders import (  # noqa: E402, F401
     _RealmBuildConfig,
     _attach_agent_build_tool,
     _build_executor,
+    _build_learning_consolidation,
+    _build_learning_curator,
     _build_llm,
     _build_memory,
     _build_mimir,
@@ -535,6 +537,7 @@ def _build_agent(
     memory = _build_memory(settings, llm=llm)
     mimir = _build_mimir(settings)
     memory = _with_mimir_fact_capture(memory, mimir)
+    learning_consolidation = _build_learning_consolidation(settings, llm)
     iteration_budget = _build_iteration_budget(settings, max_iterations)
     tools = _build_tools(
         settings,
@@ -582,6 +585,10 @@ def _build_agent(
         inject_learnings=settings.reflection.inject_learnings,
         max_learnings_injected=settings.reflection.max_learnings_injected,
         learning_token_budget=settings.reflection.learning_token_budget,
+        learning_index=learning_consolidation.lessons if learning_consolidation else None,
+        learning_entry_max_chars=settings.reflection.learning_entry_max_chars,
+        max_route_recoveries=settings.reflection.verified_promotion.max_route_recoveries,
+        route_excerpt_chars=settings.reflection.verified_promotion.excerpt_chars,
         episode_summary_max_chars=settings.agent.episode_summary_max_chars,
         episode_task_max_chars=settings.agent.episode_task_max_chars,
         iteration_budget=iteration_budget,
@@ -724,11 +731,15 @@ async def _run_with_signals(
         if _refl_mimir is not None:
             from ravn.adapters.reflection.post_session import PostSessionReflectionService
 
+            _refl_llm = _build_llm(settings)
+            _refl_consolidation = _build_learning_consolidation(settings, _refl_llm)
             reflection_svc = PostSessionReflectionService(
                 subscriber=in_process_bus,
                 mimir=_refl_mimir,
-                llm=_build_llm(settings),
+                llm=_refl_llm,
                 config=settings.effective_post_session_reflection_config(),
+                lessons=_refl_consolidation.lessons if _refl_consolidation else None,
+                judge=_refl_consolidation.judge if _refl_consolidation else None,
             )
             await reflection_svc.start()
 
@@ -1131,6 +1142,51 @@ def memory_backfill_embeddings(
     )
     typer.echo(f"embedded  : {embedded}")
     typer.echo(f"remaining : {remaining}")
+
+
+@app.command("learnings-curate")
+def learnings_curate(
+    config: str = typer.Option("", "--config", help="Path to the ravn config file."),
+    max_judgments: int = typer.Option(
+        0,
+        help="Lesson pairs to judge this run; 0 uses reflection.curation.max_judgments.",
+    ),
+    max_rewrites: int = typer.Option(
+        -1,
+        help="Learnings to rewrite procedurally; -1 uses reflection.curation.max_rewrites.",
+    ),
+) -> None:
+    """Run one learning-curation pass now, outside the dream schedule.
+
+    The dream pass judges a bounded number of lesson pairs per run, so a
+    resident with hundreds of candidates recorded before curation existed
+    would take many dreams to consolidate them. This runs the same pass once
+    with a larger budget — the backfill — and prints what it changed. Every
+    change is also recorded on a Mímir audit page. Safe to repeat: pairs it
+    already resolved are retired and not judged again.
+    """
+
+    if config:
+        os.environ["RAVN_CONFIG"] = config
+    settings = Settings()
+    if not settings.reflection.curation.enabled:
+        typer.echo("reflection.curation.enabled is false; nothing to curate.", err=True)
+        raise typer.Exit(1)
+    mimir = _build_mimir(settings)
+    curator = _build_learning_curator(
+        settings,
+        mimir=mimir,
+        consolidation=_build_learning_consolidation(settings, _build_llm(settings)),
+    )
+    report = asyncio.run(
+        curator.curate(
+            max_judgments=max_judgments or None,
+            max_rewrites=None if max_rewrites < 0 else max_rewrites,
+        )
+    )
+    for key, value in report.summary().items():
+        shown = len(value) if isinstance(value, list) else value
+        typer.echo(f"{key:<17}: {shown}")
 
 
 # ---------------------------------------------------------------------------

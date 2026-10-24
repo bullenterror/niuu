@@ -64,6 +64,7 @@ async def _run_daemon(
     # Build Mímir adapter early so _agent_factory closure can capture it.
     daemon_mimir = _build_mimir(settings)
     memory = _with_mimir_fact_capture(memory, daemon_mimir)
+    learning_consolidation = _build_learning_consolidation(settings, llm)
 
     # Resolve the resident's charter once, before any consumer (this runtime,
     # EnvironmentSignalRuntime's triage prompts, resident context, the HUD
@@ -332,6 +333,10 @@ async def _run_daemon(
             inject_learnings=settings.reflection.inject_learnings,
             max_learnings_injected=settings.reflection.max_learnings_injected,
             learning_token_budget=settings.reflection.learning_token_budget,
+            learning_index=learning_consolidation.lessons if learning_consolidation else None,
+            learning_entry_max_chars=settings.reflection.learning_entry_max_chars,
+            max_route_recoveries=settings.reflection.verified_promotion.max_route_recoveries,
+            route_excerpt_chars=settings.reflection.verified_promotion.excerpt_chars,
             episode_summary_max_chars=settings.agent.episode_summary_max_chars,
             episode_task_max_chars=settings.agent.episode_task_max_chars,
             iteration_budget=budget,
@@ -610,12 +615,26 @@ async def _run_daemon(
         await realm_capability_sync.start()
         typer.echo("  Realm capability sync: subscribed")
 
+    learning_curator = _build_learning_curator(
+        settings,
+        mimir=daemon_mimir,
+        consolidation=learning_consolidation,
+    )
     resident_wakefulness = _build_resident_wakefulness(
         settings,
         resident_learning_runtime=resident_learning_runtime,
         publisher=environment_signal_publisher,
         memory=memory,
+        learning_curator=learning_curator,
     )
+    if learning_curator is not None and resident_wakefulness is None:
+        raise RuntimeError(
+            "reflection.curation.enabled is true, but learning curation runs inside "
+            "the resident consolidation dream and resident wakefulness is not running "
+            "(resident_wakefulness.enabled, a resident learning runtime, and a mesh "
+            "publisher are all required). Enable those or set "
+            "reflection.curation.enabled: false."
+        )
     if resident_wakefulness is not None:
         await resident_wakefulness.start()
         typer.echo("  Resident wakefulness: started")
@@ -743,6 +762,8 @@ async def _run_daemon(
             mimir=daemon_mimir,
             llm=llm,
             config=settings.effective_post_session_reflection_config(),
+            lessons=learning_consolidation.lessons if learning_consolidation else None,
+            judge=learning_consolidation.judge if learning_consolidation else None,
         )
         await daemon_reflection_svc.start()
 

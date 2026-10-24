@@ -426,6 +426,7 @@ def _build_resident_wakefulness(
     resident_learning_runtime: Any | None,
     publisher: Any | None,
     memory: Any | None = None,
+    learning_curator: Any | None = None,
 ) -> Any | None:
     """Build the wakefulness state machine for a resident daemon."""
     if not settings.resident_wakefulness.enabled:
@@ -447,6 +448,7 @@ def _build_resident_wakefulness(
         resident_learning=resident_learning_runtime,
         memory=memory,
         review_requester=resident_learning_runtime.review_requester,
+        learning_curator=learning_curator,
         tick_interval_seconds=cfg.tick_interval_seconds,
         wakeful_window_seconds=cfg.wakeful_window_seconds,
         dream_interval_seconds=cfg.dream_interval_seconds,

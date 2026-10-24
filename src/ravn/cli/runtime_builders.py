@@ -8,6 +8,7 @@ import inspect
 import logging
 import os
 from collections.abc import Awaitable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -597,6 +598,108 @@ def _uses_cli_transport_executor(
 # ---------------------------------------------------------------------------
 
 
+def _build_embedding_port(settings: Settings) -> Any:
+    """Construct the configured embedding adapter, or raise with the remedy."""
+    # Asking for embeddings and silently getting lexical-only search is the
+    # failure this must not have: retrieval keeps working, quality collapses,
+    # and nothing says so. Configuration that cannot be honoured is a
+    # startup error, not a warning.
+    try:
+        cls = _import_class(settings.embedding.adapter)
+        kwargs = _inject_secrets(
+            settings.embedding.kwargs,
+            settings.embedding.secret_kwargs_env,
+        )
+        return cls(**kwargs)
+    except Exception as exc:
+        raise RuntimeError(
+            f"embedding.enabled is true but the adapter "
+            f"{settings.embedding.adapter!r} could not be constructed: {exc}. "
+            f"Set embedding.enabled=false to run with lexical-only search, or "
+            f"fix the adapter configuration — memory will not silently degrade."
+        ) from exc
+
+
+@dataclass(frozen=True)
+class LearningConsolidation:
+    """Lesson index and judge shared by reflection, curation, and injection."""
+
+    lessons: Any
+    judge: Any
+
+
+def _build_learning_consolidation(settings: Settings, llm: Any) -> LearningConsolidation | None:
+    """Build meaning-based lesson matching when reflection asks for it.
+
+    Needed by ``reflection.matching.mode: semantic`` and by
+    ``reflection.curation.enabled``. Either one without embeddings, or without
+    a native LLM for the judge, is a startup error: running on lexical matching
+    instead is the paraphrase blindness the operator configured away from.
+    """
+    reflection = settings.effective_post_session_reflection_config()
+    if reflection.matching.mode != "semantic" and not reflection.curation.enabled:
+        return None
+    if not settings.embedding.enabled:
+        raise RuntimeError(
+            "reflection.matching.mode is 'semantic' or reflection.curation.enabled is "
+            "true, but embedding.enabled is false. Lessons are compared by embedding; "
+            "enable and configure embedding, or set reflection.matching.mode: lexical "
+            "and reflection.curation.enabled: false."
+        )
+    if llm is None:
+        raise RuntimeError(
+            "semantic learning consolidation needs a native LLM adapter for its judge, "
+            "but this runtime has none (CLI-transport executor). Set "
+            "reflection.matching.mode: lexical and reflection.curation.enabled: false."
+        )
+    from ravn.adapters.reflection.lesson_judge import LessonJudge  # noqa: PLC0415
+    from ravn.adapters.reflection.lessons import LessonIndex  # noqa: PLC0415
+
+    return LearningConsolidation(
+        lessons=LessonIndex(
+            _build_embedding_port(settings),
+            batch_size=reflection.matching.embed_batch_size,
+        ),
+        judge=LessonJudge(
+            llm,
+            model=reflection.matching.judge_llm_alias,
+            max_tokens=reflection.matching.judge_max_tokens,
+            attempts=reflection.matching.judge_attempts,
+            excerpt_chars=reflection.matching.judge_excerpt_chars,
+        ),
+    )
+
+
+def _build_learning_curator(
+    settings: Settings,
+    *,
+    mimir: Any,
+    consolidation: LearningConsolidation | None,
+) -> Any | None:
+    """Build the dream-time learning curator when curation is enabled."""
+    reflection = settings.effective_post_session_reflection_config()
+    if not reflection.curation.enabled:
+        return None
+    if consolidation is None or mimir is None:
+        raise RuntimeError(
+            "reflection.curation.enabled is true but there is no Mímir mount or lesson "
+            "index to curate; configure mimir and embedding, or set "
+            "reflection.curation.enabled: false"
+        )
+    from ravn.adapters.reflection.learning_curation import LearningCurator  # noqa: PLC0415
+
+    return LearningCurator(
+        mimir=mimir,
+        lessons=consolidation.lessons,
+        judge=consolidation.judge,
+        config=reflection.curation,
+        similarity_threshold=reflection.matching.similarity_threshold,
+        evidence_duplicate_similarity=reflection.matching.evidence_duplicate_similarity,
+        min_repetitions=reflection.candidate_min_repetitions,
+        verified_recovery_promotes=reflection.verified_promotion.route_recovery_promotes,
+    )
+
+
 def _build_memory(settings: Settings, llm: Any = None) -> Any:
     """Build the memory adapter (SQLite or Postgres), or None."""
     backend = settings.memory.backend
@@ -604,26 +707,7 @@ def _build_memory(settings: Settings, llm: Any = None) -> Any:
     if backend in {"", "none", "disabled", "off"}:
         return None
 
-    embedding_port = None
-    if settings.embedding.enabled:
-        # Asking for embeddings and silently getting lexical-only search is the
-        # failure this must not have: retrieval keeps working, quality collapses,
-        # and nothing says so. Configuration that cannot be honoured is a
-        # startup error, not a warning.
-        try:
-            cls = _import_class(settings.embedding.adapter)
-            kwargs = _inject_secrets(
-                settings.embedding.kwargs,
-                settings.embedding.secret_kwargs_env,
-            )
-            embedding_port = cls(**kwargs)
-        except Exception as exc:
-            raise RuntimeError(
-                f"embedding.enabled is true but the adapter "
-                f"{settings.embedding.adapter!r} could not be constructed: {exc}. "
-                f"Set embedding.enabled=false to run with lexical-only search, or "
-                f"fix the adapter configuration — memory will not silently degrade."
-            ) from exc
+    embedding_port = _build_embedding_port(settings) if settings.embedding.enabled else None
 
     reranker_port = None
     if getattr(settings, "reranker", None) is not None and settings.reranker.enabled:
