@@ -13,8 +13,18 @@ and is ignored. The stream ends with ``response.completed`` (or
 ``response.incomplete`` when ``max_output_tokens`` cut the answer short, or
 ``response.failed``) carrying the usage.
 
-Reasoning summaries become Anthropic ``thinking`` blocks only when the caller
-asked for thinking; the encrypted reasoning payload is never forwarded.
+Each ``reasoning`` output item becomes one Anthropic ``thinking`` block:
+
+- its summary text (only requested when the caller asked for thinking) streams
+  as ``thinking_delta``, several summary parts joined by a blank line;
+- its ``encrypted_content`` is sent as a ``signature_delta`` just before the
+  block stops, whether or not a summary was requested, because it is what lets a
+  later request continue the same reasoning (see ``to_responses``). The value on
+  ``response.output_item.done`` is the one to use: the copy on
+  ``response.output_item.added`` is shorter and differs, verified live.
+
+An item that arrives without ``encrypted_content`` is not signed; it still shows
+its summary as an unsigned block when one was requested.
 """
 
 from __future__ import annotations
@@ -41,6 +51,9 @@ _INCOMPLETE_STOP_REASONS: dict[str, str] = {
 }
 
 _PART_TYPES_AS_TEXT = frozenset({"output_text", "refusal"})
+
+# Joins the summary parts of one reasoning item into a single thinking block.
+_SUMMARY_PART_SEPARATOR = "\n\n"
 
 
 def new_message_id() -> str:
@@ -200,7 +213,10 @@ async def responses_to_anthropic_events(
 
         if kind == "response.output_item.added":
             item = event.get("item", {})
-            if item.get("type") == "function_call":
+            if item.get("type") == "reasoning":
+                for stopped in stop_block():
+                    yield stopped
+            elif item.get("type") == "function_call":
                 arguments_streamed = False
                 saw_tool_call = True
                 yield start_block(
@@ -235,7 +251,9 @@ async def responses_to_anthropic_events(
                 yield delta({"type": "input_json_delta", "partial_json": event["arguments"]})
 
         elif kind == "response.reasoning_summary_part.added":
-            if include_thinking:
+            if include_thinking and open_kind == "thinking":
+                yield delta({"type": "thinking_delta", "thinking": _SUMMARY_PART_SEPARATOR})
+            elif include_thinking:
                 for stopped in stop_block():
                     yield stopped
                 yield start_block({"type": "thinking", "thinking": ""}, "thinking")
@@ -244,11 +262,19 @@ async def responses_to_anthropic_events(
             if include_thinking and open_kind == "thinking":
                 yield delta({"type": "thinking_delta", "thinking": event.get("delta", "")})
 
-        elif kind in (
-            "response.content_part.done",
-            "response.reasoning_summary_part.done",
-            "response.output_item.done",
-        ):
+        elif kind == "response.output_item.done":
+            item = event.get("item", {})
+            encrypted = item.get("encrypted_content") if item.get("type") == "reasoning" else ""
+            if encrypted:
+                if open_kind != "thinking":
+                    for stopped in stop_block():
+                        yield stopped
+                    yield start_block({"type": "thinking", "thinking": ""}, "thinking")
+                yield delta({"type": "signature_delta", "signature": encrypted})
+            for stopped in stop_block():
+                yield stopped
+
+        elif kind == "response.content_part.done":
             for stopped in stop_block():
                 yield stopped
 
@@ -310,6 +336,8 @@ async def responses_stream_to_message(
                 blocks[index].text += body["text"]  # type: ignore[union-attr]
             elif body["type"] == "thinking_delta":
                 blocks[index].thinking += body["thinking"]  # type: ignore[union-attr]
+            elif body["type"] == "signature_delta":
+                blocks[index].signature += body["signature"]  # type: ignore[union-attr]
             else:
                 tool_arguments[index] += body["partial_json"]
         elif event_type == "message_delta":

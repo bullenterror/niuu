@@ -69,6 +69,7 @@ class StreamEventType(StrEnum):
     TOOL_CALL = "tool_call"
     MESSAGE_DONE = "message_done"
     THINKING = "thinking"  # Provider reasoning content
+    REASONING_DETAILS = "reasoning_details"  # Opaque reasoning to hand back next step
 
 
 # ---------------------------------------------------------------------------
@@ -219,18 +220,39 @@ class ToolResult:
 
 @dataclass(frozen=True)
 class Message:
-    """A single message in a conversation."""
+    """A single message in a conversation.
+
+    ``reasoning`` is the readable reasoning text. ``reasoning_details`` is the
+    opaque reasoning payload a provider returned with the turn (for example the
+    ChatGPT Responses backend's encrypted reasoning, relayed by Bifröst); it is
+    kept verbatim and sent back with this message on later requests so the
+    provider continues that reasoning instead of re-deriving it. Empty when the
+    provider returned none, which is every provider that does not do this.
+    """
 
     role: str  # "user" or "assistant"
     content: str | list[dict]
     reasoning: str = ""
+    reasoning_details: list[dict[str, Any]] = field(default_factory=list)
 
     def to_api_dict(self) -> dict[str, Any]:
         """Return the transport-neutral message representation."""
         message: dict[str, Any] = {"role": self.role, "content": self.content}
         if self.reasoning:
             message["reasoning"] = self.reasoning
+        if self.reasoning_details:
+            message["reasoning_details"] = self.reasoning_details
         return message
+
+    @classmethod
+    def from_api_dict(cls, raw: dict[str, Any]) -> Message:
+        """Rebuild a message from :meth:`to_api_dict` output (checkpoints)."""
+        return cls(
+            role=raw["role"],
+            content=raw["content"],
+            reasoning=raw.get("reasoning", ""),
+            reasoning_details=raw.get("reasoning_details", []),
+        )
 
 
 @dataclass(frozen=True)
@@ -242,6 +264,7 @@ class LLMResponse:
     stop_reason: StopReason
     usage: TokenUsage
     reasoning: str = ""
+    reasoning_details: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -252,6 +275,7 @@ class StreamEvent:
     text: str | None = None
     tool_call: ToolCall | None = None
     usage: TokenUsage | None = None
+    reasoning_details: list[dict[str, Any]] | None = None
 
 
 @dataclass(frozen=True)

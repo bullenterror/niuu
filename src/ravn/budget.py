@@ -54,6 +54,8 @@ class TokenEstimator:
                         for v in block.values():
                             if isinstance(v, str):
                                 total += len(v)
+            if msg.get("reasoning_details"):
+                total += TokenEstimator._json_chars(msg["reasoning_details"])
         return total // _CHARS_PER_TOKEN
 
     @staticmethod
@@ -97,12 +99,23 @@ class TokenEstimator:
 
     @staticmethod
     def _message_chars(msg: Message) -> int:
+        """Characters a message adds to the prompt, opaque reasoning included.
+
+        ``reasoning_details`` is sent back with the message on every later
+        request and is far larger than the text it accompanies, so leaving it
+        out would let a long tool loop grow past the prompt budget unseen.
+        """
         content = msg.content
-        if isinstance(content, str):
-            return len(content)
+        chars = len(content) if isinstance(content, str) else TokenEstimator._json_chars(content)
+        if not msg.reasoning_details:
+            return chars
+        return chars + TokenEstimator._json_chars(msg.reasoning_details)
+
+    @staticmethod
+    def _json_chars(value: Any) -> int:
         return len(
             json.dumps(
-                content,
+                value,
                 ensure_ascii=False,
                 sort_keys=True,
                 separators=(",", ":"),

@@ -7,6 +7,9 @@ Features:
 - Streaming via SSE (``data: {...}`` events)
 - Tool calling in OpenAI function-calling format
 - Reasoning output from both ``reasoning`` and legacy ``reasoning_content`` fields
+- Opaque reasoning (``reasoning_details``): when the server returns it with a
+  turn, it is captured verbatim and sent back on that assistant message in
+  later requests, so the model continues its own reasoning across tool calls
 - Token usage normalisation: ``prompt_tokens`` → ``input_tokens``,
   ``completion_tokens`` → ``output_tokens``
 - Token estimation fallback when the API response does not include usage data
@@ -113,6 +116,25 @@ def _strip_reasoning_tags(text: str) -> str:
 def _uses_developer_role(model: str) -> bool:
     """Return True when *model* expects a ``developer`` role instead of ``system``."""
     return any(model.startswith(prefix) for prefix in _DEVELOPER_ROLE_PREFIXES)
+
+
+def _reasoning_details_of(container: dict) -> list[dict]:
+    """The ``reasoning_details`` list of a message or stream delta, or ``[]``.
+
+    Raises:
+        LLMError: The server sent ``reasoning_details`` that is not a list of
+            objects. It is opaque payload meant to be echoed back; accepting a
+            malformed one would corrupt the next request.
+    """
+    details = container.get("reasoning_details")
+    if not details:
+        return []
+    if not isinstance(details, list) or not all(isinstance(item, dict) for item in details):
+        raise LLMError(
+            "OpenAI-compatible API sent reasoning_details that is not a list of objects: "
+            f"{type(details).__name__}"
+        )
+    return details
 
 
 def _emit_tool_calls(
@@ -251,6 +273,8 @@ def _convert_anthropic_messages(messages: list[dict]) -> list[dict]:
             out: dict = {"role": "assistant", "content": "\n".join(text_parts) or None}
             if msg.get("reasoning"):
                 out["reasoning_content"] = msg["reasoning"]
+            if msg.get("reasoning_details"):
+                out["reasoning_details"] = msg["reasoning_details"]
             if tool_calls_out:
                 out["tool_calls"] = tool_calls_out
             converted.append(out)
@@ -558,6 +582,7 @@ class OpenAICompatibleAdapter(LLMPort):
             # Accumulate output text for estimation fallback when usage is absent.
             accumulated_text: list[str] = []
             accumulated_reasoning: list[str] = []
+            reasoning_details_received = 0
             usage_emitted = False
 
             # Bound here, not only inside the loop: a stream can end without ever
@@ -612,6 +637,14 @@ class OpenAICompatibleAdapter(LLMPort):
                 if reasoning:
                     accumulated_reasoning.append(reasoning)
                     yield StreamEvent(type=StreamEventType.THINKING, text=reasoning)
+
+                reasoning_details = _reasoning_details_of(delta)
+                if reasoning_details:
+                    reasoning_details_received += len(reasoning_details)
+                    yield StreamEvent(
+                        type=StreamEventType.REASONING_DETAILS,
+                        reasoning_details=reasoning_details,
+                    )
 
                 # Text content delta.
                 content = delta.get("content")
@@ -695,12 +728,13 @@ class OpenAICompatibleAdapter(LLMPort):
                 text = "".join(accumulated_text)
                 logger.info(
                     "openai-compatible: stream done model=%s finish_reason=%s "
-                    "content_len=%d reasoning_len=%d tool_calls=%d tool_names=%s "
-                    "content_head=%r content_tail=%r",
+                    "content_len=%d reasoning_len=%d reasoning_details=%d tool_calls=%d "
+                    "tool_names=%s content_head=%r content_tail=%r",
                     model or self._default_model,
                     finish_reason,
                     len(text),
                     len("".join(accumulated_reasoning)),
+                    reasoning_details_received,
                     len(tool_names),
                     sorted(tool_names.values()),
                     text[:200],
@@ -763,6 +797,7 @@ class OpenAICompatibleAdapter(LLMPort):
 
         content_text = _strip_reasoning_tags(message.get("content") or "")
         reasoning_text = message.get("reasoning") or message.get("reasoning_content") or ""
+        reasoning_details = _reasoning_details_of(message)
         tool_calls: list[ToolCall] = []
 
         # First, check for API-returned tool calls
@@ -813,12 +848,13 @@ class OpenAICompatibleAdapter(LLMPort):
             # repair. Record the shape of every reply, not just the blank ones.
             logger.info(
                 "openai-compatible: completion model=%s finish_reason=%s "
-                "content_len=%d reasoning_len=%d tool_calls=%d tool_names=%s "
-                "usage=%s content_head=%r",
+                "content_len=%d reasoning_len=%d reasoning_details=%d tool_calls=%d "
+                "tool_names=%s usage=%s content_head=%r",
                 model or self._default_model,
                 finish_reason,
                 len(content_text),
                 len(reasoning_text),
+                len(reasoning_details),
                 len(tool_calls),
                 [tc.name for tc in tool_calls],
                 data.get("usage"),
@@ -842,4 +878,5 @@ class OpenAICompatibleAdapter(LLMPort):
             stop_reason=stop_reason,
             usage=usage,
             reasoning=reasoning_text,
+            reasoning_details=reasoning_details,
         )

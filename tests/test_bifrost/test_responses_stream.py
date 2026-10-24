@@ -101,11 +101,46 @@ class TestRecordedStreams:
         stops = [e["index"] for e in events if e["type"] == "content_block_stop"]
         assert stops == [0, 1]
 
-    async def test_reasoning_summary_is_dropped_when_not_asked_for(self):
+    async def test_signature_is_sent_before_the_thinking_block_stops(self):
+        events = await _translate(_fixture("reasoning_tool_call"), thinking=True)
+
+        sequence = [
+            e["delta"]["type"] if e["type"] == "content_block_delta" else e["type"]
+            for e in events
+            if e["type"].startswith("content_block")
+        ]
+        assert sequence[:5] == [
+            "content_block_start",
+            "thinking_delta",
+            "signature_delta",
+            "content_block_stop",
+            "content_block_start",
+        ]
+        signature = next(
+            e["delta"]["signature"]
+            for e in events
+            if e["type"] == "content_block_delta" and e["delta"]["type"] == "signature_delta"
+        )
+        # The backend's `.added` copy of the payload is a different, shorter one.
+        assert signature == "REDACTED-FINAL"
+
+    async def test_reasoning_without_a_summary_is_still_one_signed_block(self):
+        events = await _translate(_fixture("reasoning_tool_call_no_summary"), thinking=False)
+
+        starts = [e["content_block"]["type"] for e in events if e["type"] == "content_block_start"]
+        assert starts == ["thinking", "tool_use", "tool_use"]
+        assert events[1]["content_block"] == {"type": "thinking", "thinking": ""}
+        assert events[2]["delta"] == {"type": "signature_delta", "signature": "REDACTED-FINAL"}
+        assert events[3] == {"type": "content_block_stop", "index": 0}
+
+    async def test_reasoning_is_signed_even_when_no_summary_was_asked_for(self):
         events = await _translate(_fixture("reasoning"), thinking=False)
 
         starts = [e["content_block"]["type"] for e in events if e["type"] == "content_block_start"]
-        assert starts == ["text"]
+        assert starts == ["thinking", "text"]
+        deltas = [e["delta"] for e in events if e["type"] == "content_block_delta"]
+        assert [d["type"] for d in deltas][0] == "signature_delta"
+        assert not any(d["type"] == "thinking_delta" for d in deltas)
         assert "encrypted_content" not in json.dumps(events)
 
     async def test_incomplete_maps_to_max_tokens(self):
@@ -159,6 +194,30 @@ class TestMessageAssembly:
 
         assert [type(b) for b in message.content] == [ThinkingBlock, TextBlock]
         assert message.content[0].thinking == "**Counting strawberry letters**"
+        assert message.content[0].signature == "REDACTED"
+
+    async def test_signed_thinking_precedes_the_tool_calls_it_led_to(self):
+        message = await responses_stream_to_message(
+            _fixture("reasoning_tool_call"),
+            message_id=MESSAGE_ID,
+            model=MODEL,
+            include_thinking=True,
+        )
+
+        assert [type(b) for b in message.content] == [ThinkingBlock, ToolUseBlock, ToolUseBlock]
+        assert message.content[0].thinking == "**Checking both weather forecasts**"
+        assert message.content[0].signature == "REDACTED-FINAL"
+        assert message.stop_reason == "tool_use"
+
+    async def test_signature_is_kept_when_no_summary_was_asked_for(self):
+        message = await responses_stream_to_message(
+            _fixture("reasoning_tool_call_no_summary"),
+            message_id=MESSAGE_ID,
+            model=MODEL,
+            include_thinking=False,
+        )
+
+        assert message.content[0] == ThinkingBlock(thinking="", signature="REDACTED-FINAL")
 
     async def test_tool_arguments_that_are_not_json_are_an_error(self):
         lines = _sse(
@@ -331,7 +390,132 @@ class TestBlockTransitions:
             for e in events
             if e["type"] in ("content_block_start", "content_block_stop")
         ]
-        assert kinds == ["thinking", "stop", "thinking", "stop", "text", "stop"]
+        assert kinds == ["thinking", "stop", "text", "stop"]
+
+    async def test_summary_parts_of_one_reasoning_item_share_a_block(self):
+        events = await _translate(
+            _sse(
+                _created(),
+                {"type": "response.output_item.added", "item": {"type": "reasoning"}},
+                {"type": "response.reasoning_summary_part.added"},
+                {"type": "response.reasoning_summary_text.delta", "delta": "a"},
+                {"type": "response.reasoning_summary_part.done"},
+                {"type": "response.reasoning_summary_part.added"},
+                {"type": "response.reasoning_summary_text.delta", "delta": "b"},
+                {"type": "response.reasoning_summary_part.done"},
+                {
+                    "type": "response.output_item.done",
+                    "item": {"type": "reasoning", "encrypted_content": "ENC"},
+                },
+                _completed(),
+            ),
+            thinking=True,
+        )
+
+        deltas = [e["delta"] for e in events if e["type"] == "content_block_delta"]
+        assert deltas == [
+            {"type": "thinking_delta", "thinking": "a"},
+            {"type": "thinking_delta", "thinking": "\n\n"},
+            {"type": "thinking_delta", "thinking": "b"},
+            {"type": "signature_delta", "signature": "ENC"},
+        ]
+        assert _types(events).count("content_block_start") == 1
+
+    async def test_each_reasoning_item_gets_its_own_signed_block(self):
+        events = await _translate(
+            _sse(
+                _created(),
+                {"type": "response.output_item.added", "item": {"type": "reasoning"}},
+                {
+                    "type": "response.output_item.done",
+                    "item": {"type": "reasoning", "encrypted_content": "ONE"},
+                },
+                {"type": "response.output_item.added", "item": {"type": "reasoning"}},
+                {
+                    "type": "response.output_item.done",
+                    "item": {"type": "reasoning", "encrypted_content": "TWO"},
+                },
+                _completed(),
+            ),
+        )
+
+        signatures = [
+            e["delta"]["signature"]
+            for e in events
+            if e["type"] == "content_block_delta" and e["delta"]["type"] == "signature_delta"
+        ]
+        assert signatures == ["ONE", "TWO"]
+        assert [e["index"] for e in events if e["type"] == "content_block_stop"] == [0, 1]
+
+    async def test_reasoning_item_without_encrypted_content_stays_unsigned(self):
+        events = await _translate(
+            _sse(
+                _created(),
+                {"type": "response.output_item.added", "item": {"type": "reasoning"}},
+                {"type": "response.reasoning_summary_part.added"},
+                {"type": "response.reasoning_summary_text.delta", "delta": "a"},
+                {"type": "response.output_item.done", "item": {"type": "reasoning"}},
+                _completed(),
+            ),
+            thinking=True,
+        )
+
+        deltas = [e["delta"]["type"] for e in events if e["type"] == "content_block_delta"]
+        assert deltas == ["thinking_delta"]
+        assert _types(events).count("content_block_stop") == 1
+
+    async def test_a_block_left_open_is_closed_before_a_reasoning_item_takes_over(self):
+        events = await _translate(
+            _sse(
+                _created(),
+                {"type": "response.output_text.delta", "delta": "partial"},
+                {"type": "response.output_item.added", "item": {"type": "reasoning"}},
+                {
+                    "type": "response.output_item.done",
+                    "item": {"type": "reasoning", "encrypted_content": "ENC"},
+                },
+                _completed(),
+            ),
+        )
+
+        kinds = [
+            e["content_block"]["type"] if e["type"] == "content_block_start" else "stop"
+            for e in events
+            if e["type"] in ("content_block_start", "content_block_stop")
+        ]
+        assert kinds == ["text", "stop", "thinking", "stop"]
+
+    async def test_a_text_block_still_open_at_reasoning_done_is_closed_first(self):
+        events = await _translate(
+            _sse(
+                _created(),
+                {"type": "response.output_text.delta", "delta": "partial"},
+                {
+                    "type": "response.output_item.done",
+                    "item": {"type": "reasoning", "encrypted_content": "ENC"},
+                },
+                _completed(),
+            ),
+        )
+
+        kinds = [
+            e["content_block"]["type"] if e["type"] == "content_block_start" else "stop"
+            for e in events
+            if e["type"] in ("content_block_start", "content_block_stop")
+        ]
+        assert kinds == ["text", "stop", "thinking", "stop"]
+
+    async def test_reasoning_item_without_summary_or_payload_opens_no_block(self):
+        events = await _translate(
+            _sse(
+                _created(),
+                {"type": "response.output_item.added", "item": {"type": "reasoning"}},
+                {"type": "response.output_item.done", "item": {"type": "reasoning"}},
+                _completed(),
+            ),
+        )
+
+        assert _types(events) == ["message_start", "message_delta", "message_stop"]
 
     async def test_text_delta_while_another_block_is_open_starts_a_text_block(self):
         events = await _translate(
