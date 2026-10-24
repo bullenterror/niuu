@@ -35,6 +35,7 @@ from ravn.adapters.reflection.post_session import (
     fetch_relevant_learnings,
 )
 from ravn.config import LearningCurationConfig, Settings
+from ravn.domain.models import StopReason
 from tests.ravn.fixtures.learning_fakes import (
     ALL_ROUTES_BLOCKED,
     ALTERNATE_ROUTES,
@@ -515,6 +516,17 @@ async def test_judge_match_rejects_answers_naming_no_shown_lesson(same: str) -> 
     judge = _judge(_llm(f'{{"same": {same}}}'))
     with pytest.raises(LessonJudgeError):
         await judge.match(title="t", claim="c", recorded=[_lesson("a"), _lesson("b")])
+
+
+async def test_judge_cut_off_by_its_budget_names_the_setting() -> None:
+    response = MagicMock()
+    response.content = ""
+    response.stop_reason = StopReason.MAX_TOKENS
+    llm = AsyncMock()
+    llm.generate.return_value = response
+    with pytest.raises(LessonJudgeError, match="reflection.matching.judge_max_tokens"):
+        await _judge(llm).match(title="t", claim="c", recorded=[_lesson("a")])
+    assert llm.generate.await_count == 1
 
 
 async def test_judge_relate_and_procedure() -> None:

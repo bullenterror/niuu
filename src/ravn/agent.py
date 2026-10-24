@@ -127,7 +127,7 @@ class RavnAgent:
         compressor: ContextCompressor | None = None,
         prompt_builder: PromptBuilder | None = None,
         reflection_model: str = "claude-haiku-4-5-20251001",
-        reflection_max_tokens: int = 512,
+        reflection_max_tokens: int = 4096,
         task_summary_max_chars: int = 200,
         input_token_cost_per_million: float = 3.0,
         output_token_cost_per_million: float = 15.0,
@@ -1394,21 +1394,27 @@ class RavnAgent:
             "3. What patterns from previous episodes are confirmed or contradicted?"
         )
 
-        try:
-            response = await self._llm.generate(
-                [{"role": "user", "content": prompt}],
-                tools=[],
-                system=(
-                    "You are Ravn reflecting on a completed task. "
-                    "Be concise, factual, and specific. No preamble."
-                ),
-                model=self._reflection_model,
-                max_tokens=self._reflection_max_tokens,
+        response = await self._llm.generate(
+            [{"role": "user", "content": prompt}],
+            tools=[],
+            system=(
+                "You are Ravn reflecting on a completed task. "
+                "Be concise, factual, and specific. No preamble."
+            ),
+            model=self._reflection_model,
+            max_tokens=self._reflection_max_tokens,
+        )
+        # A reasoning model can spend the whole budget thinking and return a
+        # truncated or empty reflection, which would be recorded as if it were
+        # the model's view of the turn.
+        if response.stop_reason == StopReason.MAX_TOKENS:
+            raise RuntimeError(
+                f"the reflection model {self._reflection_model!r} used its whole "
+                f"{self._reflection_max_tokens}-token budget before finishing; raise "
+                "memory.reflection_max_tokens, or set memory.reflection_model: off to "
+                "keep episodes without a reflection"
             )
-            return response.content
-        except Exception as exc:
-            logger.warning("Reflection LLM call failed: %s", exc)
-            return f"Reflection unavailable: {exc}"
+        return response.content
 
     def _resolve_thinking(
         self,

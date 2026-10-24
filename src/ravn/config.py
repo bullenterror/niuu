@@ -554,8 +554,11 @@ class MemoryConfig(BaseModel):
         ),
     )
     reflection_max_tokens: int = Field(
-        default=512,
-        description="Maximum tokens for the reflection LLM call.",
+        default=4096,
+        description=(
+            "Maximum tokens for the reflection LLM call, reasoning included: a "
+            "reasoning model needs room to think before it answers."
+        ),
     )
     task_summary_max_chars: int = Field(
         default=200,
@@ -2680,9 +2683,12 @@ class LearningMatchingConfig(BaseModel):
         ),
     )
     judge_max_tokens: int = Field(
-        default=512,
+        default=4096,
         ge=1,
-        description="Maximum tokens one judge call may produce.",
+        description=(
+            "Maximum tokens one judge call may produce, reasoning included: a "
+            "reasoning model needs room to think before it answers."
+        ),
     )
     embed_batch_size: int = Field(
         default=64,
