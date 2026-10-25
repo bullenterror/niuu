@@ -3,7 +3,7 @@ id: 0b51b458-0aeb-5a1b-8f79-d805834491e3
 name: Infra Change Flow
 description: Tracker-driven change to a GitOps repository. Implements and reviews the change, then
   waits for the commissioning resident to approve the merge, because merging deploys it.
-version: 1.0.0
+version: 1.0.1
 persona_dependencies:
   closer:
     id: closer
@@ -21,6 +21,9 @@ persona_dependencies:
     digest: sha256:ad16133b08a3cdbd178971e0faceaabbc2196ffa4c08b0f038e1ed50db8c2f03
     path: personas/reviewer.yaml
 graph:
+  # The session never works on the target branch: it gets workflow/<slug> cut
+  # from it, and only the closer merges into the target, after the merge gate.
+  workingBranch: isolated
   nodes:
   - id: infra-change-request
     kind: trigger

@@ -767,3 +767,20 @@ def test_infra_change_flow_merges_only_after_the_resident_approves() -> None:
     assert ("infra-change-review", "infra-change-close") not in edges
     closer = nodes["infra-change-close"]["stageMembers"][0]
     assert closer["consumesEventTypes"] == ["merge.approved"]
+
+
+def test_infra_change_flow_works_on_an_isolated_branch() -> None:
+    from ting.domain.workflow_snapshot import workflow_uses_isolated_branch
+
+    workflow = next(w for w in load_system_workflows() if w.name == "Infra Change Flow")
+
+    assert workflow_uses_isolated_branch({"graph": workflow.graph}) is True
+
+
+def test_an_unknown_working_branch_mode_is_rejected() -> None:
+    from ting.domain.exceptions import WorkflowDocumentError
+    from ting.domain.workflow_snapshot import workflow_uses_isolated_branch
+
+    assert workflow_uses_isolated_branch({"graph": {}}) is False
+    with pytest.raises(WorkflowDocumentError, match="workingBranch 'shared'"):
+        workflow_uses_isolated_branch({"graph": {"workingBranch": "shared"}})

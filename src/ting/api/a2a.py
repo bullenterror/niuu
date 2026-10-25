@@ -451,6 +451,7 @@ class WorkflowTaskHandler(RequestHandler):
                     sessionName=_launch_session_name(workflow, prompt, metadata),
                     repo=str(metadata.get("repo") or ""),
                     branch=str(metadata.get("branch") or ""),
+                    baseBranch=str(metadata.get("baseBranch") or metadata.get("base_branch") or ""),
                     model=str(metadata.get("model") or ""),
                     # The already-resolved (and, on a retry, already-persisted)
                     # connection — never re-derived from raw request metadata —
