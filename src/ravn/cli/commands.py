@@ -39,6 +39,7 @@ from ravn.domain.models import (
 from ravn.domain.models import (
     OutputMode as OutputMode,
 )
+from ravn.domain.notification_channel import current_notification_channel
 from ravn.domain.profile import RavnProfile
 from ravn.ports.checkpoint import CheckpointPort
 from ravn.ports.executor import ExecutionAgentPort
@@ -935,6 +936,7 @@ def tool_mcp(
     task_id: str = typer.Option("", "--task-id", hidden=True),
     traceparent: str = typer.Option("", "--traceparent", hidden=True),
     tracestate: str = typer.Option("", "--tracestate", hidden=True),
+    notification_channel: str = typer.Option("", "--notification-channel", hidden=True),
 ) -> None:
     """Serve the active Ravn ToolPort set over MCP stdio."""
     if config:
@@ -960,6 +962,11 @@ def tool_mcp(
         effective_persona = persona or (ravn_profile.persona if ravn_profile else "")
         persona_config = _require_persona(effective_persona, project_config, settings=settings)
         tools = _build_tool_mcp_tools(settings, persona_config=persona_config)
+        notification_outbox = _tool_mcp_notification_outbox(settings, persona_config)
+        if notification_outbox is not None:
+            from ravn.adapters.tools.notify import ResidentNotifyTool
+
+            tools.append(ResidentNotifyTool(notification_outbox))
 
         from ravn.adapters.mcp.tool_port_server import ToolPortMcpServer
 
@@ -986,9 +993,33 @@ def tool_mcp(
             enabled="build_tool" in allowed_tools,
             settings=settings,
         )
-        asyncio.run(server.run_stdio())
+        # What the agent notifies from this server names the channel its turn runs in;
+        # asyncio.run copies this context into the server's task.
+        channel_token = current_notification_channel.set(notification_channel or None)
+        try:
+            asyncio.run(server.run_stdio())
+        finally:
+            current_notification_channel.reset(channel_token)
+            if notification_outbox is not None:
+                notification_outbox.close()
     finally:
         shutdown_observability()
+
+
+def _tool_mcp_notification_outbox(settings: Settings, persona_config: Any | None) -> Any | None:
+    """The resident's outbox for the ``notify`` tool a CLI agent reaches over MCP.
+
+    A CLI-backed persona (Codex, Claude Code) runs its tools in this server, not in the
+    daemon, so it gets ``notify`` here on the same terms as the daemon's own agents:
+    wherever the outbox exists, unless disabled or forbidden. This process writes the
+    resident's outbox file directly; Forge reads it on its next pull.
+    """
+    from ravn.cli.daemon_runtime import _notify_tool_allowed
+    from ravn.cli.resident_runtime_wiring import build_resident_notification_outbox
+
+    if not _notify_tool_allowed(settings, persona_config):
+        return None
+    return build_resident_notification_outbox(settings)
 
 
 def _build_tool_mcp_tools(settings: Settings, *, persona_config: Any | None) -> list[Any]:
