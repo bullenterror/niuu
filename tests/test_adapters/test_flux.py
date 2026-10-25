@@ -1065,6 +1065,55 @@ class TestFluxResidentRuntimeController:
         assert observation.backend_ref["kind"] == "HelmRelease"
         assert observation.endpoints[0].protocol == "skuld-v1"
 
+    async def test_deploy_advertises_voice_when_the_profile_enables_it(
+        self,
+        pod_manager: FluxPodManager,
+        mock_api,
+    ) -> None:
+        runtime = _resident_runtime()
+        profile = _resident_profile()
+        profile.deployment["values"]["resident"]["voice"] = {"enabled": True}
+        with patch.object(pod_manager, "_get_api", return_value=mock_api):
+            observation = await pod_manager.deploy(runtime, profile)
+
+        voice = [e for e in observation.endpoints if e.kind == "voice"]
+        assert [(e.protocol, e.url) for e in voice] == [
+            ("lexi-agent-service-v1", f"https://{runtime.id}.volundr.example.com/voice")
+        ]
+
+    async def test_deploy_without_voice_advertises_chat_only(
+        self,
+        pod_manager: FluxPodManager,
+        mock_api,
+    ) -> None:
+        with patch.object(pod_manager, "_get_api", return_value=mock_api):
+            observation = await pod_manager.deploy(_resident_runtime(), _resident_profile())
+
+        assert [e.kind for e in observation.endpoints] == ["chat"]
+
+    def test_observation_reads_voice_from_the_release_values(
+        self, pod_manager: FluxPodManager
+    ) -> None:
+        runtime = _resident_runtime()
+        pod_manager._gateway_domain = "gateway.example.com"
+        helmrelease = {"spec": {"values": {"resident": {"voice": {"enabled": True}}}}}
+
+        observation = pod_manager._resident_observation(runtime, helmrelease, None)
+
+        assert observation.endpoints[-1].url == f"https://gateway.example.com/s/{runtime.id}/voice"
+
+    @pytest.mark.parametrize(
+        "values",
+        [
+            {},
+            {"resident": None},
+            {"resident": {"voice": "on"}},
+            {"resident": {"voice": {"enabled": "true"}}},
+        ],
+    )
+    def test_only_an_explicit_true_enables_voice(self, values: dict) -> None:
+        assert FluxPodManager._values_enable_voice(values) is False
+
     async def test_deploy_omits_realm_values_without_realm_id(
         self,
         pod_manager: FluxPodManager,

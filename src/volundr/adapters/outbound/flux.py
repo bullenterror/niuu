@@ -78,6 +78,9 @@ _HTTP_NOT_FOUND = 404
 _HTTP_CONFLICT = 409
 #: Key of a Ravn resident's own OpenClaw shim token Secret (resident.openclaw.tokenSecret).
 RESIDENT_OPENCLAW_TOKEN_KEY = "token"
+#: Protocol a resident's voice channel speaks (ravn.adapters.channels.voice): the
+#: Lexi app's agent-service wire, served under /voice/ on the resident's route.
+RESIDENT_VOICE_PROTOCOL = "lexi-agent-service-v1"
 #: The platform version (chart and images) Völundr last rendered into a resident's release.
 ANNOTATION_PLATFORM_VERSION = "niuu.world/platform-version"
 #: The version that release replaced. A Völundr that still renders it (the old replica
@@ -563,14 +566,37 @@ class FluxPodManager(
             "workloadSelector": f"app.kubernetes.io/instance={release_name}",
         }
 
-    def _endpoints(self, runtime: ResidentRuntime) -> list[ResidentEndpoint]:
-        return [
+    def _endpoints(
+        self, runtime: ResidentRuntime, *, voice: bool = False
+    ) -> list[ResidentEndpoint]:
+        endpoints = [
             ResidentEndpoint(
                 kind="chat",
                 protocol="skuld-v1",
                 url=self._chat_endpoint(str(runtime.id), str(runtime.id)),
             )
         ]
+        if voice:
+            endpoints.append(
+                ResidentEndpoint(
+                    kind="voice",
+                    protocol=RESIDENT_VOICE_PROTOCOL,
+                    url=self._voice_endpoint(runtime),
+                )
+            )
+        return endpoints
+
+    def _voice_endpoint(self, runtime: ResidentRuntime) -> str:
+        if self._gateway_domain:
+            return f"https://{self._gateway_domain}/s/{runtime.id}/voice"
+        return f"{self._code_scheme}://{self._session_host(str(runtime.id))}/voice"
+
+    @staticmethod
+    def _values_enable_voice(values: Any) -> bool:
+        """Whether rendered chart values turn the resident's voice channel on."""
+        resident = values.get("resident") if isinstance(values, dict) else None
+        voice = resident.get("voice") if isinstance(resident, dict) else None
+        return isinstance(voice, dict) and voice.get("enabled") is True
 
     @staticmethod
     def _resident_claim_name(runtime: ResidentRuntime, kind: str) -> str:
@@ -1039,7 +1065,7 @@ class FluxPodManager(
         return ResidentRuntimeObservation(
             observed_state=ResidentObservedState.DEPLOYING,
             backend_ref={**self._backend_ref(runtime), "platformVersion": version},
-            endpoints=self._endpoints(runtime),
+            endpoints=self._endpoints(runtime, voice=self._values_enable_voice(values)),
             conditions=[
                 ResidentCondition(
                     type="BackendReady",
@@ -1271,10 +1297,11 @@ class FluxPodManager(
         deployment_name = self._deployment_name(deployment)
         if deployment_name:
             backend_ref["deploymentName"] = deployment_name
+        release_values = (helmrelease.get("spec") or {}).get("values") or {}
         return ResidentRuntimeObservation(
             observed_state=self._observed_state(runtime, helmrelease, deployment),
             backend_ref=backend_ref,
-            endpoints=self._endpoints(runtime),
+            endpoints=self._endpoints(runtime, voice=self._values_enable_voice(release_values)),
             conditions=self._normalized_conditions(helmrelease, deployment),
         )
 
