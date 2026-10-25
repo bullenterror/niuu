@@ -1143,3 +1143,28 @@ class TestValkyrieRuntimeConfig:
     def test_invalid_canonical_ranges_fail(self, section: str, field: str, value: int) -> None:
         with pytest.raises(ValueError, match=field):
             Settings(valkyrie={section: {field: value}})
+
+
+class TestPlatformAccessToken:
+    """``gateway.platform.access_token`` carries any platform bearer, not only a PAT."""
+
+    def test_config_key_sets_the_platform_bearer(self) -> None:
+        settings = Settings(gateway={"platform": {"access_token": "bearer-1"}})
+
+        assert settings.gateway.platform.access_token == "bearer-1"
+
+    def test_env_var_sets_the_platform_bearer(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("RAVN_GATEWAY__PLATFORM__ACCESS_TOKEN", "bearer-from-env")
+
+        assert Settings().gateway.platform.access_token == "bearer-from-env"
+
+    def test_renamed_pat_token_key_fails_loudly(self) -> None:
+        # Silently ignoring the old key would drop the credential.
+        with pytest.raises(ValueError, match="renamed to gateway.platform.access_token"):
+            Settings(gateway={"platform": {"pat_token": "bearer-1"}})
+
+    def test_renamed_pat_token_env_fails_loudly(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("RAVN_GATEWAY__PLATFORM__PAT_TOKEN", "bearer-from-env")
+
+        with pytest.raises(ValueError, match="RAVN_GATEWAY__PLATFORM__ACCESS_TOKEN"):
+            Settings()

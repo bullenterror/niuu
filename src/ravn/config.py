@@ -1214,12 +1214,12 @@ class PlatformToolsConfig(BaseModel):
     )
     base_url: str = Field(default="http://localhost:8080")
     timeout: float = Field(default=30.0)
-    pat_token: str = Field(
+    access_token: str = Field(
         default="",
         description=(
-            "Explicit external bearer token for platform API authentication. "
-            "In-cluster Ravn/Valkyrie callers should leave this empty and use "
-            "projected workload identity."
+            "Explicit bearer token for platform API authentication: a PAT for an "
+            "off-cluster resident, or the workload-bound token a sandbox runtime "
+            "mediates. Leave empty in-cluster to use projected workload identity."
         ),
     )
     anonymous_dev_mode: bool = Field(
@@ -1231,8 +1231,21 @@ class PlatformToolsConfig(BaseModel):
     )
     workload_token_file: str = Field(
         default="/var/run/secrets/kubernetes.io/serviceaccount/token",
-        description="Projected workload identity token file used when pat_token is not set.",
+        description="Projected workload identity token file used when access_token is not set.",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_renamed_pat_token(cls, data: Any) -> Any:
+        """``pat_token`` was renamed; dropping it silently would drop the credential."""
+        if isinstance(data, dict) and "pat_token" in data:
+            raise ValueError(
+                "gateway.platform.pat_token was renamed to gateway.platform.access_token "
+                "(env RAVN_GATEWAY__PLATFORM__ACCESS_TOKEN): it carries any platform "
+                "bearer, not only a PAT. Rename the key in this config."
+            )
+        return data
+
     workload_exchange_url: str = Field(
         default="",
         description=(

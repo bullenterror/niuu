@@ -85,7 +85,7 @@ def _platform_kwargs(settings: Settings, *, workflow_aliases: bool = False) -> d
     kwargs = {
         "base_url": platform.base_url,
         "timeout": platform.timeout,
-        "pat_token": platform.pat_token,
+        "access_token": platform.access_token,
         "workload_token_file": platform.workload_token_file,
         "exchange_url": platform.workload_exchange_url,
         "audiences": platform.workload_audiences,

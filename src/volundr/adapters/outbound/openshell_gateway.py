@@ -3959,7 +3959,7 @@ class OpenShellGatewayPodManager(
                 command=(
                     "sh",
                     "-lc",
-                    'export RAVN__GATEWAY__PLATFORM__PAT_TOKEN="$NIUU_VOLUNDR_ACCESS_TOKEN"; '
+                    'export RAVN_GATEWAY__PLATFORM__ACCESS_TOKEN="$NIUU_VOLUNDR_ACCESS_TOKEN"; '
                     "exec /opt/niuu/bin/python -m ravn daemon "
                     "--config /sandbox/.volundr/ravn.yaml "
                     f"--persona {shlex.quote(runtime.persona_name or 'product-steward')}",
