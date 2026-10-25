@@ -2193,6 +2193,19 @@ def test_l4_credentials_require_explicit_opt_in(monkeypatch):
     assert target["endpoints"][0].allow_uninspected_credentials is True
 
 
+def test_provider_endpoint_path_scopes_shared_host_credentials(monkeypatch):
+    adapter = _import_adapter(monkeypatch)
+    config = {
+        "endpoints": [{"host": "mcp.linear.app", "port": 443, "path": "/mcp/readonly/**"}],
+        "binaries": ["/usr/local/bin/codex"],
+    }
+    target = adapter._provider_target("NIUU_MCP_READONLY", config)
+    assert target["endpoints"][0].path == "/mcp/readonly/**"
+    del config["endpoints"][0]["path"]
+    target = adapter._provider_target("NIUU_MCP_READONLY", config)
+    assert target["endpoints"][0].path == ""
+
+
 def test_session_proxy_target_preserves_service_route_and_uses_gateway(
     monkeypatch: pytest.MonkeyPatch,
 ):

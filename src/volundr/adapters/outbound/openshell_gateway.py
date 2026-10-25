@@ -6070,6 +6070,7 @@ def _provider_target(env_name: str, config: Any = None) -> dict[str, Any]:
                 sandbox_pb2.NetworkEndpoint(
                     host=str(raw["host"]),
                     port=int(raw["port"]),
+                    path=str(raw.get("path") or ""),
                     protocol=str(raw.get("protocol") or ""),
                     tls=str(raw.get("tls") or "skip"),
                     enforcement=str(raw.get("enforcement") or "enforce"),
