@@ -99,6 +99,7 @@ def test_load_system_workflows_only_keeps_supported_catalog() -> None:
         "Specification Stack",
         "Tracker Delivery Flow",
         "Code & Review Flow",
+        "Infra Change Flow",
         "Tool & Skill Builder",
         "Developer Delivery",
         "Developer Planning",
@@ -495,6 +496,7 @@ async def test_seed_system_workflows_preserves_authored_and_obsolete_entries() -
         "Specification Stack",
         "Tracker Delivery Flow",
         "Code & Review Flow",
+        "Infra Change Flow",
         "Tool & Skill Builder",
         "Developer Delivery",
         "Developer Planning",
@@ -748,3 +750,20 @@ async def test_bundled_memory_wells_provision_without_a_stored_integration(workf
 
     assert await contributor._build_mappings(context, "owner-without-a-volundr-integration") == []
     store.get.assert_not_called()
+
+
+def test_infra_change_flow_merges_only_after_the_resident_approves() -> None:
+    """Merging an infra change deploys it, so nothing reaches the closer unapproved."""
+    workflow = next(w for w in load_system_workflows() if w.name == "Infra Change Flow")
+    nodes = {node["id"]: node for node in workflow.graph["nodes"]}
+    gate = nodes["infra-change-merge-gate"]
+    edges = {(edge["source"], edge["target"]): edge["label"] for edge in workflow.graph["edges"]}
+
+    assert gate["kind"] == "gate"
+    assert gate["mode"] == "human_approval"
+    assert "autoForwardAfter" not in gate
+    assert edges[("infra-change-review", "infra-change-merge-gate")].startswith("review.passed")
+    assert edges[("infra-change-merge-gate", "infra-change-close")].startswith("merge.approved")
+    assert ("infra-change-review", "infra-change-close") not in edges
+    closer = nodes["infra-change-close"]["stageMembers"][0]
+    assert closer["consumesEventTypes"] == ["merge.approved"]
