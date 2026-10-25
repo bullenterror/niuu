@@ -100,13 +100,13 @@ data:
         {{- if not .Values.session.ownerId }}
         {{- fail "resident.voice.enabled needs session.ownerId: only the resident's owner may call it" }}
         {{- end }}
-        # Realtime voice calls for the Lexi app; nginx forwards /voice/ here.
+        # Realtime voice calls; nginx forwards /voice/ here.
         voice:
           enabled: true
           host: "127.0.0.1"
           port: {{ .Values.resident.voice.port }}
           store_path: {{ .Values.resident.voice.storePath | quote }}
-          display_name: {{ .Values.resident.voice.displayName | quote }}
+          display_name: {{ .Values.resident.voice.displayName | default (include "skuld.residentName" .) | quote }}
           time_zone: {{ .Values.resident.voice.timeZone | quote }}
           owner_id: {{ .Values.session.ownerId | quote }}
           user_id_header: {{ .Values.envoy.headerNames.userId | quote }}

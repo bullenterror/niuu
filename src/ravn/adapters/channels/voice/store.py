@@ -4,7 +4,7 @@ A call is opened by ``session.start`` with the client's id, filled by
 ``session.log`` entries, and closed by ``session.end``. Starting an id again
 reopens it (a continued call keeps logging into the same record). Entries are
 stored verbatim, unknown fields included, and projected into the shapes the
-Lexi app reads: ``/api/logs`` sessions with ISO times, and ``/api/call-history``
+voice client reads: ``/api/logs`` sessions with ISO times, and ``/api/call-history``
 rows with epoch-millisecond times, finished turns and paired tool calls.
 """
 

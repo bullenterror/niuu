@@ -1,4 +1,4 @@
-"""The voice channel end to end, in the shapes the Lexi app's AgentServiceKit decodes."""
+"""The voice channel end to end, in the shapes the shapes voice clients decode."""
 
 from __future__ import annotations
 
@@ -80,7 +80,7 @@ def build(
         tools=tools if tools is not None else [FakeTool("web_search", result="sunny")],
         permission=AllowAllPermission(),
         conversation=VoiceConversationTools(store, search_limit=5),
-        agent_name="lexi",
+        agent_name="sidekick",
         timeout_seconds=5,
     )
     the_persona = persona()
@@ -122,17 +122,17 @@ def test_handshake_frames(tmp_path: Path) -> None:
         assert ask(ws, "auth", {"token": "x"}) == {"type": "auth.ok", "id": "m1", "payload": {}}
         assert ask(ws, "ping", message_id="p") == {"type": "pong", "id": "p", "payload": {}}
         assert ask(ws, "persona.list")["payload"] == {
-            "defaultPersona": "lexi",
-            "personas": ["lexi"],
+            "defaultPersona": "sidekick",
+            "personas": ["sidekick"],
         }
-        context = ask(ws, "persona.get", {"name": "lexi", "connector": "lexi-ios"})["payload"][
-            "context"
-        ]
-        assert context["name"] == "lexi" and context["displayName"] == "Lexi"
+        context = ask(ws, "persona.get", {"name": "sidekick", "connector": "sidekick-ios"})[
+            "payload"
+        ]["context"]
+        assert context["name"] == "sidekick" and context["displayName"] == "Sidekick"
         assert context["voices"] == {"grok-voice": "ara", "openai-realtime": "marin"}
         assert context["voice"] == "marin"
-        assert context["sources"] == ["persona:lexi"] and context["errors"] == []
-        assert context["contextPrompt"].startswith("You are Lexi.")
+        assert context["sources"] == ["persona:sidekick"] and context["errors"] == []
+        assert context["contextPrompt"].startswith("You are Sidekick.")
         assert ask(ws, "gateway.credentials")["payload"]["gateways"] == []
 
 
@@ -166,7 +166,7 @@ def test_mint_returns_a_credential_and_the_persona(tmp_path: Path) -> None:
     _, client = build(tmp_path, minters={"xai": minter})
     with client.websocket_connect("/") as ws:
         result = ask(
-            ws, "voice.ephemeral", {"provider": "xai", "persona": "lexi", "reasoning": "high"}
+            ws, "voice.ephemeral", {"provider": "xai", "persona": "sidekick", "reasoning": "high"}
         )
 
     assert result["type"] == "voice.ephemeral.result"
@@ -178,7 +178,7 @@ def test_mint_returns_a_credential_and_the_persona(tmp_path: Path) -> None:
     assert payload["model"] == "grok-voice-3.0"
     assert payload["voice"] == "ara"
     assert payload["personaApplied"] is False
-    assert payload["instructions"].startswith("You are Lexi.")
+    assert payload["instructions"].startswith("You are Sidekick.")
     assert minter.requests[0]["reasoning"] == "high"
 
 
@@ -248,7 +248,7 @@ def test_call_lifecycle_lands_in_history_logs_and_the_room(tmp_path: Path) -> No
             "session.start",
             {
                 "sessionId": "CALL-1",
-                "persona": "lexi",
+                "persona": "sidekick",
                 "provider": "xai",
                 "metadata": {"client": "ios"},
             },
@@ -263,12 +263,12 @@ def test_call_lifecycle_lands_in_history_logs_and_the_room(tmp_path: Path) -> No
             {
                 "sessionId": "CALL-1",
                 "type": "user_speech",
-                "payload": {"text": "Hi Lexi", "timestamp": 1000},
+                "payload": {"text": "Hi Sidekick", "timestamp": 1000},
             },
         )
         assert (
             ack["type"] == "session.log.ack"
-            and ack["payload"]["entry"]["payload"]["text"] == "Hi Lexi"
+            and ack["payload"]["entry"]["payload"]["text"] == "Hi Sidekick"
         )
         ask(
             ws,
@@ -324,14 +324,14 @@ def test_call_lifecycle_lands_in_history_logs_and_the_room(tmp_path: Path) -> No
         assert ask(ws, "session.start", {})["payload"]["code"] == "INVALID_PARAMS"
 
     assert room.copies == [
-        {"call_id": "CALL-1", "speaker": "user", "text": "Hi Lexi"},
+        {"call_id": "CALL-1", "speaker": "user", "text": "Hi Sidekick"},
         {"call_id": "CALL-1", "speaker": "agent", "text": "Hello!"},
     ]
     history = client.get("/api/call-history").json()
     assert history["count"] == 1
     row = history["calls"][0]
     assert row["provider"] == "grok-voice" and row["client"] == "ios" and row["durationMs"] == 9000
-    assert [m["text"] for m in row["messages"]] == ["Hi Lexi", "Hello!"]
+    assert [m["text"] for m in row["messages"]] == ["Hi Sidekick", "Hello!"]
     sessions = client.get("/api/logs").json()["sessions"]
     assert sessions[0]["id"] == "CALL-1" and sessions[0]["entryCount"] == 4
     detail = client.get("/api/logs/CALL-1").json()
@@ -370,7 +370,7 @@ def test_rest_tools_prompt_and_health(tmp_path: Path) -> None:
 
     prompt = client.get(
         "/api/voice/prompt",
-        params={"provider": "grok", "surface": "ios", "persona": "lexi", "conversationId": "C"},
+        params={"provider": "grok", "surface": "ios", "persona": "sidekick", "conversationId": "C"},
     ).json()
     assert prompt["success"] and prompt["prompt"]["session"]["voice"] == "ara"
     assert (
@@ -445,7 +445,7 @@ def test_a_channel_without_an_owner_is_refused(tmp_path: Path) -> None:
         tools=[],
         permission=AllowAllPermission(),
         conversation=VoiceConversationTools(store, search_limit=1),
-        agent_name="lexi",
+        agent_name="sidekick",
         timeout_seconds=1,
     )
     the_persona = persona()

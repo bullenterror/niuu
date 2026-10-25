@@ -83,8 +83,8 @@ _HTTP_CONFLICT = 409
 #: Key of a Ravn resident's own OpenClaw shim token Secret (resident.openclaw.tokenSecret).
 RESIDENT_OPENCLAW_TOKEN_KEY = "token"
 #: Protocol a resident's voice channel speaks (ravn.adapters.channels.voice): the
-#: Lexi app's agent-service wire, served under /voice/ on the resident's route.
-RESIDENT_VOICE_PROTOCOL = "lexi-agent-service-v1"
+#: agent-service wire of realtime voice clients, served under /voice/ on the resident's route.
+RESIDENT_VOICE_PROTOCOL = "agent-service-voice-v1"
 #: The resident pod container its declared credentials are rendered into: the Ravn
 #: daemon, which holds the persona, its tools and the voice channel.
 RESIDENT_CREDENTIAL_CONTAINERS = "ravn"

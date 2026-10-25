@@ -37,8 +37,8 @@ def _persona(**voice: object) -> PersonaConfig:
     fields: dict[str, object] = {"voices": {"grok-voice": "ara"}, "tools": ["web_search"]}
     fields.update(voice)
     return PersonaConfig(
-        name="lexi",
-        system_prompt_template="You are Lexi.",
+        name="sidekick",
+        system_prompt_template="You are Sidekick.",
         allowed_tools=["web"],
         voice=PersonaVoiceConfig(**fields),  # type: ignore[arg-type]
     )
@@ -63,7 +63,7 @@ def test_builds_the_gateway_with_only_the_voice_tools(tmp_path: Path) -> None:
 
 def test_room_copy_is_built_when_the_broker_is_configured(tmp_path: Path) -> None:
     settings = _settings(
-        tmp_path, room_broker_url="http://127.0.0.1:8081", room_participant_id="flock-lexi"
+        tmp_path, room_broker_url="http://127.0.0.1:8081", room_participant_id="flock-sidekick"
     )
 
     room = voice_wiring.build_room_copier(settings.gateway.channels.voice)

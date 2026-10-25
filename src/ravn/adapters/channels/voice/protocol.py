@@ -1,4 +1,4 @@
-"""The lexi-agent-service WebSocket wire, as the Lexi app's AgentServiceKit speaks it.
+"""The agent-service WebSocket wire, as realtime voice clients speak it.
 
 Every frame is ``{type, id, payload}``. A response echoes the request's ``id``;
 ``payload`` is always an object. An error is ``{type: "error", id, payload:

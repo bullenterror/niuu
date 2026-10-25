@@ -1,4 +1,4 @@
-"""The voice channel: a resident speaking the Lexi app's agent-service wire.
+"""The voice channel: a resident speaking the agent-service wire of realtime voice clients.
 
 See :mod:`ravn.adapters.channels.voice.gateway`.
 """

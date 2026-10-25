@@ -1078,7 +1078,7 @@ class TestFluxResidentRuntimeController:
 
         voice = [e for e in observation.endpoints if e.kind == "voice"]
         assert [(e.protocol, e.url) for e in voice] == [
-            ("lexi-agent-service-v1", f"https://{runtime.id}.volundr.example.com/voice")
+            ("agent-service-voice-v1", f"https://{runtime.id}.volundr.example.com/voice")
         ]
 
     async def test_deploy_without_voice_advertises_chat_only(

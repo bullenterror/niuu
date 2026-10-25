@@ -10,7 +10,7 @@ import httpx
 import pytest
 
 from ravn.adapters.channels.voice.prompt import (
-    PROMPT_SCHEMA,
+    PROMPT_VERSION,
     UnsupportedProviderError,
     VoicePersona,
     VoicePromptComposer,
@@ -33,9 +33,9 @@ MODELS = {"grok": "grok-voice-3.0", "gpt-realtime": "gpt-realtime-2.1"}
 
 def persona(**overrides: object) -> VoicePersona:
     fields: dict[str, object] = {
-        "name": "lexi",
-        "display_name": "Lexi",
-        "identity": "You are Lexi.",
+        "name": "sidekick",
+        "display_name": "Sidekick",
+        "identity": "You are Sidekick.",
         "style": "Warm.",
         "voices": {"grok-voice": "ara", "openai-realtime": "marin"},
         "grok_session": {"reasoning": {"effort": "high"}},
@@ -96,7 +96,8 @@ def test_grok_prompt_carries_persona_session_and_native_search() -> None:
 
     prompt = composer.prompt("xai", surface="ios", conversation_id="CALL-1")
 
-    assert prompt["schema"] == PROMPT_SCHEMA
+    assert "schema" not in prompt  # clients read an unnamed prompt as version 2
+    assert prompt["fingerprint"]["version"] == PROMPT_VERSION
     assert prompt["provider"] == "grok"
     assert prompt["session"] == {
         "model": "grok-voice-3.0",
@@ -108,10 +109,10 @@ def test_grok_prompt_carries_persona_session_and_native_search() -> None:
     assert prompt["fingerprint"]["toolCount"] == 2
     instructions = prompt["instructions"]
     assert instructions.startswith(
-        "You are Lexi, speaking with your operator on a live voice call from their iPhone."
+        "You are Sidekick, speaking with your operator on a live voice call from their iPhone."
     )
     assert "This conversation's id is CALL-1." in instructions
-    assert "You are Lexi." in instructions and "## How you sound\n\nWarm." in instructions
+    assert "You are Sidekick." in instructions and "## How you sound\n\nWarm." in instructions
     assert "end_conversation" in instructions
 
 
@@ -128,7 +129,7 @@ def test_gpt_realtime_prompt_has_no_grok_fields() -> None:
 def test_standing_instructions_have_no_per_call_preamble() -> None:
     composer = VoicePromptComposer(persona(), models=MODELS, time_zone="UTC", tool_names=[])
 
-    assert composer.standing_instructions().startswith("You are Lexi.")
+    assert composer.standing_instructions().startswith("You are Sidekick.")
 
 
 @pytest.mark.parametrize("provider", ["gemini", "gpt-live", "live"])
@@ -161,7 +162,7 @@ def _bridge(
         tools=list(tools),
         permission=permission or AllowAllPermission(),
         conversation=VoiceConversationTools(store, search_limit=10),
-        agent_name="lexi",
+        agent_name="sidekick",
         timeout_seconds=timeout,
     )
 
@@ -229,9 +230,9 @@ def test_bridge_refuses_a_tool_named_like_a_conversation_tool(store: VoiceCallSt
 
 
 async def test_conversation_tools_work_over_the_store(store: VoiceCallStore) -> None:
-    store.start("OLD", persona="lexi", provider="xai", metadata={})
+    store.start("OLD", persona="sidekick", provider="xai", metadata={})
     store.log("OLD", "user_speech", {"text": "plan the garden"})
-    store.start("NOW", persona="lexi", provider="xai", metadata={})
+    store.start("NOW", persona="sidekick", provider="xai", metadata={})
     bridge = _bridge(store)
 
     titled = await bridge.call(
@@ -274,7 +275,7 @@ async def test_conversation_tools_work_over_the_store(store: VoiceCallStore) -> 
 async def test_conversation_tools_answer_bad_input_as_errors(
     store: VoiceCallStore, name: str, args: dict, conversation: str, message: str
 ) -> None:
-    store.start("NOW", persona="lexi", provider="xai", metadata={})
+    store.start("NOW", persona="sidekick", provider="xai", metadata={})
     outcome = await _bridge(store).call(name, args, call_id="", conversation_id=conversation)
 
     assert outcome.is_error and message in outcome.content
@@ -297,7 +298,7 @@ def _room(status: int, seen: list[httpx.Request]) -> VoiceRoomCopier:
 
     return VoiceRoomCopier(
         broker_url="http://127.0.0.1:8081/",
-        participant_id="flock-lexi",
+        participant_id="flock-sidekick",
         timeout_seconds=1,
         transport=httpx.MockTransport(handler),
     )
@@ -318,7 +319,7 @@ async def test_room_copy_posts_commentary_under_the_right_speaker() -> None:
         "source": "voice",
         "metadata": {"channel": "voice", "call_id": "C", "speaker": "agent"},
         "deliver_to_transport": False,
-        "participant_id": "flock-lexi",
+        "participant_id": "flock-sidekick",
     }
     assert "participant_id" not in user and user["metadata"]["speaker"] == "user"
 

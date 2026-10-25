@@ -1,7 +1,7 @@
 """The voice prompt: the resident's persona, spoken.
 
 ``persona.get`` answers with the persona's voice context (identity plus how it
-sounds). ``GET /api/voice/prompt`` answers with ``lexi.voice-prompt.v2``: the
+sounds). ``GET /api/voice/prompt`` answers with the composed prompt (version 2): the
 same context opened by a preamble (who is speaking, when, and the conversation
 id), the provider's session fields, and native web search for Grok. The device
 appends only what it alone knows (its runtime context and the resume block).
@@ -15,7 +15,9 @@ from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
-PROMPT_SCHEMA = "lexi.voice-prompt.v2"
+#: The prompt's version, recorded in its fingerprint. The prompt itself carries no ``schema``
+#: field: clients read an unnamed prompt as version 2.
+PROMPT_VERSION = 2
 
 #: Prompt providers this channel composes for, and the persona voice key each uses.
 VOICE_KEYS = {"grok": "grok-voice", "gpt-realtime": "openai-realtime"}
@@ -140,7 +142,6 @@ class VoicePromptComposer:
         if provider == "grok":
             session.update(persona.grok_session)
         prompt: dict[str, Any] = {
-            "schema": PROMPT_SCHEMA,
             "persona": persona.name,
             "displayName": persona.display_name,
             "provider": provider,
@@ -150,7 +151,7 @@ class VoicePromptComposer:
             "instructions": instructions,
             "session": session,
             "fingerprint": {
-                "schema": PROMPT_SCHEMA,
+                "version": PROMPT_VERSION,
                 "persona": persona.name,
                 "provider": provider,
                 "surface": surface,

@@ -37,7 +37,7 @@ async def test_xai_mints_a_ttl_only_secret(key_file: Path) -> None:
         transport=_transport(200, {"value": "xai-secret", "expires_at": 1_800_000_000}, seen),
     )
 
-    credential = await minter.mint(model="grok-voice-3.0", voice="ara", instructions="Be Lexi.")
+    credential = await minter.mint(model="grok-voice-3.0", voice="ara", instructions="Be Sidekick.")
 
     assert credential.token == "xai-secret"
     assert credential.expires_at_ms == 1_800_000_000_000
@@ -64,7 +64,7 @@ async def test_openai_bakes_model_instructions_voice_and_reasoning(key_file: Pat
     )
 
     credential = await minter.mint(
-        model="gpt-realtime-2.1", voice="marin", instructions="Be Lexi.", reasoning="low"
+        model="gpt-realtime-2.1", voice="marin", instructions="Be Sidekick.", reasoning="low"
     )
 
     assert credential.token == "ek_123"
@@ -74,7 +74,7 @@ async def test_openai_bakes_model_instructions_voice_and_reasoning(key_file: Pat
     assert body["session"] == {
         "type": "realtime",
         "model": "gpt-realtime-2.1",
-        "instructions": "Be Lexi.",
+        "instructions": "Be Sidekick.",
         "audio": {"output": {"voice": "marin"}},
         "reasoning": {"effort": "low"},
     }

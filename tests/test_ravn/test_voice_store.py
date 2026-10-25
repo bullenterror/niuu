@@ -1,4 +1,4 @@
-"""The voice call store and its projections into the Lexi app's shapes."""
+"""The voice call store and its projections into a voice client.s shapes."""
 
 from __future__ import annotations
 
@@ -18,7 +18,10 @@ def store(tmp_path: Path) -> VoiceCallStore:
 
 def _call(store: VoiceCallStore, call_id: str = "CALL-1") -> None:
     store.start(
-        call_id, persona="lexi", provider="xai", metadata={"client": "ios", "agentId": "lexi"}
+        call_id,
+        persona="sidekick",
+        provider="xai",
+        metadata={"client": "ios", "agentId": "sidekick"},
     )
 
 
@@ -111,11 +114,13 @@ def test_starting_an_ended_call_reopens_it_and_merges_metadata(store: VoiceCallS
     _call(store)
     store.end("CALL-1", reason="done", duration_ms=None, summary=None, metadata={})
 
-    call = store.start("CALL-1", persona="lexi", provider="xai", metadata={"continuedFrom": "OLD"})
+    call = store.start(
+        "CALL-1", persona="sidekick", provider="xai", metadata={"continuedFrom": "OLD"}
+    )
 
     assert call.state == "active"
     assert call.ended_at_ms is None
-    assert call.metadata == {"client": "ios", "agentId": "lexi", "continuedFrom": "OLD"}
+    assert call.metadata == {"client": "ios", "agentId": "sidekick", "continuedFrom": "OLD"}
     assert store.history_json(call)["continuedFrom"] == "OLD"
 
 

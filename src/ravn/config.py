@@ -1554,10 +1554,10 @@ class VoiceMinterConfig(BaseModel):
 
 
 class VoiceChannelConfig(BaseModel):
-    """Realtime voice channel — makes the resident look like Lexi's agent service.
+    """Realtime voice channel — makes the resident the agent service of a voice client.
 
-    Serves the subset of the lexi-agent-service wire (a ``{type,id,payload}``
-    WebSocket at the root plus ``/api`` REST) that the Lexi app's voice calls use:
+    Serves the subset of the agent-service wire (a ``{type,id,payload}``
+    WebSocket at the root plus ``/api`` REST) that realtime voice clients use:
     persona, prompt, short-lived provider credentials, the resident's tools, and
     the call log. The phone's realtime model is the resident's voice; it calls
     the persona's ``voice.tools`` directly. See ``ravn.adapters.channels.voice``.

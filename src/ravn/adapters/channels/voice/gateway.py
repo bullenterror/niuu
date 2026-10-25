@@ -1,10 +1,10 @@
-"""Make the resident look like Lexi's agent service to the Lexi app's voice calls.
+"""Make the resident the agent service of a realtime voice client.
 
-Rather than teaching the Lexi app about Ravn, this teaches the resident to speak
-the protocol the app's voice stack already implements (``AgentServiceKit``): a
-``{type,id,payload}`` WebSocket at the root and REST under ``/api``. The app's
-realtime model runs on the phone and talks to the provider directly; the
-resident supplies who is speaking (its persona), short-lived provider
+Rather than teaching a voice client about Ravn, this teaches the resident to
+speak the agent-service protocol such clients already implement: a
+``{type,id,payload}`` WebSocket at the root and REST under ``/api``. The
+client's realtime model runs on the device and talks to the provider directly;
+the resident supplies who is speaking (its persona), short-lived provider
 credentials, its own tools, and the record of the call.
 
 The server binds loopback. The pod's nginx forwards ``/voice/`` here, behind the

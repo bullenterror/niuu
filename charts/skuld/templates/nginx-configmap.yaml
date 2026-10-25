@@ -77,7 +77,7 @@ data:
             }
 
             {{- if and (include "skuld.residentEnabled" .) .Values.resident.voice.enabled }}
-            # Resident voice channel (Ravn, loopback): the Lexi app's agent-service wire.
+            # Resident voice channel (Ravn, loopback): the agent-service wire voice clients speak.
             location = /voice {
                 return 301 /voice/;
             }

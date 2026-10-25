@@ -122,10 +122,10 @@ def test_portable_document_rejects_malformed_voice(voice: object, message: str) 
         parse_portable_persona(yaml.safe_dump(raw))
 
 
-def test_lexi_persona_offers_voice_with_only_allowed_tools() -> None:
+def test_sidekick_persona_offers_voice_with_only_allowed_tools() -> None:
     from ravn.cli.tool_builders import _expand_allowed_tools
 
-    persona = FilesystemPersonaAdapter().load("lexi")
+    persona = FilesystemPersonaAdapter().load("sidekick")
 
     assert persona is not None
     assert persona.voice.voices == {"grok-voice": "ara", "openai-realtime": "marin"}

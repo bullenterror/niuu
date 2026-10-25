@@ -1686,13 +1686,15 @@ class TestResidentVoice:
             "session": {"ownerId": "owner-1"},
             "resident": {
                 "enabled": True,
-                "persona": "lexi",
+                "persona": "sidekick",
                 "voice": {"enabled": True, "minters": self._MINTERS, **voice},
             },
         }
 
     def test_off_by_default(self, tmp_path: Path) -> None:
-        rendered = _render_skuld_chart(tmp_path, {"resident": {"enabled": True, "persona": "lexi"}})
+        rendered = _render_skuld_chart(
+            tmp_path, {"resident": {"enabled": True, "persona": "sidekick"}}
+        )
 
         assert "voice" not in _ravn_config_from_rendered(rendered)["gateway"]["channels"]
         assert "location /voice/" not in rendered
@@ -1712,8 +1714,10 @@ class TestResidentVoice:
         assert config.models == {"grok": "grok-voice-3.0"}
         assert config.minters["xai"].kwargs == {"key_file": "/run/secrets/xai-api-key"}
         assert config.room_broker_url == "http://127.0.0.1:8081"
-        assert config.room_participant_id == "flock-lexi"
+        assert config.room_participant_id == "flock-sidekick"
         assert config.owner_id == "owner-1" and config.user_id_header == "x-auth-user-id"
+        # The resident introduces itself by its own name (here its persona, without one).
+        assert config.display_name == "sidekick"
 
     def test_nginx_forwards_voice_to_the_channel_with_upgrade(self, tmp_path: Path) -> None:
         rendered = _render_skuld_chart(tmp_path, self._values(port=19001))

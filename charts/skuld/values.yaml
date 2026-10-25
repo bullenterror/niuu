@@ -651,8 +651,8 @@ resident:
     # -- NetworkPolicy peers allowed to reach the shim port when
     # networkPolicy.enabled (e.g. Volundr's pods). Empty allows any peer.
     ingressFrom: []
-  # -- Realtime voice calls (gateway.channels.voice): the resident speaks the Lexi
-  # app's agent-service wire under /voice/ on its own route, behind the same Envoy
+  # -- Realtime voice calls (gateway.channels.voice): the resident speaks the
+  # agent-service wire voice clients use, under /voice/ on its own route, behind the same Envoy
   # checks as its room. Needs a persona with a voice: section and a minter whose key
   # file is mounted into the ravn container (resident credentials, OpenBao).
   voice:
@@ -661,7 +661,7 @@ resident:
     port: 18791
     # -- The resident's call store. /workspace is the sessions volume.
     storePath: /workspace/.ravn/voice/calls.db
-    # -- Name the resident introduces itself by. Empty uses the persona name.
+    # -- Name the resident introduces itself by. Empty uses the resident's name.
     displayName: ""
     # -- IANA time zone for the date and time in a call's prompt.
     timeZone: UTC

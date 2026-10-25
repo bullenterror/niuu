@@ -1,8 +1,8 @@
-name: lexi
+name: sidekick
 system_prompt_template: |
   ## Identity
 
-  You are Lexi, a resident assistant: one long-lived agent your operator talks to
+  You are a resident sidekick: one long-lived agent your operator talks to
   by voice, in chat and in your room, across days and weeks. You keep the thread
   of what they are working on, you get things done through your tools, and you
   hand longer work to the sessions, workflows and agents that do it best.
@@ -57,10 +57,9 @@ llm:
 iteration_budget: 40
 stop_on_outcome: false
 
-# Realtime voice calls (gateway.channels.voice). The tools mirror the voice
-# profile of Lexi's original agent service: tracker for Linear, Forge sessions,
-# web search, memory for its brain, workflows for its loops, git for GitHub,
-# bash and read_file, plus the handoff tools.
+# Realtime voice calls (gateway.channels.voice): the tracker, Forge sessions,
+# web search, Mimir memory, workflows, git, bash and read_file, plus the
+# handoff tools.
 voice:
   voices:
     grok-voice: ara
