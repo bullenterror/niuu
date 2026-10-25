@@ -740,6 +740,7 @@ async def launch_workflow_execution(
     bearer_token: str | None = None,
     pinned_workflow_snapshot: dict[str, Any] | None = None,
     trusted_workflow_execution: bool = False,
+    launch_slug: str | None = None,
 ) -> WorkflowLaunchExecution:
     raw_execution_context = launch.provenance.get("workflow_execution")
     if raw_execution_context and not trusted_workflow_execution:
@@ -792,7 +793,10 @@ async def launch_workflow_execution(
             workflow_snapshot,
             launch.gate_auto_forward_after.strip(),
         )
-    launch_slug = _resolve_launch_slug(launch, workflow)
+    # A platform launcher (A2A) pins its own stable slug so a retry recovers the
+    # session it already spawned while the session still gets a readable name.
+    if launch_slug is None:
+        launch_slug = _resolve_launch_slug(launch, workflow)
     session_name = _resolve_launch_session_name(launch, workflow, launch_slug)
     settings = request.app.state.settings
 
