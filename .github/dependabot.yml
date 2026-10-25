@@ -62,6 +62,11 @@ updates:
       # npm 12 blocks dependency lifecycle scripts required by the runtime CLIs.
       - dependency-name: "npm"
         update-types: ["version-update:semver-major"]
+      # These direct undici pins only exist for replace-nested.sh, which copies
+      # them over a bundled copy: they must stay on the major the bundling
+      # package declares (npm's node-gyp ^6, pi-coding-agent's 8.x).
+      - dependency-name: "undici"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: docker
     directories:

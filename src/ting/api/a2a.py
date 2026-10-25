@@ -110,6 +110,12 @@ from ting.ports.workflow_repository import WorkflowRepository
 
 logger = logging.getLogger(__name__)
 
+
+def _sanitize_log(value: object) -> str:
+    """Sanitize a value for safe log output (prevent log injection)."""
+    return str(value).replace("\n", "\\n").replace("\r", "\\r")
+
+
 A2A_ENDPOINT_PREFIX = "/api/v1/ting/a2a"
 A2A_SURFACE = "a2a"
 LAUNCH_SCOPE = "ting:workflow:launch"
@@ -1906,10 +1912,12 @@ def create_a2a_router() -> APIRouter:
             )
             logger.info(
                 "A2A JSON-RPC %s finished outcome=%s task_id=%s workflow_id=%s",
-                attributes["rpc.method"],
+                _sanitize_log(attributes["rpc.method"]),
                 outcome,
-                str(response_attributes.get("taskId") or attributes.get("taskId") or ""),
-                str(response_attributes.get("workflowId") or attributes.get("workflowId") or ""),
+                _sanitize_log(response_attributes.get("taskId") or attributes.get("taskId") or ""),
+                _sanitize_log(
+                    response_attributes.get("workflowId") or attributes.get("workflowId") or ""
+                ),
             )
             return response
 
