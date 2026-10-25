@@ -1418,13 +1418,16 @@ def _make_channel_tasks(
     gw: Any,
     *,
     notifications: Any | None = None,
+    voice_factory: Any | None = None,
 ) -> list[tuple[Any, str]]:
     """Create asyncio tasks for the extended gateway channel adapters.
 
     Returns a list of ``(task, name)`` pairs so callers can populate both
     a task list and a display list without duplicating the if-chain.
     ``notifications`` is the resident notification outbox the OpenClaw shim
-    serves to Forge (``build_resident_notification_outbox``).
+    serves to Forge (``build_resident_notification_outbox``). ``voice_factory``
+    builds the voice channel for the runtime's persona
+    (``ravn.cli.voice_wiring.build_voice_gateway``).
     """
     from ravn.adapters.channels.gateway_discord import DiscordGateway
     from ravn.adapters.channels.gateway_matrix import MatrixGateway
@@ -1453,6 +1456,14 @@ def _make_channel_tasks(
             WhatsAppGateway(channels_cfg.whatsapp, gw).run(), name="whatsapp"
         )
         pairs.append((task, "whatsapp"))
+    voice_cfg = getattr(channels_cfg, "voice", None)
+    if voice_cfg is not None and voice_cfg.enabled:
+        if voice_factory is None:
+            raise RuntimeError(
+                "gateway.channels.voice is enabled but this runtime builds no voice channel"
+            )
+        task = asyncio.create_task(voice_factory().run(), name="voice")
+        pairs.append((task, "voice"))
     return pairs
 
 
@@ -1589,7 +1600,12 @@ async def _run_gateway(
         ht = HttpGateway(settings.gateway.channels.http, gw)
         tasks.append(asyncio.create_task(ht.run(), name="http"))
 
-    for task, _ in _make_channel_tasks(settings.gateway.channels, gw):
+    def _voice_factory() -> Any:
+        from ravn.cli.voice_wiring import build_voice_gateway
+
+        return build_voice_gateway(settings, persona_config)
+
+    for task, _ in _make_channel_tasks(settings.gateway.channels, gw, voice_factory=_voice_factory):
         tasks.append(task)
 
     typer.echo(f"Gateway started ({len(tasks)} channel(s) active). Press Ctrl+C to stop.")
