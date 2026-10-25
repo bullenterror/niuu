@@ -338,6 +338,7 @@ class TestCliAgentNotify:
 
         assert [tool.name for tool in served["tools"]] == [NOTIFY_TOOL_NAME]
         assert served["channel"] == "room-7"
+        assert current_notification_channel.get() is None, "the channel ends with the server"
         outbox.close.assert_called_once_with()
 
     def test_the_servers_notification_reaches_the_residents_outbox(self, tmp_path):

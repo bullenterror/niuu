@@ -967,9 +967,6 @@ def tool_mcp(
             from ravn.adapters.tools.notify import ResidentNotifyTool
 
             tools.append(ResidentNotifyTool(notification_outbox))
-        # What the agent notifies from this server names the channel its turn runs in;
-        # asyncio.run copies this context into the server's task.
-        current_notification_channel.set(notification_channel or None)
 
         from ravn.adapters.mcp.tool_port_server import ToolPortMcpServer
 
@@ -996,9 +993,13 @@ def tool_mcp(
             enabled="build_tool" in allowed_tools,
             settings=settings,
         )
+        # What the agent notifies from this server names the channel its turn runs in;
+        # asyncio.run copies this context into the server's task.
+        channel_token = current_notification_channel.set(notification_channel or None)
         try:
             asyncio.run(server.run_stdio())
         finally:
+            current_notification_channel.reset(channel_token)
             if notification_outbox is not None:
                 notification_outbox.close()
     finally:
