@@ -4,7 +4,7 @@ COPY containers/python-security/ /security/
 RUN apt-get update && apt-get install -y --no-install-recommends patch \
     && python /security/build.py /patched-stdlib
 
-FROM ghcr.io/astral-sh/uv:0.12.24@sha256:3af4716e991d6956a41e573eab705d0ee08500cd829ed30293eb8472f372c65a AS uv
+FROM ghcr.io/astral-sh/uv:0.13.5@sha256:32a7bb39b496babbd997b0a39a4d66c126bdaf5661b302bf6f06abda8deca6ff AS uv
 
 # The sandbox base ships gh v2.102.0 (the latest release), built with Go 1.27.1 and
 # golang.org/x/net v0.58.0 (GO-2026-6603/6604/6611/6612). Replace it with the same
