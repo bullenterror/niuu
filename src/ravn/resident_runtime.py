@@ -106,7 +106,13 @@ is required. Declare `next_action_timing` as `external_event` or `scheduled_time
 When you sleep with `scheduled_time`, also give `wake_at` as an ISO timestamp. The runtime
 persists it and wakes this same case at that time; without a usable `wake_at` it falls back to
 its configured default delay. Sleeping with `external_event` schedules nothing — the next
-observation is the wake source."""
+observation is the wake source.
+
+The open operator questions above are ones you already asked that are still waiting. Do not
+ask any of them again in other words; wait for the answer. When one no longer needs an answer
+— the work it waited on is done, it was decided another way, or a newer question replaces it —
+withdraw it: include `withdrawn_questions` as a list of `{case_id: <case_id>, reason: <why>}`.
+The runtime closes exactly those questions and nothing else."""
 
 
 @dataclass(frozen=True)
@@ -375,6 +381,19 @@ class ResidentRuntime:
             if a2a_tasks
             else "(No active durable A2A task handles.)"
         )
+        open_questions = await self._state.list_operator_needed()
+        questions_block = (
+            _bounded(
+                json.dumps(
+                    [_open_question_prompt_view(entry) for entry in open_questions],
+                    indent=2,
+                    sort_keys=True,
+                ),
+                self._context_max_chars,
+            )
+            if open_questions
+            else "(No operator questions are waiting for an answer.)"
+        )
         return (
             f"{task.initiative_context.rstrip()}\n\n"
             "## Durable resident working state\n\n"
@@ -382,6 +401,8 @@ class ResidentRuntime:
             f"{state_block}\n\n"
             "## Durable A2A task handles\n\n"
             f"{a2a_block}\n\n"
+            "## Open operator questions\n\n"
+            f"{questions_block}\n\n"
             f"{_WORKING_STATE_PROTOCOL}\n"
         )
 
@@ -763,6 +784,9 @@ class ResidentRuntime:
                     "ravn.resident.working_state_updates",
                     attributes={"ravn.resident.id": self._resident_id},
                 )
+
+        if outcome_valid:
+            await self._withdraw_operator_questions(fields, case_id=case_id, turn_ref=turn_ref)
 
         snapshot = ResidentBudgetSnapshot(
             turns_used=turn_index,
@@ -1347,6 +1371,53 @@ class ResidentRuntime:
             operator_ref=operator_ref,
             question=question,
         )
+
+    async def _withdraw_operator_questions(
+        self,
+        fields: Mapping[str, Any],
+        *,
+        case_id: str,
+        turn_ref: str,
+    ) -> None:
+        """Close the open questions this turn judged no longer need an answer.
+
+        The judgment is the resident's; this only applies it. A withdrawal naming
+        no open question is rejected visibly rather than guessed at.
+        """
+        requested = fields.get("withdrawn_questions")
+        if not requested:
+            return
+        telemetry = get_observability()
+        items = requested if isinstance(requested, list) else [requested]
+        for item in items:
+            target, reason = _withdrawal_request(item, fallback_reason=fields.get("rationale"))
+            pending = await self._state.read_operator_needed(target) if target else None
+            if pending is None or target == case_id:
+                telemetry.event(
+                    "ravn.resident.operator_question.withdraw_rejected",
+                    attributes={"ravn.resident.case_id": case_id},
+                    content={
+                        "requested": item,
+                        "reason": "its own question"
+                        if target == case_id
+                        else "no open question for that case",
+                    },
+                )
+                continue
+            operator_ref = await self._state.withdraw_operator_needed(
+                target, reason=reason, turn_ref=turn_ref
+            )
+            if self._notifications is not None:
+                # Its "needs your input" item must not keep asking the owner.
+                await self._notifications.resolve(group=target)
+            telemetry.event(
+                "ravn.resident.operator_question.withdrawn",
+                attributes={
+                    "ravn.resident.case_id": case_id,
+                    "ravn.resident.withdrawn_case_id": target,
+                },
+                content={"reason": reason, "operator_ref": operator_ref},
+            )
 
     async def pending_questions(self) -> list[dict[str, str]]:
         return [_pending_view(item) for item in await self._state.list_operator_needed()]
@@ -2185,6 +2256,24 @@ def _evidence_refs(fields: dict[str, Any], task: AgentTask) -> tuple[str, ...]:
             if value:
                 refs.append(value)
     return tuple(dict.fromkeys(refs))
+
+
+def _open_question_prompt_view(entry: ResidentMemoryEntry) -> dict[str, str]:
+    return {
+        "case_id": _metadata(entry.content, "case_id") or _case_from_path(entry.path),
+        "asked_at": _metadata(entry.content, "created_at"),
+        "question": _metadata(entry.content, "question"),
+    }
+
+
+def _withdrawal_request(item: Any, *, fallback_reason: Any) -> tuple[str, str]:
+    if isinstance(item, Mapping):
+        target = str(item.get("case_id") or "").strip()
+        reason = str(item.get("reason") or "").strip()
+    else:
+        target = str(item or "").strip()
+        reason = ""
+    return target, reason or str(fallback_reason or "").strip() or "withdrawn by the resident"
 
 
 def _pending_view(entry: ResidentMemoryEntry) -> dict[str, str]:
