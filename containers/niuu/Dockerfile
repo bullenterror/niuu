@@ -1,5 +1,5 @@
 # Security fixes awaiting stable CPython releases; no interpreter ABI changes.
-FROM --platform=$BUILDPLATFORM python:3.15.0-slim-bookworm@sha256:0e019bbdfb5d9874cb2389f1c2884b64aa2ac97c99960b5bc521cef978c0617d AS python-security
+FROM --platform=$BUILDPLATFORM python:3.14-slim-bookworm@sha256:945c2676dc2b18e0c1f16879244122c57c0ffede60006bf3df159c507a31bcae AS python-security
 COPY containers/python-security/ /security/
 RUN apt-get update && apt-get install -y --no-install-recommends patch \
     && python /security/build.py /patched-stdlib
@@ -36,7 +36,7 @@ RUN wget -q https://github.com/cli/cli/archive/refs/tags/v2.102.0.tar.gz -O /tmp
 # Only the installed Python environment reaches the final image.
 FROM rust:1.99.0-slim-trixie@sha256:2752b332db73fdbb7dc576f06c82ed1f312005784ef913d7e04a28f5f55dc581 AS rust-toolchain
 
-FROM python:3.15.0-slim-trixie@sha256:f5b92f2a669a4c347044f29367f31983280b648250ca94dea66f98c53bc87e58 AS python-build
+FROM python:3.14-slim-trixie@sha256:35caba83af2fe6da9a5d922f9b0156f21d1246a48278c58a08bd253303ba42e8 AS python-build
 
 ARG TARGETARCH
 
@@ -127,7 +127,7 @@ RUN --mount=type=bind,from=switchyard-wheel,source=/wheels,target=/wheels \
     && /opt/venv/bin/python -m pytest tests/test_bifrost -q \
     && touch /switchyard-tests-passed
 
-FROM python:3.15.0-slim-trixie@sha256:f5b92f2a669a4c347044f29367f31983280b648250ca94dea66f98c53bc87e58
+FROM python:3.14-slim-trixie@sha256:35caba83af2fe6da9a5d922f9b0156f21d1246a48278c58a08bd253303ba42e8
 
 RUN --mount=type=bind,from=python-security,source=/patched-stdlib,target=/patched-stdlib \
     --mount=type=bind,source=containers/python-security,target=/security \
