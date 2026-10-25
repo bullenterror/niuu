@@ -23,6 +23,7 @@ def _settings(tmp_path: Path, **voice: object) -> Settings:
     key.write_text("sk-test", encoding="utf-8")
     fields: dict[str, object] = {
         "enabled": True,
+        "owner_id": "owner-1",
         "store_path": str(tmp_path / "calls.db"),
         "minters": {"xai": VoiceMinterConfig(adapter=_MINTER, kwargs={"key_file": str(key)})},
     }

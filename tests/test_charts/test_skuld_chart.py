@@ -1683,11 +1683,12 @@ class TestResidentVoice:
 
     def _values(self, **voice: object) -> dict:
         return {
+            "session": {"ownerId": "owner-1"},
             "resident": {
                 "enabled": True,
                 "persona": "lexi",
                 "voice": {"enabled": True, "minters": self._MINTERS, **voice},
-            }
+            },
         }
 
     def test_off_by_default(self, tmp_path: Path) -> None:
@@ -1712,6 +1713,7 @@ class TestResidentVoice:
         assert config.minters["xai"].kwargs == {"key_file": "/run/secrets/xai-api-key"}
         assert config.room_broker_url == "http://127.0.0.1:8081"
         assert config.room_participant_id == "flock-lexi"
+        assert config.owner_id == "owner-1" and config.user_id_header == "x-auth-user-id"
 
     def test_nginx_forwards_voice_to_the_channel_with_upgrade(self, tmp_path: Path) -> None:
         rendered = _render_skuld_chart(tmp_path, self._values(port=19001))
@@ -1724,12 +1726,24 @@ class TestResidentVoice:
 
         assert "room_broker_url" not in channel
 
-    def test_voice_without_minters_fails_to_render(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize(
+        ("change", "message"),
+        [
+            ({"minters": {}}, "resident.voice.enabled needs resident.voice.minters"),
+            ({"owner": ""}, "resident.voice.enabled needs session.ownerId"),
+        ],
+    )
+    def test_voice_that_cannot_serve_fails_to_render(
+        self, tmp_path: Path, change: dict, message: str
+    ) -> None:
         helm = shutil.which("helm")
         if not helm:
             pytest.skip("helm is not installed")
+        values = self._values(**{k: v for k, v in change.items() if k != "owner"})
+        if "owner" in change:
+            values["session"]["ownerId"] = change["owner"]
         values_file = tmp_path / "values.yaml"
-        values_file.write_text(yaml.safe_dump(self._values(minters={})), encoding="utf-8")
+        values_file.write_text(yaml.safe_dump(values), encoding="utf-8")
 
         result = subprocess.run(
             [helm, "template", "skuld-test", str(CHART_DIR), "-f", str(values_file)],
@@ -1738,7 +1752,7 @@ class TestResidentVoice:
         )
 
         assert result.returncode != 0
-        assert "resident.voice.enabled needs resident.voice.minters" in result.stderr
+        assert message in result.stderr
 
 
 class TestResidentOpenClawSessions:

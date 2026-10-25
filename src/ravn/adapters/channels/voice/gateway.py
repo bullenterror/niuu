@@ -7,9 +7,10 @@ realtime model runs on the phone and talks to the provider directly; the
 resident supplies who is speaking (its persona), short-lived provider
 credentials, its own tools, and the record of the call.
 
-The server binds loopback. The pod's nginx forwards ``/voice/`` here, behind
-Envoy's JWT check (and ownership, where enforced), so every caller has already
-been authenticated as the resident's owner; ``auth`` is answered ``auth.ok``.
+The server binds loopback. The pod's nginx forwards ``/voice/`` here, behind the
+gateway's JWT check, which projects the verified caller into ``user_id_header``.
+Only the resident's owner is served (``owner_id``): a call mints the owner's
+provider credentials and runs the resident's tools. ``auth`` is answered ``auth.ok``.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from fastapi import Body, FastAPI, Query, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 from ravn.adapters.channels.voice import protocol as wire
@@ -47,6 +48,8 @@ MINT_PROVIDERS = {"xai": "grok", "openai": "gpt-realtime"}
 
 #: The one tool profile the app asks for.
 VOICE_TOOL_PROFILE = "voice"
+#: WebSocket close code for a caller who is not the resident's owner.
+_CLOSE_FORBIDDEN = 4403
 
 
 @dataclass
@@ -71,6 +74,10 @@ class VoiceGateway:
         minters: dict[str, RealtimeCredentialMinterPort],
         room: VoiceRoomCopier | None,
     ) -> None:
+        if not getattr(config, "owner_id", ""):
+            raise ValueError(
+                "The voice channel needs owner_id: only the resident's owner may call it"
+            )
         unknown = set(minters) - set(MINT_PROVIDERS)
         if unknown:
             raise ValueError(
@@ -130,8 +137,20 @@ class VoiceGateway:
 
     # -- app ---------------------------------------------------------------
 
+    def _is_owner(self, headers: Any) -> bool:
+        return headers.get(self._config.user_id_header, "").strip() == self._config.owner_id
+
     def _build_app(self) -> FastAPI:
         app = FastAPI(title="Ravn voice channel", docs_url=None, redoc_url=None)
+
+        @app.middleware("http")
+        async def owner_only(request: Request, call_next: Any) -> Any:
+            if not self._is_owner(request.headers):
+                return JSONResponse(
+                    {"success": False, "error": "Only this resident's owner may call it"},
+                    status_code=403,
+                )
+            return await call_next(request)
 
         @app.get("/health")
         async def health() -> dict[str, Any]:
@@ -273,6 +292,9 @@ class VoiceGateway:
     # -- WebSocket -------------------------------------------------------
 
     async def _serve(self, websocket: WebSocket) -> None:
+        if not self._is_owner(websocket.headers):
+            await websocket.close(code=_CLOSE_FORBIDDEN)
+            return
         await websocket.accept()
         connection = _Connection()
         key = id(connection)

@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from ravn.adapters.channels.voice.gateway import VoiceGateway
 from ravn.adapters.channels.voice.prompt import VoicePromptComposer
@@ -57,6 +58,7 @@ class FakeRoom:
         self.closed = True
 
 
+OWNER = "owner-1"
 _OPEN: list[VoiceGateway] = []
 
 
@@ -70,7 +72,9 @@ def _close_gateways():
 def build(
     tmp_path: Path, *, minters=None, room=None, tools=None
 ) -> tuple[VoiceGateway, TestClient]:
-    config = VoiceChannelConfig(enabled=True, history_default_limit=2, history_max_limit=3)
+    config = VoiceChannelConfig(
+        enabled=True, history_default_limit=2, history_max_limit=3, owner_id=OWNER
+    )
     store = VoiceCallStore(str(tmp_path / "calls.db"))
     bridge = VoiceToolBridge(
         tools=tools if tools is not None else [FakeTool("web_search", result="sunny")],
@@ -82,7 +86,7 @@ def build(
     the_persona = persona()
     gateway = _gateway(config, the_persona, bridge, store, minters, room)
     _OPEN.append(gateway)
-    return gateway, TestClient(gateway.app)
+    return gateway, TestClient(gateway.app, headers={"x-auth-user-id": OWNER})
 
 
 def _gateway(config, the_persona, bridge, store, minters, room) -> VoiceGateway:
@@ -420,3 +424,43 @@ def test_timeouts_are_tool_call_errors(tmp_path: Path) -> None:
     with client.websocket_connect("/") as ws:
         error = ask(ws, "tools.call", {"name": "slow", "args": {}})
     assert error["type"] == "tools.call.error" and "ran past" in error["payload"]["error"]
+
+
+def test_only_the_owner_is_served(tmp_path: Path) -> None:
+    gateway, _ = build(tmp_path)
+    stranger = TestClient(gateway.app, headers={"x-auth-user-id": "someone-else"})
+    anonymous = TestClient(gateway.app)
+
+    assert stranger.get("/health").status_code == 403
+    assert anonymous.post("/api/tools/web_search/call", json={"args": {}}).status_code == 403
+    for client in (stranger, anonymous):
+        with pytest.raises(WebSocketDisconnect) as closed, client.websocket_connect("/") as ws:
+            ws.receive_json()
+        assert closed.value.code == 4403
+
+
+def test_a_channel_without_an_owner_is_refused(tmp_path: Path) -> None:
+    store = VoiceCallStore(str(tmp_path / "calls.db"))
+    bridge = VoiceToolBridge(
+        tools=[],
+        permission=AllowAllPermission(),
+        conversation=VoiceConversationTools(store, search_limit=1),
+        agent_name="lexi",
+        timeout_seconds=1,
+    )
+    the_persona = persona()
+    try:
+        with pytest.raises(ValueError, match="owner_id"):
+            VoiceGateway(
+                VoiceChannelConfig(enabled=True),
+                persona=the_persona,
+                composer=VoicePromptComposer(
+                    the_persona, models=MODELS, time_zone="UTC", tool_names=[]
+                ),
+                tools=bridge,
+                store=store,
+                minters={"xai": FakeMinter()},
+                room=None,
+            )
+    finally:
+        store.close()

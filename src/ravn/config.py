@@ -1618,6 +1618,18 @@ class VoiceChannelConfig(BaseModel):
     room_timeout_seconds: float = Field(
         default=10.0, gt=0, description="Timeout for one room copy request."
     )
+    owner_id: str = Field(
+        default="",
+        description=(
+            "The resident's owner. Every request must carry this user in user_id_header "
+            "(projected by the gateway from the verified token's sub claim): voice mints the "
+            "owner's provider credentials and runs the resident's tools. Empty serves nobody."
+        ),
+    )
+    user_id_header: str = Field(
+        default="x-auth-user-id",
+        description="Header the gateway projects the verified caller's user id into.",
+    )
 
 
 class GatewayChannelsConfig(BaseModel):

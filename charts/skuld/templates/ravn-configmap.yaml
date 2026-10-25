@@ -97,6 +97,9 @@ data:
         {{- if not .Values.resident.voice.minters }}
         {{- fail "resident.voice.enabled needs resident.voice.minters: at least one provider whose key file is mounted" }}
         {{- end }}
+        {{- if not .Values.session.ownerId }}
+        {{- fail "resident.voice.enabled needs session.ownerId: only the resident's owner may call it" }}
+        {{- end }}
         # Realtime voice calls for the Lexi app; nginx forwards /voice/ here.
         voice:
           enabled: true
@@ -105,6 +108,8 @@ data:
           store_path: {{ .Values.resident.voice.storePath | quote }}
           display_name: {{ .Values.resident.voice.displayName | quote }}
           time_zone: {{ .Values.resident.voice.timeZone | quote }}
+          owner_id: {{ .Values.session.ownerId | quote }}
+          user_id_header: {{ .Values.envoy.headerNames.userId | quote }}
           {{- with .Values.resident.voice.models }}
           models:
             {{- toYaml . | nindent 12 }}
