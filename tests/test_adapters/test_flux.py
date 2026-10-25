@@ -2916,3 +2916,165 @@ class TestStatusDetail:
             pytest.raises(RuntimeError, match="grant events get/list"),
         ):
             await pod_manager.status_detail(sample_session)
+
+
+class TestResidentCredentials:
+    """deployment.credentials: the owner's credentials, injected into the ravn container."""
+
+    _DECLARED = [{"integration": "xai", "files": {"/run/secrets/xai-api-key": "api_key"}}]
+
+    def _wire(
+        self,
+        pod_manager: FluxPodManager,
+        *,
+        connections: list | None = None,
+        stored_keys: list[str] | None = None,
+        supports: bool = True,
+    ) -> MagicMock:
+        from volundr.domain.models import PodSpecAdditions
+
+        injection = MagicMock()
+        injection.supports_workloads = supports
+        injection.workload_pod_spec_additions = AsyncMock(
+            return_value=PodSpecAdditions(annotations={"vault.hashicorp.com/role": "r"})
+        )
+        injection.cleanup_workload = AsyncMock()
+        integrations = AsyncMock()
+        integrations.list_connections.return_value = (
+            connections
+            if connections is not None
+            else [MagicMock(slug="xai", enabled=True, credential_name="xai-key")]
+        )
+        store = AsyncMock()
+        store.get.return_value = MagicMock(keys=stored_keys or ["api_key"])
+        pod_manager.set_resident_credentials(
+            secret_injection=injection, integrations=integrations, credential_store=store
+        )
+        pod_manager._resident_platform_base_url = "https://niuu.example.test"
+        return injection
+
+    def _profile(self, credentials: object) -> ResidentDeploymentProfile:
+        profile = _resident_profile()
+        profile.deployment["credentials"] = credentials
+        return profile
+
+    async def test_owner_integration_is_injected_into_the_ravn_container(
+        self, pod_manager: FluxPodManager, mock_api
+    ) -> None:
+        injection = self._wire(pod_manager)
+        runtime = _resident_runtime()
+        with patch.object(pod_manager, "_get_api", return_value=mock_api):
+            await pod_manager.deploy(runtime, self._profile(self._DECLARED))
+
+        values = mock_api.create_namespaced_custom_object.call_args.kwargs["body"]["spec"]["values"]
+        assert values["podAnnotations"]["vault.hashicorp.com/role"] == "r"
+        args, kwargs = injection.workload_pod_spec_additions.await_args
+        assert args[0] == "user-a"
+        assert args[1][0].credential_name == "xai-key"
+        assert args[1][0].file_mappings == {"/run/secrets/xai-api-key": "api_key"}
+        assert kwargs == {
+            "workload_id": str(runtime.id),
+            "service_account_name": f"resident-{runtime.id}",
+            "inject_containers": "ravn",
+            "tenant_id": "tenant-a",
+        }
+
+    async def test_a_named_credential_needs_no_integration(
+        self, pod_manager: FluxPodManager, mock_api
+    ) -> None:
+        injection = self._wire(pod_manager)
+        declared = [{"credential": "my-key", "files": {"/run/secrets/k": "api_key"}}]
+        with patch.object(pod_manager, "_get_api", return_value=mock_api):
+            await pod_manager.deploy(_resident_runtime(), self._profile(declared))
+
+        assert (
+            injection.workload_pod_spec_additions.await_args.args[1][0].credential_name == "my-key"
+        )
+
+    async def test_no_declared_credentials_inject_nothing(
+        self, pod_manager: FluxPodManager, mock_api
+    ) -> None:
+        injection = self._wire(pod_manager)
+        with patch.object(pod_manager, "_get_api", return_value=mock_api):
+            await pod_manager.deploy(_resident_runtime(), _resident_profile())
+
+        injection.workload_pod_spec_additions.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        ("credentials", "message"),
+        [
+            ("xai", "must be a list"),
+            (["xai"], "must be objects"),
+            ([{"files": {"/run/secrets/k": "f"}}], "exactly one of integration or credential"),
+            (
+                [{"integration": "xai", "credential": "k", "files": {"/run/secrets/k": "f"}}],
+                "exactly one of integration or credential",
+            ),
+            ([{"integration": "xai"}], "map files"),
+            ([{"integration": "xai", "files": {"/home/k": "api_key"}}], "under /run/secrets/"),
+            (
+                [{"integration": "xai", "files": {"/run/secrets/k": "token"}}],
+                r"no field\(s\) \['token'\]",
+            ),
+        ],
+    )
+    async def test_bad_declarations_are_fatal(
+        self, pod_manager: FluxPodManager, credentials: object, message: str
+    ) -> None:
+        self._wire(pod_manager)
+        with pytest.raises(ValueError, match=message):
+            await pod_manager._render_resident_values(
+                _resident_runtime(), self._profile(credentials)
+            )
+
+    @pytest.mark.parametrize("count", [0, 2])
+    async def test_the_owner_needs_exactly_one_connection(
+        self, pod_manager: FluxPodManager, count: int
+    ) -> None:
+        connections = [
+            MagicMock(slug="xai", enabled=True, credential_name=f"k{i}") for i in range(count)
+        ]
+        self._wire(pod_manager, connections=connections)
+        with pytest.raises(
+            ValueError, match=f"exactly one enabled xai connection, and has {count}"
+        ):
+            await pod_manager._render_resident_values(
+                _resident_runtime(), self._profile(self._DECLARED)
+            )
+
+    async def test_a_missing_owner_credential_is_fatal(self, pod_manager: FluxPodManager) -> None:
+        self._wire(pod_manager)
+        pod_manager._credential_store.get.return_value = None
+        with pytest.raises(ValueError, match="owner has no credential 'xai-key'"):
+            await pod_manager._render_resident_values(
+                _resident_runtime(), self._profile(self._DECLARED)
+            )
+
+    async def test_without_workload_injection_it_is_fatal(
+        self, pod_manager: FluxPodManager
+    ) -> None:
+        self._wire(pod_manager, supports=False)
+        with pytest.raises(ValueError, match="no secret injection that serves residents"):
+            await pod_manager._render_resident_values(
+                _resident_runtime(), self._profile(self._DECLARED)
+            )
+
+    async def test_without_the_residents_own_service_account_it_is_fatal(
+        self, pod_manager: FluxPodManager
+    ) -> None:
+        self._wire(pod_manager)
+        pod_manager._resident_platform_base_url = ""
+        with pytest.raises(ValueError, match="resident platform base URL"):
+            await pod_manager._render_resident_values(
+                _resident_runtime(), self._profile(self._DECLARED)
+            )
+
+    async def test_delete_removes_the_residents_credential_access(
+        self, pod_manager: FluxPodManager, mock_api
+    ) -> None:
+        injection = self._wire(pod_manager)
+        runtime = _resident_runtime()
+        with patch.object(pod_manager, "_get_api", return_value=mock_api):
+            await pod_manager.delete(runtime)
+
+        injection.cleanup_workload.assert_awaited_once_with(str(runtime.id))

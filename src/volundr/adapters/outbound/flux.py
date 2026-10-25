@@ -34,6 +34,7 @@ from volundr.adapters.outbound.resident_container_spec import (
 from volundr.domain.models import (
     LABEL_MANAGED_BY,
     LABEL_PVC_TYPE,
+    CredentialMapping,
     ResidentBackend,
     ResidentCondition,
     ResidentConditionStatus,
@@ -51,6 +52,8 @@ from volundr.domain.models import (
     _deep_merge,
 )
 from volundr.domain.ports import (
+    CredentialStorePort,
+    IntegrationRepository,
     PodManager,
     PodStartResult,
     ResidentLogsUnavailableError,
@@ -59,6 +62,7 @@ from volundr.domain.ports import (
     ResidentRuntimeController,
     ResidentRuntimeLogReader,
     ResidentRuntimeObservation,
+    SecretInjectionPort,
 )
 
 logger = logging.getLogger(__name__)
@@ -81,6 +85,11 @@ RESIDENT_OPENCLAW_TOKEN_KEY = "token"
 #: Protocol a resident's voice channel speaks (ravn.adapters.channels.voice): the
 #: Lexi app's agent-service wire, served under /voice/ on the resident's route.
 RESIDENT_VOICE_PROTOCOL = "lexi-agent-service-v1"
+#: The resident pod container its declared credentials are rendered into: the Ravn
+#: daemon, which holds the persona, its tools and the voice channel.
+RESIDENT_CREDENTIAL_CONTAINERS = "ravn"
+#: Where the OpenBao agent renders injected files in the pod (its shared secret volume).
+RESIDENT_SECRET_ROOT = "/run/secrets/"
 #: The platform version (chart and images) Völundr last rendered into a resident's release.
 ANNOTATION_PLATFORM_VERSION = "niuu.world/platform-version"
 #: The version that release replaced. A Völundr that still renders it (the old replica
@@ -173,6 +182,11 @@ class FluxPodManager(
         # the Ravn session controller (set_resident_openclaw_tokens). None: no Ravn
         # sessions on this backend.
         self._resident_openclaw_tokens: ResidentOpenClawTokens | None = None
+        # The owner's credentials a profile declares for its residents (deployment.credentials),
+        # injected through the same OpenBao agent as session credentials.
+        self._secret_injection: SecretInjectionPort | None = None
+        self._integrations: IntegrationRepository | None = None
+        self._credential_store: CredentialStorePort | None = None
         # Defaults for each resident's own home and workspace PVCs; a profile
         # overrides them per volume in deployment.volumes.<home|workspace>.
         # An empty storage class means the cluster's default class.
@@ -763,6 +777,113 @@ class FluxPodManager(
                     raise
                 logger.debug("Resident %s PVC %s is already absent", kind, name)
 
+    def set_resident_credentials(
+        self,
+        *,
+        secret_injection: SecretInjectionPort,
+        integrations: IntegrationRepository,
+        credential_store: CredentialStorePort,
+    ) -> None:
+        """Wire what a resident's declared credentials are resolved and injected with."""
+        self._secret_injection = secret_injection
+        self._integrations = integrations
+        self._credential_store = credential_store
+
+    async def _resident_credential_annotations(
+        self,
+        runtime: ResidentRuntime,
+        profile: ResidentDeploymentProfile,
+    ) -> dict[str, str]:
+        """Inject the owner's credentials a profile declares, bound to the resident's own SA.
+
+        ``deployment.credentials`` lists ``{integration: <slug>}`` (the owner's one enabled
+        connection of that integration) or ``{credential: <name>}``, each with ``files``
+        mapping a path under /run/secrets/ to a credential field. They render into the
+        ravn container. Declared but impossible is fatal.
+        """
+        declared = profile.deployment.get("credentials") or []
+        if not declared:
+            return {}
+        if not isinstance(declared, list):
+            raise ValueError(f"Resident profile {profile.id} deployment.credentials must be a list")
+        injection = self._secret_injection
+        if injection is None or not injection.supports_workloads:
+            raise ValueError(
+                f"Resident profile {profile.id} declares credentials, but this Völundr has no "
+                "secret injection that serves residents: configure the OpenBao injection adapter"
+            )
+        service_account = self._resident_service_account_values(runtime).get("serviceAccountName")
+        if not service_account:
+            raise ValueError(
+                f"Resident profile {profile.id} declares credentials, which bind to the "
+                "resident's own service account: set the resident platform base URL"
+            )
+        mappings = [
+            await self._resident_credential_mapping(runtime, profile, item) for item in declared
+        ]
+        additions = await injection.workload_pod_spec_additions(
+            runtime.owner_id,
+            mappings,
+            workload_id=str(runtime.id),
+            service_account_name=str(service_account),
+            inject_containers=RESIDENT_CREDENTIAL_CONTAINERS,
+            tenant_id=runtime.tenant_id,
+        )
+        return dict(additions.annotations)
+
+    async def _resident_credential_mapping(
+        self,
+        runtime: ResidentRuntime,
+        profile: ResidentDeploymentProfile,
+        item: Any,
+    ) -> CredentialMapping:
+        where = f"Resident profile {profile.id} deployment.credentials"
+        if not isinstance(item, dict):
+            raise ValueError(f"{where} entries must be objects")
+        integration = str(item.get("integration") or "")
+        credential = str(item.get("credential") or "")
+        if bool(integration) == bool(credential):
+            raise ValueError(f"{where} entries name exactly one of integration or credential")
+        files = item.get("files")
+        if not isinstance(files, dict) or not files:
+            raise ValueError(f"{where} entries map files: {{path: field}}")
+        for path, field in files.items():
+            if not str(path).startswith(RESIDENT_SECRET_ROOT) or not field:
+                raise ValueError(
+                    f"{where} files must map a path under {RESIDENT_SECRET_ROOT} to a field"
+                )
+        if integration:
+            credential = await self._owner_integration_credential(runtime, where, integration)
+        if self._credential_store is None:
+            raise ValueError(f"{where} needs a credential store to check the owner's credentials")
+        stored = await self._credential_store.get("user", runtime.owner_id, credential)
+        if stored is None:
+            raise ValueError(f"{where}: the owner has no credential {credential!r}")
+        missing = sorted({str(field) for field in files.values()} - set(stored.keys))
+        if missing:
+            raise ValueError(f"{where}: credential {credential!r} has no field(s) {missing}")
+        return CredentialMapping(
+            credential_name=credential,
+            file_mappings={str(path): str(field) for path, field in files.items()},
+        )
+
+    async def _owner_integration_credential(
+        self, runtime: ResidentRuntime, where: str, slug: str
+    ) -> str:
+        if self._integrations is None:
+            raise ValueError(f"{where} names integration {slug!r} but no integrations are wired")
+        connections = [
+            connection
+            for connection in await self._integrations.list_connections(runtime.owner_id)
+            if connection.slug == slug and connection.enabled
+        ]
+        if len(connections) != 1:
+            raise ValueError(
+                f"{where} names integration {slug!r}: the owner needs exactly one enabled "
+                f"{slug} connection, and has {len(connections)}"
+            )
+        return connections[0].credential_name
+
     def set_resident_openclaw_tokens(self, tokens: ResidentOpenClawTokens) -> None:
         """Where each Ravn resident's own shim token is kept (RavnResidentSessionController)."""
         self._resident_openclaw_tokens = tokens
@@ -1182,7 +1303,11 @@ class FluxPodManager(
         runtime: ResidentRuntime,
         profile: ResidentDeploymentProfile,
     ) -> dict[str, Any]:
-        return self._resident_values(runtime, profile, await self._resolve_realm_slug(runtime))
+        values = self._resident_values(runtime, profile, await self._resolve_realm_slug(runtime))
+        annotations = await self._resident_credential_annotations(runtime, profile)
+        if annotations:
+            values.setdefault("podAnnotations", {}).update(annotations)
+        return values
 
     def _platform_version(self, values: dict[str, Any]) -> str:
         """The version this Völundr renders for a resident: its chart and images."""
@@ -1341,6 +1466,8 @@ class FluxPodManager(
         existed = await self._delete_helmrelease(self._resident_release_name(runtime))
         await self._delete_resident_claims(runtime)
         await self._delete_resident_openclaw_secret(runtime)
+        if self._secret_injection is not None and self._secret_injection.supports_workloads:
+            await self._secret_injection.cleanup_workload(str(runtime.id))
         return existed
 
     async def logs(
