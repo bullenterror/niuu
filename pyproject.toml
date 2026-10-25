@@ -184,6 +184,12 @@ build-backend = "hatchling.build"
 # xds-protos wheel, which bundles a colliding copy of opentelemetry/proto/**.
 packages = ["src/audit", "src/cli", "src/credentials", "src/features", "src/guild", "src/identity", "src/integrations", "src/niuu", "src/volundr", "src/ting", "src/tracker", "src/skuld", "src/sleipnir", "src/ravn", "src/bifrost", "src/mimir", "src/observatory", "src/personas", "src/yggdrasil", "vendor/envoy_authz_protos/envoy", "vendor/envoy_authz_protos/xds", "vendor/envoy_authz_protos/udpa", "vendor/envoy_authz_protos/validate"]
 
+# Migrations live only in migrations/ (the chart reads them through a symlink).
+# The wheel carries them as cli/migrations so an installed service — every
+# container image — can run them; see cli.resources.migration_dir.
+[tool.hatch.build.targets.wheel.force-include]
+"migrations" = "cli/migrations"
+
 [tool.hatch.metadata]
 allow-direct-references = true
 
