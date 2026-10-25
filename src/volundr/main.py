@@ -1071,6 +1071,15 @@ def create_app(
                 )
             else:
                 integration_repo = PostgresIntegrationRepository(integration_pool)
+            # Residents get the owner's credentials their profile declares, injected the
+            # same way as a session's (OpenBao), bound to the resident's own identity.
+            for controller in {id(c): c for c in [pod_manager, *resident_controllers]}.values():
+                if hasattr(controller, "set_resident_credentials"):
+                    controller.set_resident_credentials(
+                        secret_injection=secret_injection,
+                        integrations=integration_repo,
+                        credential_store=credential_store,
+                    )
             # Outside mini mode a push device is an integration: a messaging connection
             # whose token lives in the credential store with every other integration secret.
             if settings.push.uses_integration_devices(mini_mode=settings.local_mounts.mini_mode):
