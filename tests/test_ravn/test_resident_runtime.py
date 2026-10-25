@@ -886,6 +886,54 @@ async def test_operator_question_is_filed_in_shared_review_inbox(tmp_path) -> No
 
 
 @pytest.mark.asyncio
+async def test_a_question_that_cannot_be_filed_fails_the_turn_loudly(tmp_path) -> None:
+    publisher = AsyncMock()
+    publisher.publish.side_effect = RuntimeError("sleipnir unreachable")
+    state = LocalResidentState(tmp_path / "state")
+    runtime = ResidentRuntime(
+        state=state,
+        resident_id="regin",
+        review_requester=ReviewRequester(
+            publisher=publisher, store=JsonReviewStore(tmp_path / "reviews.json")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="sleipnir unreachable"):
+        await runtime.handle_completed_turn(
+            task=_task(),
+            prompt="prompt",
+            result=_result({"continuation": "ask_operator", "question": "May I merge?"}),
+            response_text="response",
+        )
+
+    # Persisted before filing, so the question survives for the next attempt.
+    assert await state.read_operator_needed("root-1") is not None
+
+
+@pytest.mark.asyncio
+async def test_republishing_pending_questions_fails_when_filing_fails(tmp_path) -> None:
+    state = LocalResidentState(tmp_path / "state")
+    await ResidentRuntime(state=state).handle_completed_turn(
+        task=_task(),
+        prompt="prompt",
+        result=_result({"continuation": "ask_operator", "question": "May I merge?"}),
+        response_text="response",
+    )
+    publisher = AsyncMock()
+    publisher.publish.side_effect = RuntimeError("sleipnir unreachable")
+    runtime = ResidentRuntime(
+        state=state,
+        resident_id="regin",
+        review_requester=ReviewRequester(
+            publisher=publisher, store=JsonReviewStore(tmp_path / "reviews.json")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="sleipnir unreachable"):
+        await runtime.publish_pending_questions()
+
+
+@pytest.mark.asyncio
 async def test_operator_answer_preserves_suspended_a2a_build_handoff(tmp_path) -> None:
     state = LocalResidentState(tmp_path)
     queued: list[AgentTask] = []

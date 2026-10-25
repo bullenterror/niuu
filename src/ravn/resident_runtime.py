@@ -1466,15 +1466,10 @@ class ResidentRuntime:
             requested_by=self._resident_id,
             correlation_id=root_correlation_id or case_id,
         )
-        try:
-            return await self._review_requester.request(item)
-        except Exception as exc:  # noqa: BLE001 — room/Telegram delivery must still proceed
-            get_observability().event(
-                "ravn.resident.operator_question_review_failed",
-                attributes={"ravn.resident.case_id": case_id},
-                content=str(exc),
-            )
-            return None
+        # A question nobody can see in the review queue is one the operator will
+        # never answer: fail the turn loudly. The question itself is already
+        # persisted and its attention raised before this, so nothing is lost.
+        return await self._review_requester.request(item)
 
     async def submit_operator_answer(
         self,
