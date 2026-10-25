@@ -16,6 +16,13 @@ CVE-2026-15310 (`zipfile/__init__.py`) and CVE-2026-19672 (`tarfile.py`), so
 those backports were removed. `verify.py` keeps their exploit regressions as
 guards on the runtime.
 
+Grype's data still credits CVE-2026-12345 only to 3.15.0rc3, although CPython
+3.14.9 fixes it (gh-157579; the CVE record lists `< 3.14.9`). `manifest.json`
+names it under `upstream_fixes` with the exact upstream `tempfile.py` hash:
+`verify.py` checks that hash and the fix's regression inside the image, and
+only then does `vex.py` issue a `fixed` statement for it, worded as an upstream
+fix rather than a backport. Drop the entry once the scanner data catches up.
+
 The POP3 fix is deliberately taken from the newer upstream line: it rejects
 C0/DEL characters in commands, including credentials. Older Python branches
 have not adopted that behavior because it can reject previously accepted
