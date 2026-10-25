@@ -264,6 +264,11 @@ class KubernetesToolsConfig(BaseModel):
         ge=1,
         description="Characters of each ConfigMap value kubernetes_inspect returns.",
     )
+    max_list_items: int = Field(
+        default=100,
+        ge=1,
+        description="Most objects a kubernetes_inspect listing (pods) returns.",
+    )
 
 
 class BashToolConfig(BaseModel):

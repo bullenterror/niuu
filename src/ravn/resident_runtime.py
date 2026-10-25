@@ -1536,6 +1536,18 @@ class ResidentRuntime:
             or ""
         ).strip()
         if not case_id:
+            # A reply routed through the room carries the asking turn's root
+            # correlation, which is the case id for a resident case. Bind to it
+            # only when that case really is waiting on the operator.
+            for candidate in (
+                context.get("root_correlation_id"),
+                metadata.get("root_correlation_id"),
+            ):
+                candidate = str(candidate or "").strip()
+                if candidate and await self._state.read_operator_needed(candidate) is not None:
+                    case_id = candidate
+                    break
+        if not case_id:
             pending = await self._state.list_operator_needed()
             if len(pending) != 1:
                 return False

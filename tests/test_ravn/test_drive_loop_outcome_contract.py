@@ -2922,6 +2922,8 @@ recommendation: choose whether to optimize for latency or quality
         assert help_event.payload["context"]["root_correlation_id"] == "root-help"
         assert help_event.payload["context"]["workflow_parent_event_id"] == "parent-help"
         assert help_event.payload["context"]["workflow_node_id"] == "chair-synthesis"
+        # Not a resident case, so there is no case for a reply to resume.
+        assert "resident_case_id" not in help_event.payload["context"]
         assert help_event.payload["collaboration_routing_only"] is True
         assert alias_event.payload["event_type"] == "council.human_input.requested"
 
@@ -2930,6 +2932,44 @@ recommendation: choose whether to optimize for latency or quality
         assert (
             skuld_channel.emit.await_args_list[2].args[0].payload["event_type"]
             == "council.human_input.requested"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_resident_help_request_names_the_case_its_reply_resumes(self) -> None:
+        """The room returns this context with the human's reply; without the case id
+        the resident could not bind the reply to its question (it never did)."""
+        dl = _make_drive_loop()
+        dl._mesh = AsyncMock()
+        dl._skuld_channel = AsyncMock()
+        dl._source_id = "drive_loop"
+        dl._persona_config = SimpleNamespace(
+            name="council-chair",
+            produces=SimpleNamespace(
+                event_type="council.chair.turn.completed",
+                event_type_map={"help_needed": "council.human_input.requested"},
+            ),
+        )
+        task = _make_agent_task(task_id="task-steward")
+        task.root_correlation_id = "resident-stewardship-20261025T130015Z"
+        task.resident_case_id = "resident-stewardship-20261025T130015Z"
+        response_text = """\
+---outcome---
+verdict: help_needed
+summary: which route is authorized
+question: Which deployment route is authorized?
+reason: needs_context
+---end---
+"""
+
+        await dl._emit_mesh_outcome_event(task, response_text, success=True)
+
+        help_event = next(
+            call.args[0]
+            for call in dl._mesh.publish.await_args_list
+            if call.kwargs.get("topic") == "help_needed"
+        )
+        assert help_event.payload["context"]["resident_case_id"] == (
+            "resident-stewardship-20261025T130015Z"
         )
 
     @pytest.mark.asyncio

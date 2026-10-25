@@ -4758,6 +4758,9 @@ class DriveLoop:
                 "workflow_parent_event_id": task.workflow_parent_event_id,
                 "workflow_node_id": task.workflow_node_id,
                 "session_id": task.session_id,
+                # The room hands this back with the human's reply; without the
+                # case id a resident could not tell which question it answers.
+                **({"resident_case_id": task.resident_case_id} if task.resident_case_id else {}),
             }
             help_event = build_help_needed_event(
                 source=self._source_id,

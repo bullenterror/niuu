@@ -148,6 +148,7 @@ class TestRegistryStructure:
             "kubeconfig_path": "",
             "max_log_lines": 80,
             "max_configmap_value_chars": 900,
+            "max_list_items": 100,
         }
 
     def test_kubernetes_tool_is_enabled_explicitly_not_by_environment_type(self) -> None:

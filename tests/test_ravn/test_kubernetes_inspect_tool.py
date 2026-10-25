@@ -298,6 +298,90 @@ async def test_an_in_cluster_resident_cannot_name_another_cluster() -> None:
     assert result.is_error and "only its own cluster" in result.content
 
 
+class _PodsCore:
+    def __init__(self) -> None:
+        self.selectors: list[str] = []
+
+    async def list_namespaced_pod(self, namespace: str, label_selector: str = ""):
+        self.selectors.append(label_selector)
+
+        def pod(name: str, ready: bool) -> SimpleNamespace:
+            return SimpleNamespace(
+                metadata=SimpleNamespace(
+                    name=name,
+                    owner_references=[SimpleNamespace(kind="ReplicaSet", name=f"{name[:-6]}")],
+                ),
+                spec=SimpleNamespace(node_name="node-a"),
+                status=SimpleNamespace(
+                    phase="Running",
+                    start_time=None,
+                    container_statuses=[
+                        SimpleNamespace(name="ravn", ready=ready, restart_count=1),
+                        SimpleNamespace(name="tbot", ready=True, restart_count=0),
+                    ],
+                ),
+            )
+
+        return SimpleNamespace(
+            items=[
+                pod("valkyrie-ymir-k8s-7b864d-abcde", True),
+                pod("valkyrie-ymir-k8s-7b864d-fghij", False),
+                pod("nats-0", True),
+            ]
+        )
+
+
+@pytest.mark.asyncio
+async def test_pods_lists_a_namespace_so_a_changing_pod_name_can_be_found(tmp_path) -> None:
+    built: list[str] = []
+    core = _PodsCore()
+    kubeconfig = tmp_path / "kubeconfig.yaml"
+    kubeconfig.write_text(_TELEPORT_KUBECONFIG, encoding="utf-8")
+
+    async def factory(path: str, context: str) -> KubernetesClients:
+        built.append(context)
+        return KubernetesClients(core_v1=core, apps_v1=None, batch_v1=None)
+
+    tool = KubernetesInspectTool(
+        in_cluster=False, kubeconfig_path=str(kubeconfig), max_list_items=1, client_factory=factory
+    )
+
+    result = await tool.execute(
+        {
+            "action": "pods",
+            "cluster": "ymir",
+            "namespace": "nats",
+            "label_selector": "app.kubernetes.io/name=valkyrie",
+            "name_prefix": "valkyrie-ymir-k8s",
+        }
+    )
+
+    payload = json.loads(result.content)
+    assert core.selectors == ["app.kubernetes.io/name=valkyrie"]
+    assert payload["total"] == 2
+    assert payload["truncated"] is True
+    assert payload["pods"] == [
+        {
+            "name": "valkyrie-ymir-k8s-7b864d-abcde",
+            "phase": "Running",
+            "ready": "2/2",
+            "restarts": 1,
+            "node_name": "node-a",
+            "started_at": "",
+            "owner": "ReplicaSet/valkyrie-ymir-k8s-7b864d",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pods_needs_a_namespace() -> None:
+    tool = KubernetesInspectTool(core_v1=_PodsCore(), apps_v1=FakeAppsV1(), batch_v1=FakeBatchV1())
+
+    result = await tool.execute({"action": "pods"})
+
+    assert result.is_error and "namespace is required" in result.content
+
+
 def test_k8s_persona_can_request_kubernetes_inspect_tool() -> None:
     persona = SimpleNamespace(
         allowed_tools=["ravn", "kubernetes_inspect"],

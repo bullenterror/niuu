@@ -99,6 +99,55 @@ async def test_a_directed_reply_in_the_room_is_the_answer(tmp_path) -> None:
     assert ops == [ResidentNotificationOp.ATTENTION, ResidentNotificationOp.RESOLVED]
 
 
+async def _ask_in(runtime: ResidentRuntime, case_id: str, question: str) -> None:
+    await runtime.handle_completed_turn(
+        task=_task(task_id=f"task-{case_id}", root_correlation_id=case_id),
+        prompt="prompt",
+        result=_result({"continuation": "ask_operator", "question": question}),
+        response_text="response",
+    )
+
+
+async def test_a_room_reply_binds_to_the_question_it_answers_among_several(tmp_path) -> None:
+    """The reply carries the asking turn's root correlation (the case id): with more
+    than one question open it still reaches the right one."""
+    runtime, queued = _runtime(tmp_path)
+    await _ask_in(runtime, "case-route", "Which route is authorized?")
+    await _ask_in(runtime, "case-scope", "Which scope applies?")
+
+    consumed = await runtime.consume_directed_message(
+        "Use GitOps.",
+        {"help_context": {"root_correlation_id": "case-route"}, "root_correlation_id": "room-1"},
+    )
+
+    assert consumed
+    assert queued[-1].resident_case_id == "case-route"
+    assert await runtime._state.read_operator_needed("case-route") is None
+    assert await runtime._state.read_operator_needed("case-scope") is not None
+
+
+async def test_a_help_context_case_id_binds_the_reply(tmp_path) -> None:
+    runtime, queued = _runtime(tmp_path)
+    await _ask_in(runtime, "case-route", "Which route is authorized?")
+    await _ask_in(runtime, "case-scope", "Which scope applies?")
+
+    assert await runtime.consume_directed_message(
+        "Read-only.", {"help_context": {"resident_case_id": "case-scope"}}
+    )
+    assert queued[-1].resident_case_id == "case-scope"
+
+
+async def test_a_reply_correlated_to_no_waiting_case_is_ordinary_chat(tmp_path) -> None:
+    runtime, queued = _runtime(tmp_path)
+    await _ask_in(runtime, "case-route", "Which route is authorized?")
+    await _ask_in(runtime, "case-scope", "Which scope applies?")
+
+    assert not await runtime.consume_directed_message(
+        "Hello", {"help_context": {"root_correlation_id": "room-session"}}
+    )
+    assert queued == []
+
+
 async def test_questions_waiting_at_startup_are_raised_once(tmp_path) -> None:
     runtime, _ = _runtime(tmp_path)
     await _ask(runtime)  # asked before this resident had an outbox

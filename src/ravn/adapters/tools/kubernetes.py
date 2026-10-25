@@ -53,6 +53,7 @@ class KubernetesInspectTool(ToolPort):
         batch_v1: Any | None = None,
         max_log_lines: int = 120,
         max_configmap_value_chars: int = 4000,
+        max_list_items: int = 100,
         client_factory: ClientFactory | None = None,
     ) -> None:
         self._in_cluster = in_cluster
@@ -64,6 +65,7 @@ class KubernetesInspectTool(ToolPort):
         self._loaded = core_v1 is not None
         self._max_log_lines = max(1, max_log_lines)
         self._max_configmap_value_chars = max(1, max_configmap_value_chars)
+        self._max_list_items = max(1, max_list_items)
         self._client_factory = client_factory or _clients_for_context
         self._clients_by_context: dict[str, KubernetesClients] = {}
 
@@ -90,6 +92,7 @@ class KubernetesInspectTool(ToolPort):
                     "type": "string",
                     "enum": [
                         "clusters",
+                        "pods",
                         "inspect_pod",
                         "object_events",
                         "pod_logs",
@@ -113,6 +116,17 @@ class KubernetesInspectTool(ToolPort):
                 "kind": {
                     "type": "string",
                     "description": "Object kind for events/workloads.",
+                },
+                "label_selector": {
+                    "type": "string",
+                    "description": (
+                        "pods only: Kubernetes label selector, e.g. "
+                        "'app.kubernetes.io/instance=regin'."
+                    ),
+                },
+                "name_prefix": {
+                    "type": "string",
+                    "description": "pods only: keep pods whose name starts with this.",
                 },
                 "name": {
                     "type": "string",
@@ -152,6 +166,8 @@ class KubernetesInspectTool(ToolPort):
                 )
             await self._ensure_clients(str(input.get("cluster") or "").strip())
             match action:
+                case "pods":
+                    payload = await self._pods(input)
                 case "inspect_pod":
                     payload = await self._inspect_pod(input)
                 case "object_events":
@@ -237,6 +253,30 @@ class KubernetesInspectTool(ToolPort):
         self._core_v1 = clients.core_v1
         self._apps_v1 = clients.apps_v1
         self._batch_v1 = clients.batch_v1
+
+    async def _pods(self, input: dict) -> dict[str, Any]:  # noqa: A002
+        namespace = str(input.get("namespace") or "").strip()
+        if not namespace:
+            raise ValueError("namespace is required for pods")
+        selector = str(input.get("label_selector") or "").strip()
+        prefix = str(input.get("name_prefix") or "").strip()
+        kwargs: dict[str, Any] = {"label_selector": selector} if selector else {}
+        listed = await _maybe_await(self._core_v1.list_namespaced_pod(namespace, **kwargs))
+        pods = [
+            pod
+            for pod in list(getattr(listed, "items", listed) or [])
+            if _field(_field(pod, "metadata", default={}), "name", default="").startswith(prefix)
+        ]
+        shown = pods[: self._max_list_items]
+        return {
+            "action": "pods",
+            "namespace": namespace,
+            "label_selector": selector,
+            "name_prefix": prefix,
+            "total": len(pods),
+            "truncated": len(pods) > len(shown),
+            "pods": [_pod_summary(pod) for pod in shown],
+        }
 
     async def _inspect_pod(self, input: dict) -> dict[str, Any]:  # noqa: A002
         namespace, name = _namespace_name(input)
@@ -423,6 +463,33 @@ def _pod(pod: Any) -> dict[str, Any]:
                 _field(status, "container_statuses", "containerStatuses", default=[]) or []
             )
         ],
+    }
+
+
+def _pod_summary(pod: Any) -> dict[str, Any]:
+    status = _field(pod, "status", default={}) or {}
+    spec = _field(pod, "spec", default={}) or {}
+    meta = _field(pod, "metadata", default={}) or {}
+    statuses = list(_field(status, "container_statuses", "containerStatuses", default=[]) or [])
+    ready = sum(bool(_field(s, "ready", default=False)) for s in statuses)
+    return {
+        "name": _field(meta, "name", default=""),
+        "phase": _field(status, "phase", default=""),
+        "ready": f"{ready}/{len(statuses)}",
+        "restarts": sum(
+            int(_field(s, "restart_count", "restartCount", default=0) or 0) for s in statuses
+        ),
+        "node_name": _field(spec, "node_name", "nodeName", default=""),
+        "started_at": _iso(_field(status, "start_time", "startTime")),
+        "owner": next(
+            (
+                f"{_field(ref, 'kind', default='')}/{_field(ref, 'name', default='')}"
+                for ref in list(
+                    _field(meta, "owner_references", "ownerReferences", default=[]) or []
+                )
+            ),
+            "",
+        ),
     }
 
 
