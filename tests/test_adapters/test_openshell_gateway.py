@@ -3462,7 +3462,10 @@ def test_workflow_memory_urls_use_platform_provider_routes(monkeypatch):
         {
             "mimir": {
                 "hostedUrl": "https://mimir.example/api/v1",
-                "registryRefs": [{"kwargs": {"base_url": "https://memory.example/api/v1"}}],
+                "registryRefs": [
+                    {"kwargs": {"base_url": "https://memory.example/api/v1"}},
+                    {"url": "https://registry.example/api/v1", "authRef": "workload:mimir"},
+                ],
                 "instances": [{"url": "https://shared.example/api/v1"}],
             }
         }
@@ -3470,6 +3473,7 @@ def test_workflow_memory_urls_use_platform_provider_routes(monkeypatch):
     assert set(urls) == {
         "https://mimir.example/api/v1",
         "https://memory.example/api/v1",
+        "https://registry.example/api/v1",
         "https://shared.example/api/v1",
     }
 
