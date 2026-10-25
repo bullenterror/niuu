@@ -1367,6 +1367,10 @@ async def test_stewardship_fires_for_a_resident_that_has_never_run(tmp_path) -> 
     assert "careful" in task.initiative_context
     # The turn must not push the model toward manufacturing work.
     assert "nothing warrants action is a correct" in task.initiative_context
+    # Nor may the last focus stand in for the charter: a resident watching one
+    # delivery must still survey the rest of its queue.
+    assert "not the edge of your charter" in task.initiative_context
+    assert "including any work queue it names" in task.initiative_context
 
 
 @pytest.mark.asyncio

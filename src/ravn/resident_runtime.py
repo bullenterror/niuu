@@ -1696,6 +1696,12 @@ class ResidentRuntime:
                 "curiosity — a turn that concludes without having looked has "
                 "grounded nothing.",
                 "",
+                "Your working state records what you were last focused on; it is "
+                "not the edge of your charter. Survey the charter's whole scope — "
+                "including any work queue it names — before you conclude. Something "
+                "you are watching that is progressing on its own and is not waiting "
+                "on you is not a reason to leave everything else untouched.",
+                "",
                 "Deciding that nothing warrants action is a correct and expected "
                 "outcome. Do not manufacture work to justify this turn. Prefer "
                 "`stop` or `sleep` over acting on a hypothesis you cannot ground in "

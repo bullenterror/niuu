@@ -78,7 +78,7 @@ from ting.api.workflows import (
     WorkflowLaunchExecution,
     _can_view_workflow,
     _resolve_target_adapter,
-    _slugify,
+    launch_slug_for_session_name,
     launch_workflow_execution,
     resolve_workflow_repo,
 )
@@ -117,6 +117,11 @@ _CANCELED_KEY = "a2a_canceled"
 _CONTEXT_ID_KEY = "a2a_context_id"
 _MESSAGE_ID_KEY = "a2a_message_id"
 _WORKFLOW_SLUG_KEY = "a2a_workflow_slug"
+
+
+def _launch_session_name(reservation: A2ALaunchReservation) -> str:
+    """Session name of an A2A launch; stable per reservation so a retry recovers it."""
+    return f"a2a-{reservation.id.hex}"
 
 
 async def resolve_a2a_launch_repo() -> A2ALaunchReservationRepository:
@@ -378,7 +383,9 @@ class WorkflowTaskHandler(RequestHandler):
                 "prompt": prompt,
                 _CONTEXT_ID_KEY: message.context_id or reservation.task_id,
                 _MESSAGE_ID_KEY: message.message_id,
-                _WORKFLOW_SLUG_KEY: _slugify(_optional_str(metadata, "sessionName") or prompt),
+                # The slug the session runs under, so ``{slug}`` in declared
+                # artifact paths resolves to where the workflow wrote them.
+                _WORKFLOW_SLUG_KEY: launch_slug_for_session_name(_launch_session_name(reservation)),
                 **({"repo": str(metadata["repo"])} if metadata.get("repo") else {}),
                 **({"branch": str(metadata["branch"])} if metadata.get("branch") else {}),
                 # The workload that sent this task for its owner (attribution only).
@@ -419,7 +426,7 @@ class WorkflowTaskHandler(RequestHandler):
                     parent_execution,
                     request=self._request,
                     prompt=prompt,
-                    session_name=f"a2a-{reservation.id.hex}",
+                    session_name=_launch_session_name(reservation),
                     repo=str(metadata.get("repo") or ""),
                     branch=str(metadata.get("branch") or ""),
                     model=str(metadata.get("model") or ""),
@@ -432,7 +439,7 @@ class WorkflowTaskHandler(RequestHandler):
             else:
                 launch = WorkflowLaunchBody(
                     prompt=prompt,
-                    sessionName=f"a2a-{reservation.id.hex}",
+                    sessionName=_launch_session_name(reservation),
                     repo=str(metadata.get("repo") or ""),
                     branch=str(metadata.get("branch") or ""),
                     model=str(metadata.get("model") or ""),
@@ -483,7 +490,7 @@ class WorkflowTaskHandler(RequestHandler):
                     execution = WorkflowLaunchExecution(
                         workflow=workflow,
                         workflow_snapshot=pending.workflow_snapshot,
-                        slug=f"a2a-{reservation.id.hex}",
+                        slug=launch_slug_for_session_name(_launch_session_name(reservation)),
                         session=recovered,
                         adapter=target_adapter,
                         connection_id=getattr(target_adapter, "target_id", None),
@@ -550,7 +557,7 @@ class WorkflowTaskHandler(RequestHandler):
                 "cluster_name": execution.session.cluster_name,
                 _CONTEXT_ID_KEY: message.context_id or reservation.task_id,
                 _MESSAGE_ID_KEY: message.message_id,
-                _WORKFLOW_SLUG_KEY: pending.metadata[_WORKFLOW_SLUG_KEY],
+                _WORKFLOW_SLUG_KEY: execution.slug,
                 # Code-output pointers: for code workflows the durable
                 # artifact is the branch the session pushes, not a Mimir page.
                 **({"repo": launch.repo} if launch.repo else {}),
@@ -1170,7 +1177,8 @@ class WorkflowTaskHandler(RequestHandler):
         adapter = _campaign_knowledge(
             campaign,
             settings,
-            bearer_token=self._downstream_auth_token(),
+            bearer_token=self._bearer_token,
+            service_auth=getattr(self._request.app.state, "mimir_service_auth", None),
         )
         if adapter is None:
             return

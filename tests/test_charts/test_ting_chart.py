@@ -633,3 +633,22 @@ class TestMigrationConfigMap:
         for filename in source_files:
             expected = (TING_MIGRATIONS_DIR / filename).read_text().rstrip() + "\n"
             assert blocks[filename] == expected
+
+
+def test_ting_chart_renders_mimir_service_auth(tmp_path: Path) -> None:
+    auth = {
+        "adapter": "niuu.adapters.outbound.http_auth.WorkloadIdentityBearerTokenAuthAdapter",
+        "kwargs": {
+            "exchange_url": "https://platform.test/api/v1/tokens/workload/exchange",
+            "token_file": "/var/run/secrets/niuu-workload/token",
+            "audiences": ["mimir"],
+        },
+    }
+
+    config = _config_from_rendered(
+        _render_ting_chart(tmp_path, {"dispatch": {"flock": {"mimirServiceAuth": auth}}})
+    )
+
+    assert config["dispatch"]["flock"]["mimir_service_auth"] == auth
+    settings = Settings.model_validate(config)
+    assert settings.dispatch.flock.mimir_service_auth.kwargs["audiences"] == ["mimir"]

@@ -785,7 +785,11 @@ class TestSendMessage:
         assert campaign.owner_id == "user-1"
         assert campaign.metadata["surface"] == "a2a"
         assert campaign.metadata["a2a_message_id"] == "msg-1"
-        assert campaign.metadata["a2a_workflow_slug"] == "build-the-widget-tool"
+        # NIU-1149: the recorded slug is the one the session runs under (its
+        # launch name), not the caller's requested sessionName — `{slug}` in
+        # the workflow's artifact paths must resolve to where it wrote them.
+        assert campaign.metadata["a2a_workflow_slug"] == result["id"]
+        assert port.spawned[0].name == result["id"]
 
     def test_fan_out_skill_binds_durable_execution_context(self) -> None:
         workflow = next(
@@ -1485,6 +1489,8 @@ class TestSendMessage:
         assert campaign is not None
         assert campaign.connection_id == "spark-01"
         assert campaign.session_id == "recovered-session"
+        # The stale pre-launch slug is replaced by the recovered launch's own.
+        assert campaign.metadata["a2a_workflow_slug"] == task_id
 
     def test_launch_failure_marks_the_campaign_failed_instead_of_leaving_it_pending(
         self,
@@ -1668,6 +1674,37 @@ class TestGetTask:
 
         assert response.status_code == 200
         assert response.json()["result"]["id"] == campaign.slug
+
+    def test_scoped_launcher_reads_completed_artifacts_with_ting_credential(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """NIU-1149: the build's artifacts are read with Ting's Mimir credential."""
+        from niuu.adapters.outbound.http_auth import StaticBearerTokenAuthAdapter
+        from ting.api import research as research_module
+
+        regin = "system:serviceaccount:nats:regin"
+        campaign = _make_campaign(
+            slug="tool-built-by-regin",
+            status=WorkflowCampaignStatus.COMPLETED,
+            metadata={"actor_id": regin},
+        )
+        client, _, _ = _make_client(campaign_repo=InMemoryCampaignRepository([campaign]))
+        client.app.state.identity = EnvoyHeaderAuthenticationAdapter()
+        client.app.state.mimir_service_auth = StaticBearerTokenAuthAdapter(token="ting-mimir")
+        seen: list[str | None] = []
+
+        def _resolve(*_args: Any, bearer_token: str | None = None, **_kwargs: Any) -> None:
+            seen.append(bearer_token)
+            return None
+
+        monkeypatch.setattr(research_module, "resolve_mimir_workload", _resolve)
+        token = _build_token(["ting:workflow:launch"], act={"sub": regin})
+
+        response = _rpc(client, "GetTask", {"id": campaign.slug}, headers=_headers(token=token))
+
+        assert response.status_code == 200, response.text
+        assert "error" not in response.json()
+        assert seen == ["ting-mimir"]
 
     def test_scoped_launcher_cannot_read_another_workloads_task(self) -> None:
         campaign = _make_campaign(

@@ -342,6 +342,16 @@ class FlockConfig(BaseModel):
         default="",
         description="URL of the Mimir knowledge base for coordinator context queries.",
     )
+    mimir_service_auth: HttpAuthAdapterConfig = Field(
+        default_factory=HttpAuthAdapterConfig,
+        description=(
+            "Credential Ting presents to Mimir when it reads a campaign's artifacts "
+            "for a caller holding a scoped workload credential. Scoped credentials "
+            "are never forwarded, so without this a resident's A2A build cannot "
+            "retrieve what it commissioned. Production: "
+            "WorkloadIdentityBearerTokenAuthAdapter with audience mimir."
+        ),
+    )
     mimir_registry_path: str = Field(
         default="~/.ravn/mimir/.mimir-registry.json",
         description=(

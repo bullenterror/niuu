@@ -144,6 +144,12 @@ data:
         {{- if .Values.dispatch.flock.observability }}
         observability: {{ .Values.dispatch.flock.observability | toJson }}
         {{- end }}
+        {{- with .Values.dispatch.flock.mimirServiceAuth }}
+        mimir_service_auth:
+          adapter: {{ .adapter | quote }}
+          kwargs:
+            {{- toYaml .kwargs | nindent 12 }}
+        {{- end }}
       {{- end }}
 
     {{- if and .Values.planner (or .Values.planner.plannerSystemPrompt .Values.planner.finalizePrompt) }}

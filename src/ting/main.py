@@ -644,6 +644,9 @@ def create_app(
     app.state.workload_identity_service = create_workload_identity_service(
         settings.workload_identity
     )
+    app.state.mimir_service_auth = _create_http_auth_adapter(
+        settings.dispatch.flock.mimir_service_auth
+    )
 
     # -- Routers --
     app.include_router(create_health_router())
