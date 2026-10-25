@@ -398,11 +398,16 @@ def test_rest_log_rename_pin_delete_and_history_limits(tmp_path: Path) -> None:
 
     renamed = client.patch("/api/logs/A", json={"title": "Morning", "pinned": True}).json()
     assert renamed == {"success": True, "sessionId": "A", "title": "Morning", "pinned": True}
-    assert client.patch("/api/logs/A", json={"title": 3}).status_code == 400
-    assert client.patch("/api/logs/A", json={"pinned": "yes"}).status_code == 400
-    assert client.patch("/api/logs/NOPE", json={"title": "x"}).status_code == 404
-    assert client.delete("/api/logs/B").json() == {"deleted": True, "sessionId": "B"}
-    assert client.delete("/api/logs/B").status_code == 404
+    bad_title = client.patch("/api/logs/A", json={"title": 3})
+    bad_pin = client.patch("/api/logs/A", json={"pinned": "yes"})
+    unknown = client.patch("/api/logs/NOPE", json={"title": "x"})
+    assert bad_title.status_code == 400
+    assert bad_pin.status_code == 400
+    assert unknown.status_code == 404
+    deleted = client.delete("/api/logs/B")
+    deleted_again = client.delete("/api/logs/B")
+    assert deleted.json() == {"deleted": True, "sessionId": "B"}
+    assert deleted_again.status_code == 404
     assert client.get("/api/call-history").json()["count"] == 2  # history_default_limit
     assert client.get("/api/call-history", params={"limit": 50}).json()["count"] == 3  # max limit
 

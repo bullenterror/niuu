@@ -186,8 +186,11 @@ class VoiceGateway:
                     {"success": False, "error": f"Voice tool '{name}' is not registered"},
                     status_code=400,
                 )
-            except VoiceToolTimeoutError as exc:
-                return JSONResponse({"success": False, "error": str(exc)}, status_code=400)
+            except VoiceToolTimeoutError:
+                return JSONResponse(
+                    {"success": False, "error": f"Voice tool '{name}' ran past its time limit"},
+                    status_code=400,
+                )
             if outcome.is_error:
                 return JSONResponse(
                     {"success": True, "result": {"error": outcome.content, "toolName": name}}
@@ -208,8 +211,15 @@ class VoiceGateway:
                 prompt = self._composer.prompt(
                     provider, surface=surface, conversation_id=conversationId
                 )
-            except UnsupportedProviderError as exc:
-                return JSONResponse({"success": False, "error": str(exc)}, status_code=404)
+            except UnsupportedProviderError:
+                logger.info("No voice prompt for provider %r", provider.replace("\n", " "))
+                return JSONResponse(
+                    {
+                        "success": False,
+                        "error": "This resident composes no prompt for that provider",
+                    },
+                    status_code=404,
+                )
             return JSONResponse({"success": True, "prompt": prompt})
 
         @app.get("/api/call-history")
@@ -227,8 +237,8 @@ class VoiceGateway:
         async def get_log(call_id: str) -> JSONResponse:
             try:
                 call = self._store.get(call_id)
-            except UnknownCallError as exc:
-                return JSONResponse({"error": str(exc)}, status_code=404)
+            except UnknownCallError:
+                return JSONResponse({"error": "Unknown voice call"}, status_code=404)
             entries = [self._store.entry_json(entry) for entry in self._store.entries(call_id)]
             return JSONResponse({"session": self._store.session_json(call), "entries": entries})
 
@@ -244,8 +254,8 @@ class VoiceGateway:
                 return JSONResponse({"error": "pinned must be a boolean"}, status_code=400)
             try:
                 call = self._store.update(call_id, title=title, pinned=pinned)
-            except UnknownCallError as exc:
-                return JSONResponse({"error": str(exc)}, status_code=404)
+            except UnknownCallError:
+                return JSONResponse({"error": "Unknown voice call"}, status_code=404)
             return JSONResponse(
                 {"success": True, "sessionId": call_id, "title": call.title, "pinned": call.pinned}
             )
@@ -254,8 +264,8 @@ class VoiceGateway:
         async def delete_log(call_id: str) -> JSONResponse:
             try:
                 self._store.delete(call_id)
-            except UnknownCallError as exc:
-                return JSONResponse({"error": str(exc)}, status_code=404)
+            except UnknownCallError:
+                return JSONResponse({"error": "Unknown voice call"}, status_code=404)
             return JSONResponse({"deleted": True, "sessionId": call_id})
 
         return app

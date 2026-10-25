@@ -219,7 +219,7 @@ class VoiceToolBridge:
                 f"Tool {name!r} ran past {self._timeout_seconds:g} s"
             ) from exc
         except Exception as exc:  # the agent loop reports a raising tool to the model the same way
-            logger.warning("Voice tool %s raised: %s", name, exc)
+            logger.warning("Voice tool %s raised: %s", name.replace("\n", " "), exc)
             return ToolOutcome(f"Tool error: {exc}", is_error=True)
         return ToolOutcome(result.content, is_error=result.is_error)
 
