@@ -1538,6 +1538,88 @@ class OpenClawChannelConfig(BaseModel):
     )
 
 
+class VoiceMinterConfig(BaseModel):
+    """One realtime provider's credential minter (dynamic adapter + kwargs)."""
+
+    adapter: str = Field(
+        description=(
+            "Fully-qualified class path implementing RealtimeCredentialMinterPort, e.g. "
+            "'ravn.adapters.voice.client_secrets.XaiRealtimeMinter'."
+        ),
+    )
+    kwargs: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Constructor keyword arguments (key_file, base_url, ttl_seconds, …).",
+    )
+
+
+class VoiceChannelConfig(BaseModel):
+    """Realtime voice channel — makes the resident look like Lexi's agent service.
+
+    Serves the subset of the lexi-agent-service wire (a ``{type,id,payload}``
+    WebSocket at the root plus ``/api`` REST) that the Lexi app's voice calls use:
+    persona, prompt, short-lived provider credentials, the resident's tools, and
+    the call log. The phone's realtime model is the resident's voice; it calls
+    the persona's ``voice.tools`` directly. See ``ravn.adapters.channels.voice``.
+
+    Bind to loopback: the pod's nginx forwards ``/voice/`` here behind Envoy's
+    JWT and ownership checks.
+    """
+
+    enabled: bool = Field(default=False)
+    host: str = Field(default="127.0.0.1", description="Host/IP to bind the voice server.")
+    port: int = Field(default=18791, description="TCP port for the voice server.")
+    store_path: str = Field(
+        default="~/.ravn/voice/calls.db",
+        description="SQLite call store: the system of record for this resident's voice calls.",
+    )
+    display_name: str = Field(
+        default="",
+        description="Name the resident introduces itself by; defaults to the persona name.",
+    )
+    time_zone: str = Field(
+        default="UTC",
+        description="IANA time zone for the date and time in the call's prompt.",
+    )
+    models: dict[str, str] = Field(
+        default_factory=lambda: {"grok": "grok-voice-3.0", "gpt-realtime": "gpt-realtime-2.1"},
+        description="Realtime model per prompt provider (grok, gpt-realtime).",
+    )
+    minters: dict[str, VoiceMinterConfig] = Field(
+        default_factory=dict,
+        description=(
+            "Credential minter per mint provider (xai, openai). A provider without a "
+            "minter cannot be called; one with a minter that cannot start is fatal."
+        ),
+    )
+    tool_timeout_seconds: float = Field(
+        default=120.0,
+        gt=0,
+        description="Longest a voice tool call may run before it is answered as failed.",
+    )
+    history_default_limit: int = Field(
+        default=50, ge=1, description="Calls returned by call history without a limit."
+    )
+    history_max_limit: int = Field(
+        default=250, ge=1, description="Most calls one call-history request returns."
+    )
+    room_broker_url: str = Field(
+        default="",
+        description=(
+            "The resident's Skuld broker (e.g. http://127.0.0.1:8081). When set, each "
+            "call's speech is copied into the room transcript as commentary. Empty "
+            "means calls stay in the voice store only."
+        ),
+    )
+    room_participant_id: str = Field(
+        default="",
+        description="The resident's room participant id that agent speech is recorded under.",
+    )
+    room_timeout_seconds: float = Field(
+        default=10.0, gt=0, description="Timeout for one room copy request."
+    )
+
+
 class GatewayChannelsConfig(BaseModel):
     """Per-channel gateway configuration."""
 
@@ -1549,6 +1631,7 @@ class GatewayChannelsConfig(BaseModel):
     slack: SlackChannelConfig = Field(default_factory=SlackChannelConfig)
     matrix: MatrixChannelConfig = Field(default_factory=MatrixChannelConfig)
     whatsapp: WhatsAppChannelConfig = Field(default_factory=WhatsAppChannelConfig)
+    voice: VoiceChannelConfig = Field(default_factory=VoiceChannelConfig)
 
 
 class GatewayConfig(BaseModel):
