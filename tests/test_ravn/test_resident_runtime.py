@@ -1901,7 +1901,12 @@ async def test_refresh_health_snapshot_counts_durable_state(tmp_path) -> None:
     assert snapshot["repeated_decision_streak"] == 0
     # The cached view serves the HUD without touching the store again.
     # The live cap-hit counts ride along with the durable ones.
-    assert runtime.health_snapshot() == {**snapshot, "cap_hits_total": 0, "degraded_total": 0}
+    assert runtime.health_snapshot() == {
+        **snapshot,
+        "cap_hits_total": 0,
+        "degraded_total": 0,
+        "retries_total": 0,
+    }
 
 
 @pytest.mark.asyncio

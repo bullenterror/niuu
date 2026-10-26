@@ -98,6 +98,41 @@ class TestBuildLlm:
         assert kwargs["api_key"] == "custom-key"
 
 
+class TestBuildLlmStreamResume:
+    @pytest.mark.usefixtures("_api_key")
+    def test_the_resume_window_and_backoff_reach_the_adapter(self, settings: Settings) -> None:
+        from ravn.cli.commands import _build_llm
+
+        settings.llm.stream_resume_window_seconds = 300.0
+        settings.llm.stream_resume_max_backoff_seconds = 15.0
+        settings.llm.retry_base_delay = 2.0
+
+        llm = _build_llm(settings)
+
+        assert llm._stream_resume_window_seconds == 300.0
+        assert llm._stream_resume_max_backoff_seconds == 15.0
+        assert llm._retry_base_delay == 2.0
+
+    @pytest.mark.usefixtures("_api_key")
+    def test_a_provider_kwarg_wins_over_the_llm_section(self, settings: Settings) -> None:
+        from ravn.cli.commands import _build_llm
+
+        settings.llm.provider.kwargs = {"stream_resume_window_seconds": 7.0}
+
+        assert _build_llm(settings)._stream_resume_window_seconds == 7.0
+
+    def test_defaults_outlast_a_gateway_restart_and_zero_disables(self) -> None:
+        settings = Settings()
+
+        assert settings.llm.stream_resume_window_seconds == 120.0
+        assert settings.llm.stream_resume_max_backoff_seconds == 10.0
+        settings.llm.model_validate({"stream_resume_window_seconds": 0})
+        with pytest.raises(ValueError):
+            settings.llm.model_validate({"stream_resume_window_seconds": -1})
+        with pytest.raises(ValueError):
+            settings.llm.model_validate({"stream_resume_max_backoff_seconds": 0})
+
+
 class TestBuildExecutor:
     def test_default_returns_agent_executor(self) -> None:
         from ravn.cli.commands import _build_executor

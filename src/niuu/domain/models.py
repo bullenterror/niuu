@@ -8,6 +8,8 @@ from datetime import datetime
 from enum import StrEnum
 from uuid import UUID
 
+from niuu.domain.delivery import CheckConclusion, CheckRecord
+
 LINEAR_API_URL = "https://api.linear.app/graphql"
 
 
@@ -295,6 +297,122 @@ class PullRequest:
     review_status: ReviewStatus | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class ChangedFile:
+    """One file touched by a commit or a comparison, as the provider reports it.
+
+    ``additions`` / ``deletions`` are ``None`` when the provider did not say (for
+    example a GitLab diff it marked too large). ``patch`` is ``None`` when the
+    caller did not ask for patches *or* the provider omitted it; in the latter
+    case ``patch_omitted_reason`` says why, so a missing patch is never
+    mistaken for an empty change.
+    """
+
+    path: str
+    status: str
+    additions: int | None
+    deletions: int | None
+    previous_path: str | None = None
+    patch: str | None = None
+    patch_omitted_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class CommitSummary:
+    """A commit in a comparison's list: identity and subject line only."""
+
+    sha: str
+    subject: str
+    author_name: str
+    authored_at: datetime | None
+    url: str
+
+
+@dataclass(frozen=True)
+class CommitDetail:
+    """One commit with the files it changed.
+
+    ``files`` may be narrowed by a path filter; ``files_total`` is always the
+    number of files the commit changed, and ``unmatched_paths`` lists requested
+    paths that matched none of them. ``patch_included`` records whether the
+    patches were requested at all.
+    """
+
+    repo_url: str
+    sha: str
+    url: str
+    parents: tuple[str, ...]
+    author_name: str
+    author_email: str
+    authored_at: datetime | None
+    message: str
+    additions: int | None
+    deletions: int | None
+    files: tuple[ChangedFile, ...]
+    files_total: int
+    unmatched_paths: tuple[str, ...] = ()
+    patch_included: bool = True
+
+
+@dataclass(frozen=True)
+class RefComparison:
+    """``base...head`` as the provider reports it.
+
+    ``ahead_by`` is the number of commits on ``head`` that ``base`` lacks and
+    ``behind_by`` the reverse. ``files`` / ``files_total`` /
+    ``unmatched_paths`` / ``patch_included`` follow :class:`CommitDetail`.
+    """
+
+    repo_url: str
+    base: str
+    head: str
+    status: str
+    ahead_by: int
+    behind_by: int
+    merge_base_sha: str
+    url: str
+    commits: tuple[CommitSummary, ...]
+    files: tuple[ChangedFile, ...]
+    files_total: int
+    unmatched_paths: tuple[str, ...] = ()
+    patch_included: bool = True
+
+
+@dataclass(frozen=True)
+class RefChecks:
+    """CI / check results for a branch, tag or commit, with or without a PR.
+
+    ``sha`` is the commit the provider resolved ``ref`` to, so the answer stays
+    bound to that exact commit even if the branch moves afterwards.
+    """
+
+    repo_url: str
+    ref: str
+    sha: str
+    checks: tuple[CheckRecord, ...]
+
+    @property
+    def status(self) -> CIStatus:
+        """Aggregate verdict: one failing check fails the ref, none reported is unknown."""
+        conclusions = {check.conclusion for check in self.checks}
+        if not conclusions:
+            return CIStatus.UNKNOWN
+        if conclusions & {CheckConclusion.FAILING, CheckConclusion.CANCELED}:
+            return CIStatus.FAILING
+        if CheckConclusion.PENDING in conclusions:
+            return CIStatus.PENDING
+        if CheckConclusion.UNKNOWN in conclusions:
+            return CIStatus.UNKNOWN
+        return CIStatus.PASSING
+
+    def counts(self) -> dict[str, int]:
+        """Number of checks per conclusion, for a one-line summary."""
+        tally: dict[str, int] = {}
+        for check in self.checks:
+            tally[check.conclusion.value] = tally.get(check.conclusion.value, 0) + 1
+        return tally
 
 
 @dataclass(frozen=True)

@@ -34,6 +34,11 @@ counted it.
   delivered as an ordinary task, and its question stays open. A reply naming
   a closed question (`operator_reply.unbound`) and a directed message not
   written to the durable inbox (`directed_message.persist`) are also counted.
+- A retry still inside its bound (a stream re-issued after a gateway restart, a
+  model call retried after a refused connection) logs at warning and counts on
+  `ravn.retries` (attribute `ravn.retry.path`); the health snapshot carries
+  `retries_total` and `retries.<path>`. Running out of the bound is a cap hit
+  on its knob, not a retry.
 - `ravn.cap_telemetry` is the only implementation: `require_complete()` for
   model answers, `record_truncation()` / `record_cap_hit()` for everything else.
 
@@ -93,7 +98,8 @@ in the output and counted. That includes excerpts the prompt announces
 | Discord image caption | same knob | Platform limit | Kept | Error log + counted |
 | Skuld Telegram `TELEGRAM_MAX_MESSAGE_LENGTH` | 4096 | Telegram: 4096 UTF-16 units after entity parsing | Measured in UTF-16 units; HTML chunks never split inside a tag or entity, and open tags are closed and reopened across a split | A failed chunk logs at error, and the event is not marked delivered, so a redelivery resends it |
 | **Retries and time** | | | | |
-| `llm.max_retries` / `llm.retry_base_delay` / `llm.timeout` | 3 / 1.0 s / 120 s | Provider availability | Kept; `timeout` is the bound for an uncapped answer | `LLMError` after the retries |
+| `llm.max_retries` / `llm.retry_base_delay` / `llm.timeout` | 3 / 1.0 s / 120 s | Provider availability | Kept; `timeout` is the bound for an uncapped answer | `LLMError` naming `llm.max_retries` after the retries; counted on `ravn.cap.hits`; each retry is a warning counted on `ravn.retries` (`retries.llm.<provider>.connect`) |
+| `llm.stream_resume_window_seconds` / `llm.stream_resume_max_backoff_seconds` | 120 s / 10 s | How long a gateway rollout takes: the time one call may spend failing, from each failure until a re-issued stream delivers its first event | New: a model stream cut mid-answer (`RemoteProtocolError`, `ReadError`, `ConnectError`, 502/503/504) is sent again; the partial answer is discarded (`STREAM_RESTART`), so a tool call never runs twice. `0` disables it. 4xx other than 429, truncation and malformed answers are never re-sent | `LLMError` naming `llm.stream_resume_window_seconds`; counted on `ravn.cap.hits`; each re-issue is a warning counted on `ravn.retries` (`retries.llm.<provider>.stream`) |
 | `agent.max_iterations` / `iteration_budget.total` | 20 / 90 | `budget.daily_cap_usd` bounds spend, but not how long one task holds its slot | Kept: a turn whose tool loop does not converge must end so the queue moves; `0` (max_iterations) is no cap | `MaxIterationsError` (checkpointed); counted |
 | `reflection.matching.judge_attempts`, post-session reflection 2 attempts, gate review 2 attempts | 2 | — | Kept: one retry on an unparseable answer, never on truncation | Raises after the last attempt |
 | Learned-tool "never used" window (`resident_evolution.tool_curation`) | none configured | The longest install-to-first-use wait known on the resident (usage ledger: observed first uses, and pre-ledger tools' install-to-last-use upper bound) | New, derived rather than set: no window until there is evidence; a retirement the widened window no longer supports is undone | Retirement is recorded, counted (`learned_tool_retirements.unused`) and reversible |

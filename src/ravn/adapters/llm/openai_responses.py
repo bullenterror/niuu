@@ -56,6 +56,14 @@ from ravn.adapters.llm.provider_items import (
     provider_items_of,
     refuse_foreign_compaction,
 )
+from ravn.adapters.llm.transient import (
+    RETRYABLE_STATUS_CODES,
+    connection_retries_exhausted,
+    describe_failure,
+    note_connection_retry,
+    reissue_request,
+    resumable_stream,
+)
 from ravn.domain.exceptions import ConfigurationError, LLMError
 from ravn.domain.models import (
     LLMResponse,
@@ -70,7 +78,6 @@ from ravn.ports.native_compaction import NativeCompactionPort
 
 logger = logging.getLogger(__name__)
 
-_RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503})
 _DEFAULT_BASE_URL = "https://api.openai.com"
 
 # Asks for each reasoning item's opaque payload: with ``store: false`` it is the
@@ -349,6 +356,8 @@ class OpenAIResponsesAdapter(LLMPort, NativeCompactionPort):
         max_retries: int = 3,
         retry_base_delay: float = 1.0,
         timeout: float = 120.0,
+        stream_resume_window_seconds: float = 120.0,
+        stream_resume_max_backoff_seconds: float = 10.0,
         reasoning_effort: str = "",
         reasoning_summary: str = "auto",
         parallel_tool_calls: bool = True,
@@ -364,6 +373,8 @@ class OpenAIResponsesAdapter(LLMPort, NativeCompactionPort):
         self._max_retries = max_retries
         self._retry_base_delay = retry_base_delay
         self._timeout = timeout
+        self._stream_resume_window_seconds = stream_resume_window_seconds
+        self._stream_resume_max_backoff_seconds = stream_resume_max_backoff_seconds
         self._reasoning_effort = reasoning_effort
         self._reasoning_summary = reasoning_summary
         self._parallel_tool_calls = parallel_tool_calls
@@ -457,7 +468,8 @@ class OpenAIResponsesAdapter(LLMPort, NativeCompactionPort):
         """POST the request and return the open streaming response.
 
         Transient failures (429, 5xx, transport errors) are retried with
-        exponential back-off before any of the stream is read.
+        exponential back-off before any of the stream is read (``llm.max_retries``).
+        A stream that is cut after this returns is re-issued by :meth:`stream`.
         """
         url = f"{self._base_url}/v1/responses"
         last_exc: Exception | None = None
@@ -467,7 +479,7 @@ class OpenAIResponsesAdapter(LLMPort, NativeCompactionPort):
                 response = await client.send(
                     client.build_request("POST", url, json=payload), stream=True
                 )
-                if response.status_code not in _RETRYABLE_STATUS_CODES:
+                if response.status_code not in RETRYABLE_STATUS_CODES:
                     return response
                 last_status = response.status_code
                 await response.aclose()
@@ -478,18 +490,21 @@ class OpenAIResponsesAdapter(LLMPort, NativeCompactionPort):
                 last_exc = exc
             if attempt < self._max_retries:
                 delay = self._retry_base_delay * (2**attempt)
-                logger.warning(
-                    "openai-responses: %s failed (%s), retrying in %.1fs (attempt %d/%d)",
-                    url,
-                    last_status or type(last_exc).__name__,
-                    delay,
-                    attempt + 1,
-                    self._max_retries,
+                note_connection_retry(
+                    provider="openai_responses",
+                    failure=last_exc,
+                    delay=delay,
+                    attempt=attempt + 1,
+                    max_retries=self._max_retries,
                 )
                 await asyncio.sleep(delay)
-        raise LLMError(
-            f"Responses API failed after {self._max_retries} retries "
-            f"(model={payload.get('model')}, endpoint={url}, status={last_status})",
+        raise connection_retries_exhausted(
+            provider="Responses API",
+            max_retries=self._max_retries,
+            detail=(
+                f" (model={payload.get('model')}, endpoint={url}, status={last_status}, "
+                f"cause={describe_failure(last_exc) if last_exc is not None else 'unknown'})"
+            ),
             status_code=last_status,
         ) from last_exc
 
@@ -516,23 +531,37 @@ class OpenAIResponsesAdapter(LLMPort, NativeCompactionPort):
             thinking=thinking,
         )
         effective_model = payload["model"]
+        url = f"{self._base_url}/v1/responses"
         async with httpx.AsyncClient(
             headers=await self._headers(), timeout=self._timeout
         ) as client:
-            response = await self._open_stream(client, payload)
-            try:
-                if response.status_code != httpx.codes.OK:
-                    body = await response.aread()
-                    raise LLMError(
-                        f"Responses API error {response.status_code}: {body.decode()[:2000]}",
-                        status_code=response.status_code,
+
+            async def open_response(resumed: bool) -> httpx.Response:
+                if resumed:
+                    return await reissue_request(
+                        client, url, payload, headers=await self._headers()
                     )
-                async for event in self._events(response, effective_model):
-                    yield event
-            finally:
-                await response.aclose()
+                return await self._open_stream(client, payload)
+
+            # A stream the gateway cuts mid-answer is re-issued within the
+            # window; the consumer discards the partial answer on STREAM_RESTART.
+            async for event in resumable_stream(
+                provider="openai_responses",
+                window_seconds=self._stream_resume_window_seconds,
+                base_delay=self._retry_base_delay,
+                max_backoff_seconds=self._stream_resume_max_backoff_seconds,
+                open_response=open_response,
+                read_events=lambda response: self._events(response, effective_model),
+            ):
+                yield event
 
     async def _events(self, response: httpx.Response, model: str) -> AsyncIterator[StreamEvent]:
+        if response.status_code != httpx.codes.OK:
+            body = await response.aread()
+            raise LLMError(
+                f"Responses API error {response.status_code}: {body.decode()[:2000]}",
+                status_code=response.status_code,
+            )
         output: list[dict[str, Any]] = []
         usage: TokenUsage | None = None
         terminal: dict[str, Any] | None = None
@@ -637,6 +666,15 @@ class OpenAIResponsesAdapter(LLMPort, NativeCompactionPort):
                 case StreamEventType.MESSAGE_DONE:
                     usage = event.usage or usage
                     truncated = truncated or event.stop_reason == StopReason.MAX_TOKENS
+                case StreamEventType.STREAM_RESTART:
+                    # The answer so far belonged to a connection that dropped; the
+                    # re-issued request starts it over.
+                    text.clear()
+                    reasoning.clear()
+                    tool_calls.clear()
+                    items.clear()
+                    usage = TokenUsage(input_tokens=0, output_tokens=0)
+                    truncated = False
         stop_reason = StopReason.TOOL_USE if tool_calls else StopReason.END_TURN
         return LLMResponse(
             content="".join(text),

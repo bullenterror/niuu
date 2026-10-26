@@ -136,8 +136,48 @@ class LLMConfig(BaseModel):
             "and counts on ravn.cap.hits."
         ),
     )
-    max_retries: int = Field(default=3)
-    retry_base_delay: float = Field(default=1.0)
+    max_retries: int = Field(
+        default=3,
+        ge=0,
+        description=(
+            "Retries of a model call that got no response header (connection refused, "
+            "reset, 429, 5xx), with exponential backoff from retry_base_delay. Bounded "
+            "by retrying being pointless past a short outage; a stream that is cut after "
+            "its header arrived is bounded by stream_resume_window_seconds instead. "
+            "Exhausting it raises LLMError naming this knob and counts on ravn.cap.hits."
+        ),
+    )
+    retry_base_delay: float = Field(
+        default=1.0,
+        gt=0.0,
+        description=(
+            "Seconds before the first retry or stream re-issue; doubles per attempt "
+            "up to stream_resume_max_backoff_seconds (stream re-issues) or without "
+            "a ceiling (max_retries)."
+        ),
+    )
+    stream_resume_window_seconds: float = Field(
+        default=120.0,
+        ge=0.0,
+        description=(
+            "How long to keep re-issuing a model call whose stream was cut by a gateway "
+            "restart (RemoteProtocolError, ReadError, ConnectError, 502/503/504). Bounded "
+            "by how long a gateway rollout takes: the time one call may spend failing, "
+            "counted from each failure until a re-issued stream delivers its first "
+            "event (a stream that then runs long does not use it up). The partial "
+            "answer is discarded and the same request is sent again, so no tool call "
+            "runs twice. Exhausting it raises LLMError naming this knob and counts on "
+            "ravn.cap.hits; each re-issue logs at warning and counts on ravn.retries. "
+            "0 disables re-issuing: a cut stream fails the task."
+        ),
+    )
+    stream_resume_max_backoff_seconds: float = Field(
+        default=10.0,
+        gt=0.0,
+        description=(
+            "Ceiling for the delay between stream re-issues within stream_resume_window_seconds."
+        ),
+    )
     timeout: float = Field(default=120.0)
     provider: LLMProviderConfig = Field(default_factory=LLMProviderConfig)
     extended_thinking: ExtendedThinkingConfig = Field(
