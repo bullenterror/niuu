@@ -28,6 +28,7 @@ from ravn.valkyrie_evolution.models import (
 from ravn.valkyrie_evolution.tool_runtime import (
     DEFAULT_TOOL_TIMEOUT_SECONDS,
     DEFAULT_TOOL_VENV_PIP_TIMEOUT_SECONDS,
+    HOST_SDK_MODULE,
     TOOL_VENV_REQUIREMENTS_STAMP,
     TOOL_VENV_UV_CACHE_DIRNAME,
     HostCall,
@@ -1439,6 +1440,29 @@ def _reach_enforcement(*, network: str | None, network_allowed: bool) -> str:
     return REACH_ENFORCEMENT_UNAVAILABLE
 
 
+def imports_host_sdk(tool_code: str) -> bool:
+    """True when *tool_code* imports the host SDK (``ravn.sdk``) anywhere."""
+    try:
+        tree = ast.parse(tool_code)
+    except SyntaxError:
+        return False
+    package, _, submodule = HOST_SDK_MODULE.partition(".")
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            if any(_is_host_sdk(alias.name) for alias in node.names):
+                return True
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            if _is_host_sdk(node.module):
+                return True
+            if node.module == package and any(alias.name == submodule for alias in node.names):
+                return True
+    return False
+
+
+def _is_host_sdk(module: str) -> bool:
+    return module == HOST_SDK_MODULE or module.startswith(HOST_SDK_MODULE + ".")
+
+
 def require_verified_artifact(artifact: LearnedToolArtifact) -> None:
     """Raise unless *artifact* carries a passing independent verification.
 
@@ -1489,6 +1513,19 @@ class LearnedTool(ToolPort):
         # Refuse at load a tool whose declared reach this backend cannot
         # enforce, so it is never offered for invocation. run() checks again.
         self._runner.check_reach(manifest.declared_reach)
+        # Likewise a tool that calls the resident's own tools on a backend
+        # with no channel back: in a container or Job the import fails, which
+        # reads as the tool being broken and would archive a healthy tool.
+        if (
+            not getattr(self._runner, "supports_host_call", False)
+            and self._tool_path.is_file()
+            and imports_host_sdk(self._tool_path.read_text(encoding="utf-8"))
+        ):
+            raise LearnedToolError(
+                f"learned tool {manifest.name!r} calls the resident's own tools through "
+                f"{HOST_SDK_MODULE}, which this execution backend cannot provide; run it on "
+                "the local backend, or rebuild it self-contained"
+            )
         self._requirements = list(requirements)
         self._host_call = host_call
         self._artifact_id = artifact_id
