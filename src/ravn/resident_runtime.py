@@ -20,7 +20,14 @@ from ravn.cap_telemetry import DEGRADED_TOTAL_KEY, record_truncation
 from ravn.cap_telemetry import HEALTH_TOTAL_KEY as CAP_HEALTH_TOTAL_KEY
 from ravn.cap_telemetry import health_counts as cap_health_counts
 from ravn.domain.exceptions import UnboundOperatorReplyError
-from ravn.domain.models import AgentTask, OutputMode, TokenUsage, TurnResult
+from ravn.domain.models import (
+    RESIDENT_HOME_PRIORITY,
+    RESIDENT_HOME_TRIGGER,
+    AgentTask,
+    OutputMode,
+    TokenUsage,
+    TurnResult,
+)
 from ravn.domain.resident_continuation import (
     ContinuationDecisionKind,
     ResidentA2ATaskRecord,
@@ -1704,9 +1711,10 @@ class ResidentRuntime:
             task_id=_task_id("resident_home"),
             title=f"Resident home turn ({len(rows)} observations)",
             initiative_context="\n".join(context_lines),
-            triggered_by="resident:home",
+            triggered_by=RESIDENT_HOME_TRIGGER,
             output_mode=output_mode,
             persona=persona,
+            priority=RESIDENT_HOME_PRIORITY,
             root_correlation_id=str(origin.get("root_correlation_id") or case_id),
             resident_case_id=case_id,
             resident_turn_index=int(origin.get("turn_index") or 0) + 1,

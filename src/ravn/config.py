@@ -1821,6 +1821,18 @@ class BudgetConfig(BaseModel):
 class InitiativeConfig(BaseModel):
     """Drive-loop initiative engine configuration (NIU-539)."""
 
+    @model_validator(mode="before")
+    @classmethod
+    def _refuse_removed_queue_cap(cls, data: Any) -> Any:
+        """A removed cap left in a config would read as enforced while doing nothing."""
+        if isinstance(data, dict) and "task_queue_max" in data:
+            raise ValueError(
+                "initiative.task_queue_max no longer exists: the queue no longer drops "
+                "tasks when full; a backlog shows as the queue depth and each queued "
+                "task's age. Remove the key"
+            )
+        return data
+
     enabled: bool = Field(
         default=False,
         description="Enable the drive loop / initiative engine.",
@@ -1828,10 +1840,6 @@ class InitiativeConfig(BaseModel):
     max_concurrent_tasks: int = Field(
         default=3,
         description="Maximum simultaneous initiative tasks.",
-    )
-    task_queue_max: int = Field(
-        default=50,
-        description="Maximum tasks in the priority queue.",
     )
     queue_journal_path: str = Field(
         default="~/.ravn/daemon/queue.json",
@@ -4365,6 +4373,18 @@ class EnvironmentTopologyConfig(BaseModel):
 class EnvironmentConfig(BaseModel):
     """Runtime environment identity for long-running resident Valkyries."""
 
+    @model_validator(mode="before")
+    @classmethod
+    def _refuse_removed_triage_cap(cls, data: Any) -> Any:
+        """A removed cap left in a config would read as enforced while doing nothing."""
+        if isinstance(data, dict) and "idle_triage_max_signals" in data:
+            raise ValueError(
+                "environment.idle_triage_max_signals no longer exists: an idle-triage "
+                "window keeps every untriaged observation instead of dropping the oldest; "
+                "the prompt is bounded by idle_triage_sample_signals. Remove the key"
+            )
+        return data
+
     id: str = Field(
         default="local",
         description="Stable environment id, for example a k8s cluster or host id.",
@@ -4455,10 +4475,6 @@ class EnvironmentConfig(BaseModel):
             "Seconds between idle triage judgments over signals that did not match "
             "signal_task_severities. 0 disables idle triage."
         ),
-    )
-    idle_triage_max_signals: int = Field(
-        default=200,
-        description="Maximum below-threshold signals summarized in one idle triage task.",
     )
     idle_triage_sample_signals: int = Field(
         default=15,
