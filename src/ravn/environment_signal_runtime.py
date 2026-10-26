@@ -166,6 +166,8 @@ class EnvironmentSignalRuntime:
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
+        for adapter in self._adapters:
+            await adapter.close()
         if self._owns_publisher and hasattr(self._publisher, "stop"):
             await self._publisher.stop()  # type: ignore[attr-defined]
 
