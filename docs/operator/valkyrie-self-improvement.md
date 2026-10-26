@@ -183,9 +183,49 @@ resident_evolution:
   before every Job. Requires explicit `learned_tool_k8s.namespace`,
   `deny_policy_name`, and `allow_policy_name`; the runner refuses to start
   without them (no silent unenforced fallback). Jobs run digest-pinned,
-  read-only-root, non-root/seccomp/capability-restricted, with no
-  service-account token, and requirements are never installed at invocation
-  time — bake them into a reviewed image instead.
+  read-only-root, non-root/seccomp/capability-restricted. Requirements are
+  never installed: a gate inside the Job checks them against the pinned image
+  (the devrunner image bakes in `kubernetes`, `requests`, `PyYAML` and
+  `kubectl`) and refuses the run, naming what is missing, otherwise.
+
+  Each run's egress is derived from the tool's declared reach
+  (`ravn.valkyrie_evolution.reach_plan`):
+
+  | Declared reach | Egress the Job gets |
+  |---|---|
+  | none, or only `pure_compute`/`process` | none (deny policy) |
+  | Kubernetes API (`kubernetes`, `k8s*`, `kubernetes.default.svc`, the SA token path) | the API server's endpoints, plus the read-only `tool_service_account` token |
+  | `namespace/service[:port]`, `svc.ns.svc[:port]`, `http://svc.ns.svc:port` | the pods behind that Service, on its target port |
+  | `https://host`, `host:port`, `ip:port` | those addresses (host names resolved at run time) |
+  | a word declared in `named_targets` (e.g. `prometheus`) | the Service the operator mapped it to |
+  | untargeted `network` with `read_write` | unrestricted egress (allow policy) |
+
+  A targeted run keeps the denied label, so the verified deny policy isolates
+  its pod from the moment it starts; a per-run NetworkPolicy owned by the Job
+  adds exactly the egress above plus cluster DNS (`dns_service`). Anything the
+  planner cannot express is refused with the remedy: an untargeted `read`
+  grant, a wildcard host, prose with no address and no declared word, a
+  filesystem path other than the service-account token, credentials, host
+  SDK calls, or Kubernetes access beyond `read`. The tool's own timeout
+  counts from container start; `job_pod_start_timeout_seconds` covers
+  scheduling and image pull.
+
+  ```yaml
+  learned_tool_k8s:
+    namespace: nats
+    image: ghcr.io/niuulabs/devrunner@sha256:<reviewed digest>
+    deny_policy_name: learned-tool-deny
+    allow_policy_name: learned-tool-allow
+    tool_service_account: <resident>-tools   # bound to read-only RBAC only
+    dns_service: kube-system/rke2-coredns-rke2-coredns
+    named_targets:
+      prometheus: monitoring/kube-prom-kube-prometheus-prometheus:9090
+  ```
+
+  The resident's own service account needs, in that namespace: create/get/
+  list/watch/delete `jobs`; create/delete `secrets` and `networkpolicies`;
+  get/list `networkpolicies`, `pods`, `pods/log`; and get `services` (any
+  target namespace) and `endpoints` (`default/kubernetes`).
 
   Peer-adoption re-verification (`verify()`) is supported on `k8s_job`: a
   peer's test suite runs in the SAME denied-network, NetworkPolicy-verified
@@ -365,7 +405,7 @@ What each layer actually provides:
 | Env scrubbing | Hygiene: tools can't read tokens from `os.environ` (proven by test) | A wall — same-user file reads still work |
 | `local` backend | Crash/timeout isolation; no network for a tool that declares none (refused where the host cannot isolate) | Per-target egress filtering, filesystem isolation |
 | Docker backend (`container`) | Container + network isolation where Docker exists | Anything in Kubernetes |
-| `k8s_job` backend | Pod-per-run Kubernetes containment: verified NetworkPolicies, no SA token, non-root/seccomp/dropped capabilities, resource/time/output bounds — for both invocation and `verify()` | A Docker daemon (none needed); runtime dependency installation (bake into the pinned image) |
+| `k8s_job` backend | Pod-per-run Kubernetes containment: per-run egress derived from declared reach (API server, named Services, named addresses), a read-only tool identity only for Kubernetes-API reach, non-root/seccomp/dropped capabilities, resource/time/output bounds — for both invocation and `verify()` | A Docker daemon (none needed); runtime dependency installation (bake into the pinned image); the HTTP verb on a non-Kubernetes target (the policy fixes *where*, not *what*) |
 | Audit + rollback + capability ledger | Detection and recovery | Prevention |
 
 There is **no hard runtime wall in-process**. Real runtime containment in
