@@ -122,6 +122,20 @@ class LearnedToolInfrastructureError(RuntimeError):
     """
 
 
+class LearnedToolUsageError(RuntimeError):
+    """A finished learned-tool run could not be recorded in the usage ledger.
+
+    Distinct from the tool failing: the run happened and its result is real.
+    Callers that turn tool exceptions into tool errors must let this through,
+    or a full disk would read as a failing tool and count toward rollback.
+    """
+
+
+#: Records one finished run of a learned tool: ``(name, artifact_id, succeeded)``.
+#: Raises :class:`LearnedToolUsageError` when the record cannot be written.
+LearnedToolUsageRecorder = Callable[[str, str, bool], None]
+
+
 def grant_reaches_network(grant: ToolReachGrant) -> bool:
     """True when *grant* reaches past this machine (see :data:`LOCAL_REACH_KINDS`)."""
     if grant.access == "none":
@@ -1464,6 +1478,8 @@ class LearnedTool(ToolPort):
         runner: LearnedToolRunner | None = None,
         requirements: Sequence[str] = (),
         host_call: HostCall | None = None,
+        artifact_id: str = "",
+        usage_recorder: LearnedToolUsageRecorder | None = None,
     ) -> None:
         _validate_manifest(manifest)
         self._manifest = manifest
@@ -1475,6 +1491,11 @@ class LearnedTool(ToolPort):
         self._runner.check_reach(manifest.declared_reach)
         self._requirements = list(requirements)
         self._host_call = host_call
+        self._artifact_id = artifact_id
+        # Every path that runs this tool records here — learned_tool_run and a
+        # tool build_tool registered live — so usage evidence does not depend
+        # on which door the call came through.
+        self._usage_recorder = usage_recorder
 
     @property
     def name(self) -> str:
@@ -1524,11 +1545,17 @@ class LearnedTool(ToolPort):
                 detail = f"{detail}\n{result.stderr}"
             if result.infrastructure:
                 raise LearnedToolInfrastructureError(detail)
+            self._record_usage(succeeded=False)
             return ToolResult(tool_call_id="", content=detail, is_error=True)
+        self._record_usage(succeeded=True)
         return ToolResult(
             tool_call_id="",
             content=json.dumps(result.result, indent=2, sort_keys=True),
         )
+
+    def _record_usage(self, *, succeeded: bool) -> None:
+        if self._usage_recorder is not None:
+            self._usage_recorder(self._manifest.name, self._artifact_id, succeeded)
 
 
 def write_learned_tool(
@@ -1590,24 +1617,29 @@ def _link_superseded_artifact(
         ) from exc
     previous_id = str(previous.get("artifact_id") or "")
     previous_supersedes = str(previous.get("supersedes") or "")
+    previous_version = int(previous.get("version") or 1)
     if not previous_id or previous_id == artifact.artifact_id:
-        if previous_supersedes and not artifact.supersedes:
-            # Rewriting the same version (e.g. refreshed provenance) must not
-            # erase the chain link the previous write established.
-            return replace(artifact, supersedes=previous_supersedes)
-        return artifact
+        # Rewriting the same version (e.g. refreshed provenance) must not
+        # erase the chain link or the version number the previous write set.
+        return replace(
+            artifact,
+            supersedes=artifact.supersedes or previous_supersedes,
+            version=previous_version,
+        )
 
     archive_path = superseded_artifact_path(artifacts_dir, artifact.manifest.name, previous_id)
     archive_path.parent.mkdir(parents=True, exist_ok=True)
     archive_path.write_text(json.dumps(previous, indent=2, sort_keys=True), encoding="utf-8")
     if artifact.supersedes:
+        if artifact.supersedes == previous_id:
+            return replace(artifact, version=previous_version + 1)
         return artifact
     if previous_supersedes == artifact.artifact_id:
         # Writing back the exact predecessor the current version superseded is
         # a rollback restore, not a new version — linking it would create a
         # two-artifact cycle that ping-pongs forever.
         return artifact
-    return replace(artifact, supersedes=previous_id)
+    return replace(artifact, supersedes=previous_id, version=previous_version + 1)
 
 
 def find_installed_duplicate(
@@ -1677,61 +1709,6 @@ def capability_key(name: str) -> str:
     return re.sub(r"[^a-z0-9]", "", folded)
 
 
-def find_installed_capability(
-    *,
-    artifacts_dir: str | Path,
-    tools_dir: str | Path,
-    capability_id: str = "",
-    name: str = "",
-) -> LearnedToolArtifact | None:
-    """Find an installed tool already serving *capability_id* or called *name*.
-
-    Answerable before any code exists, which is the point: the code-level
-    duplicate check can only run on a finished build, and a commissioned build
-    is a Ting workflow that has already taken half an hour by then. Declared
-    intent — the capability being asked for, or the name being asked for — is
-    all that is available up front, and it is enough to stop the common case.
-
-    Capability match is preferred over name match: it survives a rename, which
-    is the duplication that name-keyed logic misses entirely.
-    """
-    artifacts_path = Path(artifacts_dir)
-    if not artifacts_path.is_dir():
-        return None
-    wanted_capability = capability_id.strip()
-    wanted_name = name.strip()
-    if not wanted_capability and not wanted_name:
-        return None
-
-    by_name: LearnedToolArtifact | None = None
-    by_key: LearnedToolArtifact | None = None
-    wanted_key = capability_key(wanted_capability or wanted_name)
-    for candidate_path in sorted(artifacts_path.glob("*.json")):
-        try:
-            payload = json.loads(candidate_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if not isinstance(payload, dict):
-            continue
-        candidate = LearnedToolArtifact.from_dict(payload)
-        if not learned_tool_path(tools_dir, candidate.manifest.name).is_file():
-            continue
-        if wanted_capability and candidate.source_gap_id.strip() == wanted_capability:
-            return candidate
-        if wanted_name and candidate.manifest.name == wanted_name and by_name is None:
-            by_name = candidate
-        # Last resort: the same capability under a different spelling. Exact
-        # matching alone let one capability fork into several tools, and a
-        # resident that cannot find what it built asks for it again.
-        if by_key is None and wanted_key:
-            candidate_key = capability_key(
-                candidate.source_gap_id.strip() or candidate.manifest.name
-            )
-            if candidate_key == wanted_key:
-                by_key = candidate
-    return by_name or by_key
-
-
 def _manifest_contract(manifest: LearnedToolManifest) -> str:
     """What a caller is promised, ignoring what the tool happens to be called."""
     return json.dumps(
@@ -1762,7 +1739,7 @@ def _link_by_capability(
     if not capability_id or artifact.supersedes:
         return artifact
 
-    newest: tuple[str, str] = ("", "")
+    newest: tuple[str, str, int] = ("", "", 1)
     for candidate_path in sorted(artifacts_dir.glob("*.json")):
         try:
             payload = json.loads(candidate_path.read_text(encoding="utf-8"))
@@ -1779,11 +1756,11 @@ def _link_by_capability(
             continue
         created_at = str(payload.get("created_at") or "")
         if created_at >= newest[0]:
-            newest = (created_at, candidate_id)
+            newest = (created_at, candidate_id, int(payload.get("version") or 1))
 
     if not newest[1]:
         return artifact
-    return replace(artifact, supersedes=newest[1])
+    return replace(artifact, supersedes=newest[1], version=newest[2] + 1)
 
 
 def read_learned_tool_artifact(path: str | Path) -> LearnedToolArtifact:
@@ -1803,6 +1780,7 @@ def load_learned_tool(
     requirements: list[str] | None = None,
     venvs_dir: str | Path | None = None,
     host_call: HostCall | None = None,
+    usage_recorder: LearnedToolUsageRecorder | None = None,
 ) -> LearnedTool:
     """Create an agent-callable ToolPort from a learned artifact.
 
@@ -1822,6 +1800,8 @@ def load_learned_tool(
         runner=runner,
         requirements=resolved_requirements,
         host_call=host_call,
+        artifact_id=artifact.artifact_id,
+        usage_recorder=usage_recorder,
     )
 
 
@@ -1849,6 +1829,52 @@ def superseded_artifact_path(
     stem = _filename_for_tool(tool_name)
     suffix = re.sub(r"[^a-zA-Z0-9_.-]+", "_", artifact_id)
     return Path(artifacts_dir) / SUPERSEDED_ARTIFACTS_DIRNAME / f"{stem}__{suffix}.json"
+
+
+#: Subdirectory (of both the code and the artifacts dir) holding retired tools.
+#: Retirement moves a tool here instead of deleting it, so it is reversible;
+#: nothing that globs ``*.py`` / ``*.json`` at the top level sees it.
+RETIRED_DIRNAME = "_retired"
+
+#: Subdirectory of the artifacts dir for builds that failed verification. They
+#: are kept for audit but never written over the installed tool's envelope: a
+#: failed rebuild used to replace a working tool's envelope, which made the
+#: working code on disk unrunnable.
+FAILED_ARTIFACTS_DIRNAME = "_failed"
+
+#: Subdirectory of the artifacts dir for curation state: the usage ledger,
+#: retirement records, and capability verdicts.
+CURATION_DIRNAME = "_curation"
+
+
+def retired_tool_path(tools_dir: str | Path, tool_name: str) -> Path:
+    """Where a retired tool's code is kept."""
+    return Path(tools_dir) / RETIRED_DIRNAME / f"{_filename_for_tool(tool_name)}.py"
+
+
+def retired_artifact_path(artifacts_dir: str | Path, tool_name: str) -> Path:
+    """Where a retired tool's envelope is kept."""
+    return Path(artifacts_dir) / RETIRED_DIRNAME / f"{_filename_for_tool(tool_name)}.json"
+
+
+def failed_artifact_path(artifacts_dir: str | Path, tool_name: str, artifact_id: str) -> Path:
+    """Where a build that failed verification is kept for audit."""
+    stem = _filename_for_tool(tool_name)
+    suffix = re.sub(r"[^a-zA-Z0-9_.-]+", "_", artifact_id)
+    return Path(artifacts_dir) / FAILED_ARTIFACTS_DIRNAME / f"{stem}__{suffix}.json"
+
+
+def write_failed_learned_tool_artifact(
+    *,
+    artifacts_dir: str | Path,
+    artifact: LearnedToolArtifact,
+) -> Path:
+    """Persist a build that failed verification without touching the installed one."""
+    _validate_artifact(artifact)
+    path = failed_artifact_path(artifacts_dir, artifact.manifest.name, artifact.artifact_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(artifact.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
+    return path
 
 
 def _validate_artifact(artifact: LearnedToolArtifact) -> None:
@@ -2015,6 +2041,7 @@ class LearnedToolResolver:
         workspace_root: str | Path | None = None,
         timeout_seconds: float = DEFAULT_TOOL_TIMEOUT_SECONDS,
         execution_backend_kwargs: Mapping[str, Any] | None = None,
+        usage_recorder: LearnedToolUsageRecorder | None = None,
     ) -> None:
         if execution_backend not in KNOWN_EXECUTION_BACKENDS:
             raise LearnedToolError(f"unknown learned tool execution backend: {execution_backend!r}")
@@ -2025,6 +2052,7 @@ class LearnedToolResolver:
         self._execution_backend_kwargs = dict(execution_backend_kwargs or {})
         self._code_dir, self._artifacts_dir = learned_tool_storage(self._state_dir)
         self._venvs_dir = learned_tool_venvs_dir(self._state_dir)
+        self._usage_recorder = usage_recorder
 
     @property
     def artifacts_dir(self) -> Path:
@@ -2086,6 +2114,12 @@ class LearnedToolResolver:
             raise LearnedToolError(f"invalid learned tool name: {name!r}")
         artifact_path = learned_tool_artifact_path(self._artifacts_dir, name)
         if not artifact_path.is_file():
+            if retired_artifact_path(self._artifacts_dir, name).is_file():
+                raise LearnedToolError(
+                    f"learned tool {name!r} is retired. Use the installed tool that serves "
+                    "the same capability (capability_list), or ask build_tool for this "
+                    "capability, which restores it when it is still the right tool"
+                )
             raise LearnedToolError(f"no learned tool named {name!r} is installed")
         artifact = read_learned_tool_artifact(artifact_path)
         require_verified_artifact(artifact)
@@ -2099,6 +2133,7 @@ class LearnedToolResolver:
             runner=self._runner(),
             venvs_dir=self._venvs_dir,
             host_call=host_call,
+            usage_recorder=self._usage_recorder,
         )
 
     def _tool_path(self, name: str) -> Path:

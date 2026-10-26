@@ -3583,6 +3583,35 @@ class LearnedToolKubernetesConfig(BaseModel):
     )
 
 
+class LearnedToolCurationConfig(BaseModel):
+    """The consolidation-dream pass that retires learned tools.
+
+    Retires tools that another installed tool supersedes, that can never run,
+    that are named as debug probes and never succeeded, or that were never run
+    for longer than any tool on the resident waited before its first use. That
+    window is derived from the resident's own usage ledger, not configured.
+    Retirement moves the tool under ``_retired/`` and records why; asking
+    build_tool for the capability again restores it.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description=(
+            "Retire superseded, unrunnable, debug-leftover and never-used learned tools "
+            "during consolidation dreams. Needs resident_wakefulness. false keeps every "
+            "tool forever."
+        ),
+    )
+    leftover_name_prefixes: list[str] = Field(
+        default_factory=lambda: ["test", "debug", "tmp", "temp", "scratch"],
+        description=(
+            "First name tokens that mark a tool as a probe, not an instrument "
+            "(debug_input, test_tool). Such a tool is retired once it has no successful "
+            "run; one that succeeded is judged like any other."
+        ),
+    )
+
+
 class ResidentEvolutionConfig(BaseModel):
     """Resident Valkyrie self-evolution: builder, reviewer, rollback, autonomy.
 
@@ -3664,6 +3693,10 @@ class ResidentEvolutionConfig(BaseModel):
     learned_tool_k8s: LearnedToolKubernetesConfig = Field(
         default_factory=LearnedToolKubernetesConfig,
         description="Pod-per-run Kubernetes execution and policy coordinates.",
+    )
+    tool_curation: LearnedToolCurationConfig = Field(
+        default_factory=LearnedToolCurationConfig,
+        description="Retirement of learned tools that no longer earn their catalog entry.",
     )
     learned_tool_injection_mode: Literal["dispatch", "bulk"] = Field(
         default="dispatch",
