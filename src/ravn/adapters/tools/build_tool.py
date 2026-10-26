@@ -23,6 +23,7 @@ from ravn.ports.tool_build_backend import (
     ToolBuildError,
     ToolBuildInputRequiredError,
     ToolBuildPendingError,
+    ToolBuildTaskEndedError,
 )
 from ravn.tool_observability import publish_learned_tool_inventory
 from ravn.valkyrie_evolution.adapters import PolicyCourtReviewer
@@ -1158,6 +1159,17 @@ class BuildTool(ToolPort):
                 signal_context_suffix="",
             )
         except (ToolBuildInputRequiredError, ToolBuildPendingError):
+            raise
+        except ToolBuildTaskEndedError as ended:
+            # The remote task is over, so this continuation can never resume.
+            # Keeping it left the resident holding builds for tasks that had
+            # failed or been cancelled days earlier.
+            self._delete_pending_build(task_id)
+            telemetry.event(
+                "ravn.tool_build.continuation.ended",
+                attributes={**attributes, "a2a.task.state": ended.state},
+                content={"reason": ended.reason},
+            )
             raise
         self._delete_pending_build(task_id)
         telemetry.event(
