@@ -3564,12 +3564,40 @@ class LearnedToolKubernetesConfig(BaseModel):
         default=120.0,
         gt=0,
         description=(
-            "verify()-only: separate budget for a Job's pod to leave Pending and "
-            "start running (scheduling, image pull) before it is treated as an "
-            "infrastructure failure. Decoupled from the verify timeout, which only "
-            "starts counting once the container is actually running, so a slow "
-            "image pull is never confused with the tool's own code hanging. run() "
-            "has no separate pod-start budget and does not consult this field."
+            "Budget for a Job's pod to leave Pending and start running (scheduling, "
+            "image pull) before it is treated as an infrastructure failure, for both "
+            "run() and verify(). Decoupled from the tool and verify timeouts, which "
+            "only start counting once the container is actually running, so a slow "
+            "image pull is never confused with the tool's own code hanging."
+        ),
+    )
+    tool_service_account: str = Field(
+        default="",
+        description=(
+            "Service account a learned-tool Job runs as when its declared reach "
+            "includes the Kubernetes API; its token is mounted only for those runs. "
+            "Bind it to read-only RBAC no wider than the resident's own: it is the "
+            "only cluster identity a learned tool ever holds. Empty refuses every "
+            "tool that declares Kubernetes API reach."
+        ),
+    )
+    dns_service: str = Field(
+        default="",
+        description=(
+            "Cluster DNS Service as 'namespace/name' (e.g. "
+            "'kube-system/rke2-coredns-rke2-coredns'). A Job with targeted reach gets "
+            "egress to the pods behind it so it can resolve its targets. Empty refuses "
+            "every tool that declares targeted network reach."
+        ),
+    )
+    named_targets: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Words a learned tool's reach may use for an in-cluster Service, as "
+            "word -> 'namespace/service[:port]' (e.g. prometheus -> "
+            "'monitoring/kube-prom-kube-prometheus-prometheus:9090'). Matched as a "
+            "whole word in a grant's kind or target when it names no address; "
+            "nothing else is inferred from prose."
         ),
     )
     job_ttl_seconds_after_finished: int = Field(
