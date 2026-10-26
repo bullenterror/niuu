@@ -901,9 +901,10 @@ class ContextManagementConfig(BaseModel):
         default=0,
         ge=0,
         description=(
-            "Model context-window size in tokens. The runtime reserves the configured "
-            "maximum output before deriving the safe prompt budget. 0 means the model "
-            "window is unknown, so max_prompt_tokens must provide the prompt ceiling."
+            "Model context-window size in tokens: the real bound on a prompt. The prompt "
+            "ceiling is this window minus llm.max_tokens when an answer cap is set, else "
+            "the whole window (an answer that then does not fit comes back cut off and "
+            "raises OutputTruncatedError). 0 means the window is unknown."
         ),
     )
     token_estimate_safety_factor: float = Field(
@@ -959,13 +960,25 @@ class ContextManagementConfig(BaseModel):
     )
     max_prompt_tokens: int = Field(
         default=0,
+        ge=0,
         description=(
-            "Hard per-call budget for the estimated prompt size (system prompt + "
-            "tool schemas + message history), in tokens. 0 disables the check. "
-            "When a turn's estimated prompt still exceeds this after context "
-            "compression, the LLM call is refused with PromptBudgetExceededError "
-            "and a per-section breakdown — fail loud instead of sending a request "
-            "that overflows the model's context window."
+            "Hard per-call ceiling for the estimated prompt size (system prompt + "
+            "tool schemas + message history), in tokens. 0 derives it from "
+            "context_window_tokens (and no check when that is unknown too). A prompt "
+            "still above it after compaction is refused with PromptBudgetExceededError, "
+            "and a single tool result is cut only where it alone would break it. Set it "
+            "below the window only for a real limit; for prompt-size latency use "
+            "compaction_target_tokens, which compacts history instead of cutting results."
+        ),
+    )
+    compaction_target_tokens: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Prompt size compaction keeps history under, for prefill latency: compaction "
+            "fires at compression_threshold x this. 0 uses the prompt ceiling. This "
+            "never cuts a tool result or refuses a turn; on self-hosted models a smaller "
+            "prompt mainly means a faster time to first token."
         ),
     )
 
@@ -5667,24 +5680,24 @@ class Settings(BaseSettings):
         matching = reflection.matching.model_copy(update={"judge_llm_alias": reflection.llm_alias})
         return reflection.model_copy(update={"matching": matching})
 
-    @model_validator(mode="after")
-    def _prompt_budget_is_derivable(self) -> Settings:
-        """Refuse a context window that no longer says how much of it the prompt may use.
-
-        With an answer cap the prompt budget is the window minus the cap. With
-        no cap (``llm.max_tokens: null``) the window holds prompt and answer
-        together, so the budget has to be stated.
-        """
+    def prompt_ceiling_tokens(self) -> int:
+        """The hard prompt ceiling: configured, else derived from the context window."""
         cm = self.context_management
-        if cm.context_window_tokens and cm.max_prompt_tokens <= 0:
-            if self.llm.max_tokens is None and self.agent.max_tokens is None:
-                raise ValueError(
-                    "context_management.context_window_tokens is set but llm.max_tokens is "
-                    "null, so no prompt budget can be derived from the window; set "
-                    "context_management.max_prompt_tokens to the share of the window the "
-                    "prompt may use (or llm.max_tokens to reserve an answer cap)"
-                )
-        return self
+        if cm.max_prompt_tokens > 0:
+            return cm.max_prompt_tokens
+        if cm.context_window_tokens <= 0:
+            return 0
+        output_cap = (
+            self.llm.max_tokens if self.llm.max_tokens is not None else self.agent.max_tokens
+        )
+        if output_cap is None:
+            return cm.context_window_tokens
+        return max(0, cm.context_window_tokens - output_cap)
+
+    def compaction_budget_tokens(self) -> int:
+        """The prompt size compaction aims under: the latency target, else the ceiling."""
+        target = self.context_management.compaction_target_tokens
+        return target if target > 0 else self.prompt_ceiling_tokens()
 
     def effective_max_tokens(self) -> int | None:
         """Return the resolved answer cap, or ``None`` for no cap.

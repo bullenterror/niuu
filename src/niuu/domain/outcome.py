@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import textwrap
 from dataclasses import dataclass
+from datetime import date, datetime, time
 from typing import Any, Literal
 
 import yaml
@@ -409,6 +410,33 @@ def _validate_against_schema(
     return errors
 
 
+def _json_shaped(value: Any) -> Any:
+    """Return *value* with the shape JSON can carry.
+
+    YAML turns an unquoted ``2026-10-26:`` into a ``datetime.date`` key and
+    ``at: 2026-10-26T04:35:00Z`` into a ``datetime`` value. An outcome is a
+    JSON contract that is published, persisted and reflected on; a date key
+    made reflection fail with "keys must be str" on every such turn.
+    """
+    if isinstance(value, dict):
+        return {_json_key(key): _json_shaped(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_json_shaped(item) for item in value]
+    if isinstance(value, date | datetime | time):
+        return value.isoformat()
+    return value
+
+
+def _json_key(key: Any) -> str:
+    if isinstance(key, date | datetime | time):
+        return key.isoformat()
+    if key is None:
+        return "null"
+    if isinstance(key, bool):
+        return "true" if key else "false"
+    return str(key)
+
+
 def parse_outcome_block(text: str, schema: OutcomeSchema | None = None) -> ParsedOutcome | None:
     """Extract and parse the ---outcome--- block from agent/session output.
 
@@ -433,7 +461,7 @@ def parse_outcome_block(text: str, schema: OutcomeSchema | None = None) -> Parse
     try:
         loaded = yaml.safe_load(clean)
         if isinstance(loaded, dict):
-            parsed_fields = loaded
+            parsed_fields = _json_shaped(loaded)
         else:
             got = type(loaded).__name__
             parse_errors.append(f"outcome block did not parse as a YAML mapping; got {got}")
@@ -451,7 +479,7 @@ def parse_outcome_block(text: str, schema: OutcomeSchema | None = None) -> Parse
             except yaml.YAMLError:
                 loaded = None
         if isinstance(loaded, dict):
-            parsed_fields = loaded
+            parsed_fields = _json_shaped(loaded)
         else:
             parse_errors.append(f"YAML parse error: {exc}")
 

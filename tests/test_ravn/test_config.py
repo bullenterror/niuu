@@ -1173,11 +1173,28 @@ class TestPlatformAccessToken:
 
 
 class TestPromptBudgetDerivation:
-    """With no answer cap, a context window alone no longer implies a prompt budget."""
+    """The context window bounds the prompt; compaction aims under a separate target."""
 
-    def test_a_window_without_a_cap_or_a_budget_is_refused(self) -> None:
-        with pytest.raises(ValueError, match="max_prompt_tokens"):
-            Settings(context_management={"context_window_tokens": 131072})
+    def test_a_window_without_a_cap_is_the_ceiling(self) -> None:
+        settings = Settings(context_management={"context_window_tokens": 131072})
+        assert settings.prompt_ceiling_tokens() == 131072
+        assert settings.compaction_budget_tokens() == 131072
+
+    def test_an_answer_cap_is_reserved_out_of_the_window(self) -> None:
+        settings = Settings(
+            llm={"max_tokens": 32000}, context_management={"context_window_tokens": 131072}
+        )
+        assert settings.prompt_ceiling_tokens() == 99072
+
+    def test_the_compaction_target_does_not_lower_the_ceiling(self) -> None:
+        settings = Settings(
+            context_management={
+                "context_window_tokens": 1048576,
+                "compaction_target_tokens": 48000,
+            }
+        )
+        assert settings.prompt_ceiling_tokens() == 1048576
+        assert settings.compaction_budget_tokens() == 48000
 
     def test_a_window_with_a_cap_derives_the_budget(self) -> None:
         settings = Settings(

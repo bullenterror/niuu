@@ -2455,7 +2455,7 @@ class DriveLoop:
             attempted_items = [str(item).strip() for item in attempted if str(item).strip()]
             if attempted_items:
                 parts.append("Already attempted:")
-                parts.extend(f"  - {item}" for item in attempted_items[:6])
+                parts.extend(f"  - {item}" for item in attempted_items)
         if help_recommendation:
             parts.append(f"Previous recommendation: {help_recommendation}")
         if isinstance(context, dict) and context:
