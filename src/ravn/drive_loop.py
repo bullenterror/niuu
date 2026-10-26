@@ -55,7 +55,11 @@ from ravn.config import (
 )
 from ravn.domain.budget import DailyBudgetTracker, resolve_task_cost_usd
 from ravn.domain.events import RavnEvent, RavnEventType
-from ravn.domain.exceptions import LLMError, PromptBudgetExceededError
+from ravn.domain.exceptions import (
+    LLMError,
+    PromptBudgetExceededError,
+    UnboundOperatorReplyError,
+)
 from ravn.domain.help_needed import build_help_needed_event
 from ravn.domain.models import AgentTask, OutputMode, TurnResult
 from ravn.domain.resident_continuation import validate_resident_working_state
@@ -2387,9 +2391,21 @@ class DriveLoop:
         self,
         content: str,
         metadata: dict[str, Any] | None,
+        *,
+        unbound_case_id: str = "",
     ) -> str:
         """Render a directed human reply as initiative context for the target persona."""
         trimmed = content.strip()
+        if unbound_case_id:
+            return "\n".join(
+                [
+                    "This is a directed human reply to your question in resident case "
+                    f"{unbound_case_id}, which has no open operator question: it was "
+                    "answered, withdrawn or superseded, or never persisted. It was not "
+                    "applied as an answer to any case. Judge it as new operator input.",
+                    self._directed_message_context(content, metadata),
+                ]
+            )
         if not metadata:
             return "\n".join(
                 [
@@ -2514,15 +2530,25 @@ class DriveLoop:
         output_mode: OutputMode = OutputMode.SURFACE,
     ) -> bool:
         """Enqueue a directed message from the browser as an agent task."""
+        unbound_case_id = ""
         for handler in list(self._directed_message_interceptors):
             try:
                 if await handler(content, metadata):
                     logger.info("drive_loop: directed message consumed by interceptor")
                     return True
+            except UnboundOperatorReplyError as exc:
+                # The human's words still reach the resident, labelled as what
+                # they are: a reply whose question is no longer open.
+                logger.error("drive_loop: %s; delivering it as unbound operator input", exc)
+                unbound_case_id = exc.case_id
             except Exception:
                 logger.exception("drive_loop: directed message interceptor failed")
 
-        if output_mode == OutputMode.SURFACE and await self._try_steer_active_agent(content):
+        if (
+            not unbound_case_id
+            and output_mode == OutputMode.SURFACE
+            and await self._try_steer_active_agent(content)
+        ):
             return True
 
         import time
@@ -2542,7 +2568,9 @@ class DriveLoop:
         task = AgentTask(
             task_id=task_id,
             title="Directed message from user",
-            initiative_context=self._directed_message_context(content, metadata),
+            initiative_context=self._directed_message_context(
+                content, metadata, unbound_case_id=unbound_case_id
+            ),
             triggered_by="skuld:directed_message",
             output_mode=output_mode,
             persona=persona,
@@ -4745,7 +4773,15 @@ class DriveLoop:
         else:
             mesh_available = True
 
-        if verdict == "help_needed" and not task.resident_help_published:
+        # With a resident runtime, its disposition alone decides whether the
+        # operator is asked: it persists the question first, then publishes it
+        # with the case id. Publishing from the outcome as well sent questions
+        # the resident had not persisted, so their replies could never bind.
+        if (
+            verdict == "help_needed"
+            and not task.resident_help_published
+            and self._resident_runtime is None
+        ):
             attempted = outcome_fields.get("attempted")
             if not isinstance(attempted, list):
                 attempted = []
@@ -4758,9 +4794,6 @@ class DriveLoop:
                 "workflow_parent_event_id": task.workflow_parent_event_id,
                 "workflow_node_id": task.workflow_node_id,
                 "session_id": task.session_id,
-                # The room hands this back with the human's reply; without the
-                # case id a resident could not tell which question it answers.
-                **({"resident_case_id": task.resident_case_id} if task.resident_case_id else {}),
             }
             help_event = build_help_needed_event(
                 source=self._source_id,

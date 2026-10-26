@@ -1033,6 +1033,44 @@ class TestTelegramChannelMocked:
         assert "Need operator input" in payload["reply_context"]["content"]
 
     @pytest.mark.asyncio
+    async def test_help_reply_names_the_case_of_the_question_it_answers(self, channel):
+        def sent_message(message_id: int) -> MagicMock:
+            sent = MagicMock()
+            sent.message_id = message_id
+            sent.chat.id = 12345
+            return sent
+
+        def question(case_id: str) -> dict:
+            return {
+                "type": "room_notification",
+                "notificationType": "help_needed",
+                "participantId": "regin",
+                "participant": {"persona": "Regin"},
+                "summary": f"Question for {case_id}",
+                "reason": "needs_context",
+                "context": {"resident_case_id": case_id},
+            }
+
+        channel._bot.send_message.return_value = sent_message(501)
+        await channel.send_event(question("case-older"))
+        channel._bot.send_message.return_value = sent_message(502)
+        await channel.send_event(question("case-newer"))
+
+        on_message = AsyncMock()
+        channel._on_message = on_message
+        update = MagicMock()
+        update.effective_chat.id = 12345
+        update.message.text = "It is intended behaviour"
+        update.message.message_id = 503
+        update.message.reply_to_message.message_id = 501
+        update.message.message_thread_id = None
+
+        await channel._handle_text_message(update, None)
+
+        payload = on_message.await_args.args[0]
+        assert payload["reply_context"]["help_context"] == {"resident_case_id": "case-older"}
+
+    @pytest.mark.asyncio
     async def test_room_message_reply_retains_peer_trace_and_prior_content(self, channel):
         sent = MagicMock()
         sent.message_id = 322

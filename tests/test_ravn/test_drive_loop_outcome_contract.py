@@ -2935,23 +2935,25 @@ recommendation: choose whether to optimize for latency or quality
         )
 
     @pytest.mark.asyncio
-    async def test_a_resident_help_request_names_the_case_its_reply_resumes(self) -> None:
-        """The room returns this context with the human's reply; without the case id
-        the resident could not bind the reply to its question (it never did)."""
+    async def test_a_resident_outcome_never_publishes_its_own_help_request(self) -> None:
+        """With a resident runtime its disposition alone asks the operator, after the
+        question is persisted. An outcome-path request reached the operator for a
+        question the runtime had not persisted (a spent budget), so no reply bound."""
         dl = _make_drive_loop()
         dl._mesh = AsyncMock()
         dl._skuld_channel = AsyncMock()
+        dl._resident_runtime = object()
         dl._source_id = "drive_loop"
         dl._persona_config = SimpleNamespace(
-            name="council-chair",
+            name="regin",
             produces=SimpleNamespace(
-                event_type="council.chair.turn.completed",
-                event_type_map={"help_needed": "council.human_input.requested"},
+                event_type="valkyrie.judgment.proposed",
+                event_type_map={"help_needed": "valkyrie.help.requested"},
             ),
         )
         task = _make_agent_task(task_id="task-steward")
-        task.root_correlation_id = "resident-stewardship-20261025T130015Z"
-        task.resident_case_id = "resident-stewardship-20261025T130015Z"
+        task.root_correlation_id = "regin-operator-room"
+        task.resident_case_id = "resident-stewardship-20261026T002939Z"
         response_text = """\
 ---outcome---
 verdict: help_needed
@@ -2963,14 +2965,10 @@ reason: needs_context
 
         await dl._emit_mesh_outcome_event(task, response_text, success=True)
 
-        help_event = next(
-            call.args[0]
-            for call in dl._mesh.publish.await_args_list
-            if call.kwargs.get("topic") == "help_needed"
-        )
-        assert help_event.payload["context"]["resident_case_id"] == (
-            "resident-stewardship-20261025T130015Z"
-        )
+        topics = [call.kwargs.get("topic") for call in dl._mesh.publish.await_args_list]
+        assert "help_needed" not in topics
+        emitted = [call.args[0].type for call in dl._skuld_channel.emit.await_args_list]
+        assert "help_needed" not in emitted
 
     @pytest.mark.asyncio
     async def test_help_needed_without_question_is_failed_without_help_or_alias(self) -> None:

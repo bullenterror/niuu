@@ -1311,11 +1311,16 @@ class TelegramChannel(MessageChannel):
         trace_context = event.get("trace_context")
         if not isinstance(trace_context, dict):
             trace_context = {}
-        reply_context = {
+        reply_context: dict[str, Any] = {
             "event_type": str(event.get("type") or "room_message"),
             "content": rendered_text[:TELEGRAM_MAX_MESSAGE_LENGTH],
             "participant_id": peer_id,
         }
+        help_context = event.get("context")
+        if event.get("notificationType") == "help_needed" and isinstance(help_context, dict):
+            # The room keeps only a peer's latest question; this message's own
+            # context lets a reply to an older question name the case it answers.
+            reply_context["help_context"] = dict(help_context)
         for result in self._last_send_results:
             message_id = result.get("message_id")
             if not isinstance(message_id, int):

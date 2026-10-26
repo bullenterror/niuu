@@ -583,7 +583,9 @@ async def test_invalid_outcome_cannot_replace_state_or_queue_a_continuation(tmp_
 
 
 @pytest.mark.asyncio
-async def test_budget_stops_another_operator_round_trip(tmp_path) -> None:
+async def test_a_spent_continuation_budget_still_asks_the_operator(tmp_path) -> None:
+    """The budget bounds what the resident does alone. Swallowing its question at the
+    cap left it needing input with nothing an answer could bind to."""
     state = LocalResidentState(tmp_path)
     queued: list[AgentTask] = []
 
@@ -606,8 +608,9 @@ async def test_budget_stops_another_operator_round_trip(tmp_path) -> None:
         response_text="response",
     )
 
-    assert disposition.kind is ContinuationDecisionKind.STOP
-    assert "turn budget" in disposition.reason
+    assert disposition.kind is ContinuationDecisionKind.ASK_OPERATOR
+    assert disposition.question == "Which environment is in scope?"
+    assert await state.read_operator_needed(disposition.case_id) is not None
     assert queued == []
 
 

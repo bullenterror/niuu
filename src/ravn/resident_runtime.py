@@ -16,6 +16,7 @@ from typing import Any
 from niuu.domain.notifications import MAX_BODY_CHARS
 from niuu.domain.resident_notifications import AttentionInputKind
 from niuu.observability import get_observability
+from ravn.domain.exceptions import UnboundOperatorReplyError
 from ravn.domain.models import AgentTask, OutputMode, TokenUsage, TurnResult
 from ravn.domain.resident_continuation import (
     ContinuationDecisionKind,
@@ -927,20 +928,10 @@ class ResidentRuntime:
             )
 
         if _asks_operator(fields, control):
-            budget_reason = _budget_stop_reason(
-                turn_index=turn_index,
-                total_tokens=cumulative.total_tokens,
-                max_turns=self._max_turns,
-                max_tokens=self._max_tokens,
-            )
-            if budget_reason:
-                return ResidentTurnDisposition(
-                    kind=ContinuationDecisionKind.STOP,
-                    case_id=case_id,
-                    turn_ref=turn_ref,
-                    budget_ref=budget_ref,
-                    reason=budget_reason,
-                )
+            # The continuation budget bounds what the resident does on its own.
+            # A question hands the case to a human, whose answer is the only way
+            # it continues, so the budget never swallows one: stopping here left
+            # the resident needing input with no question anyone could answer.
             redirected = await self._redirect_to_known_resolution(
                 task=task,
                 record=record,
@@ -1524,36 +1515,35 @@ class ResidentRuntime:
         content: str,
         metadata: dict[str, Any] | None,
     ) -> bool:
+        """Bind a human reply to the resident case whose question it answers.
+
+        A reply names its case through the help context its question carried:
+        the exact message the human replied to first, then the room's latest
+        question for this resident. A named case without an open question
+        raises — binding the reply elsewhere, or reading it as fresh chat, would
+        hide that the question and its answer came apart. A message that names
+        no case binds only when exactly one question is open.
+        """
         metadata = metadata or {}
-        context = metadata.get("help_context")
-        if not isinstance(context, dict):
-            context = {}
-        case_id = str(
-            metadata.get("resident_case_id")
-            or metadata.get("case_id")
-            or context.get("resident_case_id")
-            or context.get("case_id")
-            or ""
-        ).strip()
-        if not case_id:
-            # A reply routed through the room carries the asking turn's root
-            # correlation, which is the case id for a resident case. Bind to it
-            # only when that case really is waiting on the operator.
-            for candidate in (
-                context.get("root_correlation_id"),
-                metadata.get("root_correlation_id"),
-            ):
-                candidate = str(candidate or "").strip()
-                if candidate and await self._state.read_operator_needed(candidate) is not None:
-                    case_id = candidate
-                    break
-        if not case_id:
+        case_id = _reply_case_id(metadata)
+        if case_id:
+            if await self._state.read_operator_needed(case_id) is None:
+                get_observability().event(
+                    "ravn.resident.operator_reply.unbound",
+                    attributes={
+                        "ravn.resident.id": self._resident_id,
+                        "ravn.resident.case_id": case_id,
+                    },
+                    content={"reply": content},
+                )
+                raise UnboundOperatorReplyError(case_id)
+        else:
             pending = await self._state.list_operator_needed()
             if len(pending) != 1:
                 return False
             case_id = _metadata(pending[0].content, "case_id")
-        if not case_id or await self._state.read_operator_needed(case_id) is None:
-            return False
+            if not case_id or await self._state.read_operator_needed(case_id) is None:
+                return False
         trace_context = metadata.get("trace_context")
         if not isinstance(trace_context, dict):
             trace_context = {}
@@ -2038,6 +2028,20 @@ def _operator_question(fields: dict[str, Any], record: ResidentTurnRecord) -> st
     if record.selected_next_action is not None:
         return f"May I proceed with: {record.selected_next_action.action}?"
     return str(fields.get("recommendation") or "What information should I use to continue?")
+
+
+def _reply_case_id(metadata: Mapping[str, Any]) -> str:
+    """Return the resident case a directed reply names, most specific first."""
+    reply_context = metadata.get("reply_context")
+    replied_help = reply_context.get("help_context") if isinstance(reply_context, Mapping) else None
+    sources = (metadata, replied_help, metadata.get("help_context"))
+    for source in sources:
+        if not isinstance(source, Mapping):
+            continue
+        case_id = str(source.get("resident_case_id") or source.get("case_id") or "").strip()
+        if case_id:
+            return case_id
+    return ""
 
 
 def _budget_stop_reason(
