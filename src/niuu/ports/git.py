@@ -4,7 +4,15 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from niuu.domain.models import CIStatus, GitProviderType, PullRequest, RepoInfo
+from niuu.domain.models import (
+    CIStatus,
+    CommitDetail,
+    GitProviderType,
+    PullRequest,
+    RefChecks,
+    RefComparison,
+    RepoInfo,
+)
 
 
 class GitProvider(ABC):
@@ -101,6 +109,54 @@ class GitProvider(ABC):
             List of branch names.
         """
 
+    @abstractmethod
+    async def get_commit(self, repo_url: str, ref: str) -> CommitDetail:
+        """Read one commit: identity, message and every changed file with its patch.
+
+        Args:
+            repo_url: Repository URL or shorthand.
+            ref: Commit SHA, branch or tag.
+
+        Returns:
+            The commit with all its changed files. A patch the provider
+            omitted is ``None`` with ``patch_omitted_reason`` set.
+
+        Raises:
+            GitRepoNotFoundError: The repository or the ref does not exist.
+            GitAuthError: The credentials cannot read the repository.
+        """
+
+    @abstractmethod
+    async def compare_refs(self, repo_url: str, base: str, head: str) -> RefComparison:
+        """Compare ``base...head``: ahead/behind counts, commits and changed files.
+
+        Args:
+            repo_url: Repository URL or shorthand.
+            base: Base commit SHA, branch or tag.
+            head: Head commit SHA, branch or tag.
+
+        Raises:
+            GitRepoNotFoundError: The repository or either ref does not exist.
+            GitAuthError: The credentials cannot read the repository.
+        """
+
+    @abstractmethod
+    async def get_ref_checks(self, repo_url: str, ref: str) -> RefChecks:
+        """Read CI / check results for a branch, tag or commit, with no PR needed.
+
+        Args:
+            repo_url: Repository URL or shorthand.
+            ref: Commit SHA, branch or tag.
+
+        Returns:
+            The checks attached to the commit ``ref`` resolves to. A commit
+            nothing has run on yields an empty ``checks`` tuple.
+
+        Raises:
+            GitRepoNotFoundError: The repository or the ref does not exist.
+            GitAuthError: The credentials cannot read the repository.
+        """
+
 
 class GitWorkflowProvider(ABC):
     """Port for git workflow operations (branches, PRs, CI status).
@@ -158,3 +214,12 @@ class GitAuthError(Exception):
 
 class GitRepoNotFoundError(Exception):
     """Raised when a git repository is not found."""
+
+
+class GitProviderResponseError(RuntimeError):
+    """Raised when a git provider answers a read with something unusable.
+
+    For example an incomplete comparison, a missing identity field or a
+    pagination that never advances. The caller must treat the read as failed;
+    the message names what the provider got wrong.
+    """
