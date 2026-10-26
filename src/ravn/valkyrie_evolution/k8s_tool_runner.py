@@ -1166,11 +1166,19 @@ class KubernetesJobExecutor:
         items = getattr(pods, "items", pods)
         if not items:
             return ""
-        return await core.read_namespaced_pod_log(
+        # Raw body: with the default _preload_content the client parses a log
+        # that happens to be JSON and returns str(dict) — single quotes — so
+        # every tool's JSON result read back as non-JSON output.
+        response = await core.read_namespaced_pod_log(
             _pod_name(items[0]),
             self._config.namespace,
             limit_bytes=self._config.output_limit_bytes + 1,
+            _preload_content=False,
         )
+        try:
+            return await response.text()
+        finally:
+            response.release()
 
     async def _exit_code(self, batch: Any, run_name: str) -> int:
         status = _job_status(await batch.read_namespaced_job(run_name, self._config.namespace))

@@ -588,6 +588,20 @@ class TestContainerStartedAt:
         assert _container_started_at(object()) is None
 
 
+class _RawLogResponse:
+    """What kubernetes_asyncio returns for _preload_content=False."""
+
+    def __init__(self, body: str) -> None:
+        self._body = body
+        self.released = False
+
+    async def text(self) -> str:
+        return self._body
+
+    def release(self) -> None:
+        self.released = True
+
+
 class _FakeBatchV1:
     def __init__(self) -> None:
         self.jobs: dict[str, Any] = {}
@@ -620,8 +634,11 @@ class _FakeCoreV1:
         pod = type("Pod", (), {"metadata": type("M", (), {"name": "pod-1"})()})()
         return type("List", (), {"items": [pod]})()
 
-    async def read_namespaced_pod_log(self, name: str, namespace: str, *, limit_bytes: int) -> str:
-        return self.log
+    async def read_namespaced_pod_log(
+        self, name: str, namespace: str, *, limit_bytes: int, _preload_content: bool
+    ) -> _RawLogResponse:
+        assert _preload_content is False  # a parsed JSON log comes back as str(dict)
+        return _RawLogResponse(self.log)
 
     async def delete_namespaced_secret(self, name, namespace) -> None:
         self.deleted.append(name)
@@ -1203,8 +1220,11 @@ class _FakeVerifyCoreV1:
         pod = {"metadata": {"name": f"{job_name}-pod"}, "status": dict(self._pod_status)}
         return SimpleNamespace(items=[pod])
 
-    async def read_namespaced_pod_log(self, name: str, namespace: str, *, limit_bytes: int) -> str:
-        return self.log
+    async def read_namespaced_pod_log(
+        self, name: str, namespace: str, *, limit_bytes: int, _preload_content: bool
+    ) -> _RawLogResponse:
+        assert _preload_content is False  # a parsed JSON log comes back as str(dict)
+        return _RawLogResponse(self.log)
 
 
 def _verify_executor(
