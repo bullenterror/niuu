@@ -1335,3 +1335,28 @@ async def test_an_unused_retirement_the_window_no_longer_supports_is_undone(
     assert restored == ["k8s_quantity_parse"]
     assert learned_tool_path(code_dir, "k8s_quantity_parse").is_file()
     assert LearnedToolRetirements(artifacts_dir).get("k8s_quantity_parse") is None
+
+
+async def test_judged_verdicts_survive_a_pass_cut_short(tmp_path: Path) -> None:
+    """A rollout part way through the first pass must not throw its judging away."""
+    _install(tmp_path, "alpha_tool")
+    _install(tmp_path, "beta_tool")
+    _install(tmp_path, "gamma_tool")
+
+    class RolloutError(Exception):
+        pass
+
+    class FlakyMatcher(FakeMatcher):
+        async def same_capability(self, subject, candidates, *, as_revision=False):  # type: ignore[no-untyped-def]
+            if self.calls == 1:
+                raise RolloutError
+            return await super().same_capability(subject, candidates, as_revision=as_revision)
+
+    first = FlakyMatcher()
+    with pytest.raises(RolloutError):
+        await LearnedToolCurator(state_dir=tmp_path, matcher=first).plan()
+    second = FakeMatcher()
+    await LearnedToolCurator(state_dir=tmp_path, matcher=second).plan()
+
+    # alpha's pairs were saved before the interruption; only the rest are judged.
+    assert second.calls == 1

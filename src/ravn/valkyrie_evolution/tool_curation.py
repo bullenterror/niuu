@@ -1192,6 +1192,7 @@ class LearnedToolCurator:
         if self._matcher is not None:
             verdicts = self._load_verdicts()
             descriptors = [entry.descriptor() for entry in entries]
+            keys = [item.key for item in descriptors]
             for subject in descriptors:
                 others = [item for item in descriptors if item.key != subject.key]
                 if all(_pair_key(subject.key, other.key) in verdicts for other in others):
@@ -1211,29 +1212,38 @@ class LearnedToolCurator:
                         "reason": (verdict.reason if verdict else "below the similarity shortlist"),
                         "similarity": verdict.similarity if verdict else None,
                     }
+                # Saved after every judged tool, not once at the end: a first
+                # pass is tens of judge calls, and a resident restarted part
+                # way (a rollout) would otherwise start the whole pass again,
+                # every time, and never finish it.
+                self._save_verdicts(verdicts, live=set(keys))
             names = {entry.descriptor().key: entry.name for entry in entries}
             for pair, verdict in verdicts.items():
                 left, _, right = pair.partition("|")
                 if verdict.get("same") and left in names and right in names:
                     union(names[left], names[right])
-            if self._persist:
-                live = set(names)
-                _write_json_atomic(
-                    self._verdicts_path,
-                    {
-                        "version": 1,
-                        "pairs": {
-                            pair: value
-                            for pair, value in verdicts.items()
-                            if set(pair.split("|")) <= live
-                        },
-                    },
-                )
+            self._save_verdicts(verdicts, live=set(names))
 
         groups: dict[str, set[str]] = {}
         for entry in entries:
             groups.setdefault(find(entry.name), set()).add(entry.name)
         return [members for members in groups.values() if len(members) > 1], judged
+
+    def _save_verdicts(self, verdicts: Mapping[str, Mapping[str, Any]], *, live: set[str]) -> None:
+        """Persist the verdicts between tools that are still installed."""
+        if not self._persist:
+            return
+        _write_json_atomic(
+            self._verdicts_path,
+            {
+                "version": 1,
+                "pairs": {
+                    pair: dict(value)
+                    for pair, value in verdicts.items()
+                    if set(pair.split("|")) <= live
+                },
+            },
+        )
 
     def _load_verdicts(self) -> dict[str, dict[str, Any]]:
         payload = _read_json_object(self._verdicts_path, what="capability verdict cache")
