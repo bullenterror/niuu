@@ -39,6 +39,7 @@ from ravn.adapters.reflection.lessons import (
     frontmatter_values,
 )
 from ravn.config import PostSessionReflectionConfig
+from ravn.domain.models import StopReason
 from ravn.ports.llm import LLMPort
 from ravn.resident_text import compact_line, significant_words, texts_overlap, texts_similar
 
@@ -49,6 +50,17 @@ if TYPE_CHECKING:
     from sleipnir.ports.events import SleipnirSubscriber, Subscription
 
 logger = logging.getLogger(__name__)
+
+
+class ReflectionError(RuntimeError):
+    """The reflection model gave no usable answer for a session.
+
+    Distinct from the model answering ``null`` ("nothing worth learning"),
+    which is an answer. This is the model failing to answer at all, and is
+    raised so the loss of a session's lesson is visible instead of reading as
+    "no learning extracted".
+    """
+
 
 _RAVN_SESSION_ENDED = "ravn.session.ended"
 _RAVN_TASK_COMPLETED = "ravn.task.completed"
@@ -239,22 +251,16 @@ class PostSessionReflectionService:
         if event.event_type == _RAVN_SESSION_ENDED:
             await self._on_session_ended(event)
             return
-        try:
-            await self._record_promotion_evidence(event)
-        except Exception as exc:
-            logger.warning(
-                "PostSessionReflectionService: failed to record promotion evidence: %s",
-                exc,
-            )
+        await self._record_promotion_evidence(event)
 
     async def _on_session_ended(self, event: SleipnirEvent) -> None:
-        """Handle a ``ravn.session.ended`` event — best-effort, never raises."""
-        try:
-            await self._process(event.payload)
-        except Exception as exc:
-            logger.warning(
-                "PostSessionReflectionService: unhandled error processing event: %s", exc
-            )
+        """Handle a ``ravn.session.ended`` event.
+
+        Failures propagate to the Sleipnir consumer, which logs them with a
+        traceback (or redelivers on a broker-backed transport): a reflection
+        that could not run is a lost lesson, not an empty one.
+        """
+        await self._process(event.payload)
 
     async def _record_promotion_evidence(self, event: SleipnirEvent) -> None:
         """Apply explicit feedback, verification, or review to one candidate."""
@@ -383,57 +389,52 @@ class PostSessionReflectionService:
             questions=_REPO_QUESTIONS if repo_slug else _GENERIC_QUESTIONS,
         )
 
+        session_id = payload.get("session_id", "unknown")
+        model = self._config.llm_alias
         attempts = 2
-        for attempt in range(attempts):
-            try:
-                response = await self._llm.generate(
-                    messages=[{"role": "user", "content": prompt}],
-                    tools=[],
-                    system=_REFLECTION_SYSTEM,
-                    model=self._config.llm_alias,
-                    max_tokens=self._config.max_tokens,
+        problem = ""
+        for attempt in range(1, attempts + 1):
+            response = await self._llm.generate(
+                messages=[{"role": "user", "content": prompt}],
+                tools=[],
+                system=_REFLECTION_SYSTEM,
+                model=model,
+                max_tokens=self._config.max_tokens,
+            )
+            if response.stop_reason == StopReason.MAX_TOKENS:
+                # Asking again at the same budget fails the same way.
+                raise ReflectionError(
+                    f"reflection for session {session_id} was cut off: model {model!r} "
+                    f"used its whole {self._config.max_tokens}-token budget "
+                    f"(reasoning {len(response.reasoning or '')} chars, answer "
+                    f"{len(response.content or '')} chars); raise reflection.max_tokens"
                 )
-            except Exception as exc:
-                logger.warning("PostSessionReflectionService: LLM call failed: %s", exc)
-                return None
 
-            raw = response.content.strip()
+            raw = (response.content or "").strip()
             if not raw:
-                if attempt + 1 < attempts:
-                    logger.info("PostSessionReflectionService: empty LLM response; retrying")
-                    continue
-                return None
-
-            found_json, parsed = _parse_reflection_json(raw)
-            if found_json:
-                break
-
-            if attempt + 1 < attempts:
-                logger.info(
-                    "PostSessionReflectionService: malformed JSON from LLM; retrying excerpt=%r",
-                    _compact_log_excerpt(raw),
+                problem = "an empty reply"
+            else:
+                found_json, parsed = _parse_reflection_json(raw)
+                if found_json and (parsed is None or isinstance(parsed, dict)):
+                    return parsed
+                problem = (
+                    f"JSON that is not an object ({type(parsed).__name__})"
+                    if found_json
+                    else f"no JSON (excerpt {_compact_log_excerpt(raw)!r})"
                 )
-                continue
+            if attempt < attempts:
+                logger.info(
+                    "PostSessionReflectionService: %s from %r for session %s; asking again",
+                    problem,
+                    model,
+                    session_id,
+                )
 
-            logger.warning(
-                "PostSessionReflectionService: malformed JSON from LLM excerpt=%r",
-                _compact_log_excerpt(raw),
-            )
-            return None
-        else:
-            return None
-
-        if parsed is None:
-            return None
-
-        if not isinstance(parsed, dict):
-            logger.warning(
-                "PostSessionReflectionService: LLM returned non-object JSON: %s",
-                type(parsed).__name__,
-            )
-            return None
-
-        return parsed
+        raise ReflectionError(
+            f"reflection for session {session_id} got {problem} from model {model!r} "
+            f"after {attempts} attempts; set reflection.llm_alias to a model that follows "
+            "JSON instructions, or reflection.enabled: false to stop reflecting"
+        )
 
     # ------------------------------------------------------------------
     # Mímir write
@@ -671,11 +672,9 @@ class PostSessionReflectionService:
         if not keywords:
             return None
 
-        try:
-            results = await self._mimir.search(keywords)
-        except Exception as exc:
-            logger.warning("PostSessionReflectionService: Mímir search failed: %s", exc)
-            return None
+        # A failed search must not read as "no matching lesson": that records the
+        # same lesson again as a new one-observation candidate.
+        results = await self._mimir.search(keywords)
 
         matches = [
             page
@@ -974,7 +973,7 @@ def _parse_yamlish_json(text: str) -> tuple[bool, object | None]:
         import yaml  # PyYAML is already present via pydantic-settings[yaml].
 
         parsed = yaml.safe_load(stripped)
-    except Exception:
+    except yaml.YAMLError:
         return False, None
     if parsed is None or isinstance(parsed, dict | list):
         return True, parsed
