@@ -1236,3 +1236,102 @@ def test_the_plan_command_refuses_when_curation_is_off(tmp_path: Path) -> None:
         result = CliRunner().invoke(commands.app, ["learned-tools-plan"])
 
     assert result.exit_code == 1
+
+
+def test_pre_ledger_history_bounds_the_window_so_one_fast_first_use_cannot_set_it(
+    tmp_path: Path,
+) -> None:
+    """Live on vanaheim one 29-second first use made every older unused tool look dead."""
+    _install(tmp_path, "busy", created_days_ago=30)
+    _write_lifecycle(
+        tmp_path,
+        {"busy": {"run_count": 500, "last_used_at": _iso(2), "created_at": _iso(30)}},
+    )
+    ledger = _ledger(tmp_path)
+    ledger.record_install("fresh", "f")
+    ledger.record_run("fresh", "f", True)
+
+    window = ledger.first_use_window()
+
+    assert window.tool == "busy"
+    assert window.basis == "bound"
+    assert window.seconds == pytest.approx(28 * 86400, rel=0.01)
+    # Frozen: more use later does not widen it.
+    ledger.record_run("busy", "b", True)
+    assert ledger.first_use_window().seconds == pytest.approx(28 * 86400, rel=0.01)
+
+
+def test_a_ledger_seeded_before_bounds_existed_gets_them_on_load(tmp_path: Path) -> None:
+    ledger = _ledger(tmp_path)
+    ledger.path.parent.mkdir(parents=True)
+    ledger.path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "tools": {
+                    "busy": {
+                        "name": "busy",
+                        "installed_at": _iso(10),
+                        "last_used_at": _iso(1),
+                        "runs": 40,
+                        "seeded_from": "skill_management",
+                    }
+                },
+            }
+        )
+    )
+
+    window = ledger.first_use_window()
+
+    assert window.basis == "bound"
+    assert window.seconds == pytest.approx(9 * 86400, rel=0.01)
+
+
+async def test_an_unused_retirement_the_window_no_longer_supports_is_undone(
+    tmp_path: Path,
+) -> None:
+    _install(tmp_path, "k8s_quantity_parse", created_days_ago=0.1)
+    code_dir, artifacts_dir = learned_tool_storage(tmp_path)
+    retire_learned_tool(
+        tools_dir=code_dir,
+        artifacts_dir=artifacts_dir,
+        name="k8s_quantity_parse",
+        reason=RETIRED_UNUSED,
+        detail="never run",
+    )
+    ledger = _ledger(tmp_path)
+    ledger.record_install("k8s_quantity_parse", "learned-tool:k8s_quantity_parse")
+    payload = json.loads(ledger.path.read_text())
+    payload["tools"]["k8s_quantity_parse"]["installed_at"] = _iso(0.1)
+    payload["tools"]["older"] = {
+        "name": "older",
+        "installed_at": _iso(9),
+        "first_used_at": _iso(2),
+        "first_use_observed": True,
+        "runs": 1,
+    }
+    ledger.path.write_text(json.dumps(payload))
+    restored: list[str] = []
+
+    class Skills:
+        def status(self, name: str) -> str | None:
+            return "active" if restored else "archived"
+
+        def lifecycle_metadata(self, name: str) -> dict[str, Any]:
+            return {}
+
+        async def archive(self, name: str) -> None:
+            raise AssertionError("nothing should be retired")
+
+        async def restore(self, name: str) -> None:
+            restored.append(name)
+
+    curator = LearnedToolCurator(state_dir=tmp_path, skills=Skills())
+    plan = await curator.plan()
+    summary = await curator.curate()
+
+    assert plan.restore == ["k8s_quantity_parse"]
+    assert summary["restored"] == ["k8s_quantity_parse"]
+    assert restored == ["k8s_quantity_parse"]
+    assert learned_tool_path(code_dir, "k8s_quantity_parse").is_file()
+    assert LearnedToolRetirements(artifacts_dir).get("k8s_quantity_parse") is None

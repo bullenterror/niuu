@@ -166,6 +166,12 @@ class ToolUsage:
     repairs: int = 0
     #: Where the pre-ledger history came from ("" for a tool first seen here).
     seeded_from: str = ""
+    #: For a tool used before the ledger existed, whose first use was not
+    #: recorded: the longest its first use can have taken (install to its last
+    #: use before the ledger). An upper bound, frozen once set, so it never
+    #: grows with later use.
+    first_use_wait_bound_seconds: float | None = None
+    bound_frozen: bool = False
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> ToolUsage:
@@ -182,19 +188,54 @@ class ToolUsage:
             return None
         return (first - installed).total_seconds()
 
+    def first_use_evidence(self) -> tuple[float, str] | None:
+        """``(seconds, basis)`` this tool contributes to the never-used window.
+
+        ``observed`` when its first use was recorded, ``bound`` when only an
+        upper bound is known. Counting the bound keeps the window honest on a
+        resident whose history predates the ledger: one fast first use seen
+        today says nothing about how long older tools waited.
+        """
+        wait = self.first_use_wait_seconds()
+        if wait is not None:
+            return wait, "observed"
+        if self.first_use_wait_bound_seconds is not None:
+            return self.first_use_wait_bound_seconds, "bound"
+        return None
+
+    def freeze_bound(self) -> None:
+        """Record the first-use bound of a tool seeded with unrecorded first use."""
+        if self.bound_frozen:
+            return
+        self.bound_frozen = True
+        if self.first_use_observed or not self.runs:
+            return
+        installed = _parse_time(self.installed_at)
+        last = _parse_time(self.last_used_at)
+        if installed is None or last is None or last < installed:
+            return
+        self.first_use_wait_bound_seconds = (last - installed).total_seconds()
+
 
 @dataclass(frozen=True)
 class FirstUseWindow:
     """The never-used window, derived from this resident's own tools."""
 
-    #: Longest observed install-to-first-use wait; ``None`` until one is seen.
+    #: Longest install-to-first-use wait known here; ``None`` until there is one.
     seconds: float | None
     #: The tool that set it, so the number can be checked.
     tool: str
     observations: int
+    #: ``observed`` or ``bound`` (see :meth:`ToolUsage.first_use_evidence`).
+    basis: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        return {"seconds": self.seconds, "tool": self.tool, "observations": self.observations}
+        return {
+            "seconds": self.seconds,
+            "tool": self.tool,
+            "observations": self.observations,
+            "basis": self.basis,
+        }
 
 
 class LearnedToolUsageLedger:
@@ -294,16 +335,17 @@ class LearnedToolUsageLedger:
 
     def first_use_window(self) -> FirstUseWindow:
         longest: float | None = None
-        tool = ""
+        tool = basis = ""
         observations = 0
         for usage in self._load().values():
-            wait = usage.first_use_wait_seconds()
-            if wait is None:
+            evidence = usage.first_use_evidence()
+            if evidence is None:
                 continue
             observations += 1
-            if longest is None or wait > longest:
-                longest, tool = wait, usage.name
-        return FirstUseWindow(seconds=longest, tool=tool, observations=observations)
+            if longest is None or evidence[0] > longest:
+                longest, basis = evidence
+                tool = usage.name
+        return FirstUseWindow(seconds=longest, tool=tool, observations=observations, basis=basis)
 
     # -- storage ------------------------------------------------------------
 
@@ -339,11 +381,17 @@ class LearnedToolUsageLedger:
                 f"learned-tool usage ledger at {self._path} has an unknown layout; "
                 "move it aside to re-seed it from skill_management.json"
             )
-        return {
+        entries = {
             str(name): ToolUsage.from_dict({**value, "name": str(name)})
             for name, value in tools.items()
             if isinstance(value, dict)
         }
+        for usage in entries.values():
+            # Ledgers seeded before bounds existed get theirs on first load;
+            # the next write persists it.
+            if usage.seeded_from == "skill_management":
+                usage.freeze_bound()
+        return entries
 
     def _seed(self) -> dict[str, ToolUsage]:
         """Build the first ledger from the envelopes and the lifecycle registry."""
@@ -382,6 +430,8 @@ class LearnedToolUsageLedger:
                 # One run: its last use is its first, so the wait is known.
                 usage.first_used_at = last_used
                 usage.first_use_observed = True
+            if row:
+                usage.freeze_bound()
             entries[name] = usage
         if self._persist:
             with _lock_for(self._path):
@@ -855,6 +905,8 @@ class CurationPlan:
 
     installed: int
     retire: list[RetirementDecision] = field(default_factory=list)
+    #: Tools retired as unused that the current window no longer justifies.
+    restore: list[str] = field(default_factory=list)
     keep: list[str] = field(default_factory=list)
     groups: list[dict[str, Any]] = field(default_factory=list)
     window: FirstUseWindow = field(default_factory=lambda: FirstUseWindow(None, "", 0))
@@ -864,6 +916,7 @@ class CurationPlan:
         return {
             "installed": self.installed,
             "retire": [decision.to_dict() for decision in self.retire],
+            "restore": list(self.restore),
             "keep": list(self.keep),
             "groups": list(self.groups),
             "never_used_window": self.window.to_dict(),
@@ -959,11 +1012,49 @@ class LearnedToolCurator:
 
         plan.retire = sorted(decided.values(), key=lambda decision: decision.name)
         plan.keep = sorted(entry.name for entry in entries if entry.name not in decided)
+        plan.restore = self._unjustified_unused(usage, plan.window, now)
         return plan
+
+    def _unjustified_unused(
+        self,
+        usage: Mapping[str, ToolUsage],
+        window: FirstUseWindow,
+        now: datetime,
+    ) -> list[str]:
+        """Tools retired as unused whose wait the window no longer exceeds.
+
+        The window only grows as evidence arrives; a retirement it no longer
+        supports is undone, so an early, thin window cannot keep a tool away.
+        """
+        restore: list[str] = []
+        for record in LearnedToolRetirements(self._artifacts_dir).records().values():
+            if record.reason != RETIRED_UNUSED:
+                continue
+            entry_usage = usage.get(record.name)
+            installed = _parse_time(entry_usage.installed_at if entry_usage else "") or (
+                _parse_time(record.retired_at)
+            )
+            if window.seconds is None or installed is None:
+                restore.append(record.name)
+                continue
+            if (now - installed).total_seconds() <= window.seconds:
+                restore.append(record.name)
+        return sorted(restore)
 
     async def curate(self) -> dict[str, Any]:
         """Plan, then retire what the plan says. Returns the dream summary."""
         plan = await self.plan()
+        restored: list[str] = []
+        for name in plan.restore:
+            restore_learned_tool(
+                tools_dir=self._tools_dir,
+                artifacts_dir=self._artifacts_dir,
+                name=name,
+                why="the never-used window no longer supports retiring it",
+            )
+            if self._skills is not None and self._skills.status(name) == "archived":
+                await self._skills.restore(name)
+            restored.append(name)
         retired: list[dict[str, str]] = []
         for decision in plan.retire:
             retire_learned_tool(
@@ -979,6 +1070,7 @@ class LearnedToolCurator:
         return {
             "installed_before": plan.installed,
             "retired": retired,
+            "restored": restored,
             "kept": len(plan.keep),
             "never_used_window_seconds": plan.window.seconds,
             "judged_pairs": plan.judged_pairs,
@@ -1021,12 +1113,17 @@ class LearnedToolCurator:
         age = (now - installed).total_seconds()
         if age <= window.seconds:
             return None
+        waited = (
+            "waited before its first use"
+            if window.basis == "observed"
+            else "can have waited before its first use (install to last use before the ledger)"
+        )
         return RetirementDecision(
             name=entry.name,
             reason=RETIRED_UNUSED,
             detail=(
-                f"never run in {_days(age)} since install; the longest any tool here waited "
-                f"before its first use is {_days(window.seconds)} ({window.tool})"
+                f"never run in {_days(age)} since install; the longest any tool here "
+                f"{waited} is {_days(window.seconds)} ({window.tool})"
             ),
         )
 

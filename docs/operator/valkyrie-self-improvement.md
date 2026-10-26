@@ -319,9 +319,11 @@ A resident keeps **one tool per capability**:
   `tool_curation.leftover_name_prefixes` and never succeeded), **unrunnable**
   tools (no passing verification, or rolled back), and **unused** tools —
   never run, and installed longer than the longest install-to-first-use wait
-  observed on this resident. That window is read from the ledger, not
-  configured; until one first use has been observed nothing is retired as
-  unused. Retirement moves the files under `_retired/` and records the reason
+  known on this resident. That window is read from the ledger, not configured:
+  observed first uses count, and so does each pre-ledger tool's upper bound
+  (install to its last use before the ledger), so one fast first use cannot set
+  it. Until there is evidence nothing is retired as unused, and a later dream
+  restores an unused retirement the widened window no longer supports. Retirement moves the files under `_retired/` and records the reason
   in `_curation/retirements.json`. A `capability_list` query that matches a
   retired tool says so, and asking `build_tool` for its capability restores it.
   A peer's copy of a tool retired here as superseded or a debug leftover is
