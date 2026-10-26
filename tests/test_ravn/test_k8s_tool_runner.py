@@ -1936,7 +1936,14 @@ class TestPeerAdoptionThroughK8sJob:
         `_FakeE2EExecutor` — exercises the actual Job/Secret bodies, the
         NetworkPolicy check, and cleanup for both verify() and run()."""
         batch = _FakeVerifyBatchV1()
-        core = _FakeVerifyCoreV1(log=json.dumps({"ok": True}))
+        # A real Job log: library warnings on stderr interleaved with the
+        # marked result line the bootstrap prints last.
+        core = _FakeVerifyCoreV1(
+            log=(
+                "InsecureRequestWarning: Unverified HTTPS request\n"
+                "ravn-k8s-job-result: " + json.dumps({"ok": True})
+            )
+        )
         network = _FakeNetworkingV1()
         executor = KubernetesJobExecutor(
             namespace="ravn",
@@ -1965,6 +1972,40 @@ class TestPeerAdoptionThroughK8sJob:
         assert "_verify_runner.py" in "".join(
             verify_job["spec"]["template"]["spec"]["containers"][0]["command"]
         )
+
+
+@pytest.mark.asyncio
+async def test_a_tool_result_survives_warnings_interleaved_in_its_job_log() -> None:
+    batch = _FakeBatchV1()
+    core = _FakeCoreV1(
+        "/usr/lib/python3/urllib3/connectionpool.py:1100: InsecureRequestWarning\n"
+        "  warnings.warn(\n"
+        'ravn-k8s-job-result: {"pods": 3}'
+    )
+    executor = _executor(batch=batch, core=core, network=_FakeNetworkingV1())
+
+    run = await executor.execute(
+        run_name="ravn-tool-noisy-1",
+        image=DEFAULT_TOOL_RUN_IMAGE,
+        code="def run(p): return {'pods': 3}",
+        payload={},
+        entry_point="run",
+        requirements=[],
+        timeout_seconds=10,
+        egress=EgressPlan(),
+    )
+
+    assert run.stdout == '{"pods": 3}'
+    assert "InsecureRequestWarning" in run.stderr
+
+
+def test_a_job_log_without_a_result_line_is_all_diagnostics() -> None:
+    from ravn.valkyrie_evolution.k8s_tool_runner import _split_result
+
+    assert _split_result("Traceback (most recent call last):\n  boom") == (
+        "",
+        "Traceback (most recent call last):\n  boom",
+    )
 
 
 class TestEgressResolution:

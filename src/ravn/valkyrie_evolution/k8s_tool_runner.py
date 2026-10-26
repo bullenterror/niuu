@@ -60,6 +60,11 @@ _JOB_NAME_LABEL = "batch.kubernetes.io/job-name"
 #: does not satisfy the tool's declared requirements. Trusted together only.
 _REQUIREMENTS_MARKER = "ravn-k8s-job: runner image does not satisfy:"
 _REQUIREMENTS_EXIT = 86
+#: Prefix of the one log line carrying a tool's JSON result. A pod log is
+#: the container's stdout and stderr interleaved, so a warning a tool's
+#: libraries print (urllib3's InsecureRequestWarning, say) would otherwise
+#: corrupt the result.
+_RESULT_MARKER = "ravn-k8s-job-result: "
 
 
 @dataclass
@@ -208,10 +213,10 @@ class KubernetesJobLearnedToolRunner:
         enforcement = (
             REACH_ENFORCEMENT_ENFORCED if run.network_enforced else REACH_ENFORCEMENT_UNAVAILABLE
         )
-        if run.exit_code != 0 and run.stdout.startswith(_REQUIREMENTS_MARKER):
+        if run.exit_code != 0 and run.stderr.startswith(_REQUIREMENTS_MARKER):
             return ToolRunResult(
                 ok=False,
-                error=run.stdout.strip(),
+                error=run.stderr.strip(),
                 enforcement=enforcement,
                 infrastructure=True,
             )
@@ -577,9 +582,10 @@ class KubernetesJobExecutor:
             if output_exceeded:
                 logs = logs.encode()[: self._config.output_limit_bytes].decode(errors="replace")
             exit_code = 124 if timed_out else await self._exit_code(batch, run_name)
+            result, diagnostics = _split_result(logs)
             return JobRunResult(
-                stdout=logs,
-                stderr=logs if exit_code else "",
+                stdout=result,
+                stderr=diagnostics,
                 exit_code=exit_code,
                 timed_out=timed_out,
                 output_exceeded=output_exceeded,
@@ -1552,6 +1558,16 @@ os.execv(sys.executable, [sys.executable, *sys.argv[2:]])
 """
 
 
+def _split_result(logs: str) -> tuple[str, str]:
+    """Split a tool Job's log into its JSON result line and everything else."""
+    lines = logs.splitlines()
+    for index in range(len(lines) - 1, -1, -1):
+        if lines[index].startswith(_RESULT_MARKER):
+            result = lines[index].removeprefix(_RESULT_MARKER)
+            return result, "\n".join(lines[:index] + lines[index + 1 :]).strip()
+    return "", logs.strip()
+
+
 def _gated_command(python_args: list[str], requirements_path: str) -> list[str]:
     """``python <python_args>``, run only once the requirements gate passes."""
     return ["python", "-I", "-c", _REQUIREMENTS_GATE, requirements_path, *python_args]
@@ -1664,7 +1680,7 @@ spec.loader.exec_module(module)
 with open("/tool/payload.json", encoding="utf-8") as handle:
     payload = json.load(handle)
 result = getattr(module, os.environ["RAVN_TOOL_ENTRY"])(payload)
-print(json.dumps(result), end="")
+print("\\nravn-k8s-job-result: " + json.dumps(result), flush=True)
 """
 
 
