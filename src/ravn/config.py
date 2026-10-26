@@ -3681,8 +3681,11 @@ class ResidentEvolutionConfig(BaseModel):
         description=(
             "Execution backend for learned agent tools authored through build_tool. "
             "'container' runs each invocation in a fail-closed, least-reach OCI "
-            "container; 'local' is an explicit compatibility mode without hard "
-            "reach enforcement; 'k8s_job' creates one locked-down Job per invocation "
+            "container; 'local' runs a subprocess of the resident and enforces only "
+            "the network: a tool whose declared reach is entirely local runs with every "
+            "socket denied (a network namespace on Linux, a Seatbelt profile on macOS; "
+            "refused where the host cannot apply it), while a networked tool gets the resident's "
+            "whole network and filesystem; 'k8s_job' creates one locked-down Job per invocation "
             "after verifying its NetworkPolicies; 'forge'/'devrunner' select the "
             "legacy workspace-mounted persistent container path."
         ),

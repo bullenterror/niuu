@@ -156,9 +156,23 @@ resident_evolution:
   an ordinary Docker bridge cannot enforce their target or operation. A tool
   may request explicit broad `network/read_write` reach, which is treated as
   mutating by the normal autonomy/review policy.
-- `local`: explicit compatibility mode. It uses a scrubbed subprocess and
-  per-tool venvs, but it is not a security boundary and does not enforce
-  declared reach.
+- `local`: a scrubbed subprocess of the resident with per-tool venvs. It
+  enforces one reach boundary — the network. A tool whose declared reach is
+  entirely local runs with every network socket denied: a fresh user +
+  network namespace on Linux, a no-network Seatbelt profile on macOS. Local
+  kinds are `pure_compute`/`compute`/`none`, `file`/`filesystem`/`path`/
+  `workspace`, `credential`/`secret`, and `native_tool`/`host_tool`/`host_sdk`
+  (the host SDK channel keeps working). **Every other kind is network reach**
+  — `network`, `http`, `kubernetes`, `k8s_api`, `prometheus`, or a free-text
+  description — because it names something off the machine. Where the host
+  cannot isolate (Linux with unprivileged user namespaces disabled by sysctl,
+  seccomp, or Ubuntu's `kernel.apparmor_restrict_unprivileged_userns=1`), a
+  no-network tool is refused when it is loaded and again when it is run, with
+  the remedy in the error. It is never run with the network. What `local` does
+  not narrow: a networked tool gets the resident's whole network (a grant's
+  `target` is not an egress filter, and its Kubernetes reach is whatever the
+  pod's service account RBAC allows), and every tool reads the filesystem as
+  the resident's user.
 - `forge`/`devrunner`: legacy workspace-mounted persistent-container path.
   It scopes networking but exposes the workspace, so use `container` for
   autonomous generated code.
@@ -349,7 +363,7 @@ What each layer actually provides:
 | Independent verification | Correctness: the tool does what its tests say, in a clean env | Malice detection |
 | Scoped build tokens | Blast radius: a leaked build token can only launch builds | Scoping for PATs (a PAT keeps full owner authority) |
 | Env scrubbing | Hygiene: tools can't read tokens from `os.environ` (proven by test) | A wall — same-user file reads still work |
-| `local` backend | Crash/timeout isolation | Network isolation |
+| `local` backend | Crash/timeout isolation; no network for a tool that declares none (refused where the host cannot isolate) | Per-target egress filtering, filesystem isolation |
 | Docker backend (`container`) | Container + network isolation where Docker exists | Anything in Kubernetes |
 | `k8s_job` backend | Pod-per-run Kubernetes containment: verified NetworkPolicies, no SA token, non-root/seccomp/dropped capabilities, resource/time/output bounds — for both invocation and `verify()` | A Docker daemon (none needed); runtime dependency installation (bake into the pinned image) |
 | Audit + rollback + capability ledger | Detection and recovery | Prevention |

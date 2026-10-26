@@ -119,6 +119,24 @@ async def test_runner_allows_only_broad_read_write_network_reach(tmp_path) -> No
     assert len(executor.calls) == 1
 
 
+def test_runner_refuses_unenforceable_reach_at_load() -> None:
+    runner = KubernetesJobLearnedToolRunner(
+        executor=_FakeExecutor(JobRunResult(stdout="{}", network_enforced=True))
+    )
+
+    runner.check_reach([])
+    runner.check_reach([ToolReachGrant(kind="pure_compute")])
+    runner.check_reach([ToolReachGrant(kind="kubernetes", access="read_write")])
+    # Cluster reach is network reach: a Job NetworkPolicy cannot narrow it to
+    # the one API the tool names, so a targeted grant is refused, not widened.
+    with pytest.raises(LearnedToolError, match="target-specific"):
+        runner.check_reach(
+            [ToolReachGrant(kind="kubernetes", target="pods/log", access="read_write")]
+        )
+    with pytest.raises(LearnedToolError, match="cannot enforce declared reach kind 'file'"):
+        runner.check_reach([ToolReachGrant(kind="file", target="/tmp", access="read")])
+
+
 @pytest.mark.asyncio
 async def test_runner_refuses_runtime_dependency_installation(tmp_path) -> None:
     executor = _FakeExecutor(JobRunResult(stdout='{"ok": true}', network_enforced=True))
