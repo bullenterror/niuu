@@ -3120,7 +3120,12 @@ class PostSessionReflectionConfig(BaseModel):
     )
     max_tokens: int = Field(
         default=1024,
-        description="Maximum tokens the reflection LLM call may produce.",
+        description=(
+            "Maximum tokens the reflection LLM call may produce, including a "
+            "reasoning model's thinking. A reply cut off at this budget raises "
+            "instead of reading as 'no learning'; reasoning models such as "
+            "Qwen3.8 need several thousand."
+        ),
     )
     inject_learnings: bool = Field(
         default=True,
