@@ -765,8 +765,10 @@ def _exact_lineage(
 ) -> LineageMatch | None:
     if not capability_id and not name:
         return None
-    # Installed before retired at every level: a live tool is the better answer.
-    ordered = sorted(entries, key=lambda entry: entry.retired is not None)
+    # At every level the better answer comes first: installed before retired,
+    # verified before not. Two installed tools often share a capability id (a
+    # variant family), and the one to tie the request to is the one that runs.
+    ordered = sorted(entries, key=lambda entry: (entry.retired is not None, not entry.verified))
     if capability_id:
         for entry in ordered:
             if entry.capability == capability_id:

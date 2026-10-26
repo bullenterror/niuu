@@ -338,6 +338,22 @@ class TestLineage:
         assert found.entry.retired is None
         assert "superseded" in found.reason
 
+    async def test_a_shared_capability_resolves_to_the_tool_that_runs(self, tmp_path: Path) -> None:
+        _install(tmp_path, "k8s_pod_logs_since", capability="k8s.pod_logs_since", verified=False)
+        _install(tmp_path, "k8s_pod_logs_since_sa", capability="k8s.pod_logs_since")
+        code_dir, artifacts_dir = learned_tool_storage(tmp_path)
+
+        found = await find_lineage(
+            tools_dir=code_dir,
+            artifacts_dir=artifacts_dir,
+            capability_id="k8s.pod_logs_since",
+            name="k8s_pod_logs_since_v2",
+            description="",
+        )
+
+        assert found is not None
+        assert found.entry.name == "k8s_pod_logs_since_sa"
+
     async def test_meaning_links_names_that_spelling_cannot(self, tmp_path: Path) -> None:
         _install(tmp_path, "list_pods_in_namespace_sa")
         _install(tmp_path, "get_namespace_events")
