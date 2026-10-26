@@ -19,6 +19,7 @@ from niuu.observability import get_observability
 from ravn.cap_telemetry import DEGRADED_TOTAL_KEY
 from ravn.cap_telemetry import HEALTH_TOTAL_KEY as CAP_HEALTH_TOTAL_KEY
 from ravn.cap_telemetry import health_counts as cap_health_counts
+from ravn.domain.a2a_status import a2a_status_text
 from ravn.domain.exceptions import UnboundOperatorReplyError
 from ravn.domain.models import (
     RESIDENT_HOME_PRIORITY,
@@ -592,7 +593,7 @@ class ResidentRuntime:
         semantic_update = {
             "task_id": task_id,
             "state": state,
-            "status_message": status.get("message") or status.get("update") or "",
+            "status_message": a2a_status_text(status),
             "artifact": payload.get("artifactUpdate") or event.get("artifact") or {},
         }
         digest = hashlib.sha256(

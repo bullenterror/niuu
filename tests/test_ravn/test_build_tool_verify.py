@@ -16,6 +16,7 @@ from ravn.ports.tool_build_backend import (
     ToolBuildInputRequiredError,
     ToolBuildPendingError,
     ToolBuildResult,
+    ToolBuildTaskEndedError,
 )
 from ravn.valkyrie_evolution.tool_verification import VerificationResult
 
@@ -608,6 +609,43 @@ async def test_commissioned_build_push_pending_resumes_without_answer(tmp_path) 
     assert len(requests) == 2
     assert len(registered) == 1
     assert list((tmp_path / "arts" / "pending-builds").glob("*.json")) == []
+
+
+async def test_a_continuation_whose_task_ended_is_dropped_with_the_reason(tmp_path) -> None:
+    """Regin kept pending builds for A2A tasks that had failed or been cancelled
+    days earlier: a resumed build that the peer had ended raised and left its
+    continuation behind, so the resident still held a build nothing could resume."""
+
+    class _Backend:
+        name = "a2a"
+
+        async def build(self, request: Any) -> ToolBuildResult:
+            if not request.continuation:
+                raise ToolBuildPendingError(
+                    task_id="task-push-1",
+                    push_registered=True,
+                    continuation={
+                        "task_id": "task-push-1",
+                        "input_kind": "pending",
+                        "push_registered": True,
+                    },
+                )
+            raise ToolBuildTaskEndedError(
+                task_id="task-push-1",
+                state="TASK_STATE_FAILED",
+                reason="Session idle for over 2 hours without finishing.",
+            )
+
+    tool, registered = _tool(tmp_path, build_backend=_Backend())
+    await tool.execute({"manifest": _manifest(), "build_request": "build an echo tool"})
+    assert len(list((tmp_path / "arts" / "pending-builds").glob("*.json"))) == 1
+
+    resumed = await tool.execute({"continuation_task_id": "task-push-1"})
+
+    assert resumed.is_error is True
+    assert "Session idle for over 2 hours without finishing." in resumed.content
+    assert list((tmp_path / "arts" / "pending-builds").glob("*.json")) == []
+    assert registered == []
 
 
 async def test_commissioned_build_rejects_scalar_declared_reach(tmp_path) -> None:
