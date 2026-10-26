@@ -29,9 +29,10 @@ counted it.
 - `ravn.cap_telemetry` is the only implementation: `require_complete()` for
   model answers, `record_truncation()` / `record_cap_hit()` for everything else.
 
-Deliberate excerpts, where the prompt says the model sees only a head (for
-example "first 3000 chars", or a raw payload labelled "bounded" next to its
-archive ref), are not cap hits and are not counted.
+This follows `.claude/rules/no-hidden-limits.md`: every truncation is marked
+in the output and counted. That includes excerpts the prompt announces
+("first 3000 chars", a raw payload labelled "bounded" next to its archive
+ref).
 
 ## Limits
 
@@ -71,8 +72,9 @@ archive ref), are not cap hits and are not counted.
 | `tools.kubernetes.max_configmap_value_chars` / `max_list_items` | 4000 / 100 | Prompt budget | Kept; `truncated_keys` / `truncated` in the result | Error log + counted |
 | `gateway.platform.a2a_result_max_chars` | 12000 | Prompt budget | Kept; the hard-coded 16-item list limit is removed (the character budget is the bound) | Marker + error log + counted |
 | `mimir.source_trigger.max_content_chars` | 120000 | Synthesis prompt budget | Kept; context carries a notice | Error log + counted (synthesis worked from part of the source) |
-| `thread.enricher_content_excerpt_chars` | 500, was hard-coded | — | Deliberate excerpt after title and summary | Not counted |
-| `mimir.ingest.entity_source_excerpt_chars` | 3000, was hard-coded | — | Deliberate excerpt; the prompt says "first N chars" | Not counted |
+| Thread-enricher page excerpt | was hard-coded 500 | Classifier model's window | **Removed**: the whole page is classified; the head alone misread pages by their preamble | Context errors raise |
+| `mimir.ingest.entity_source_excerpt_chars` | 3000, was hard-coded | Extraction model's window (raw sources reach megabytes) | Made configurable; the prompt says "first N chars" | Error log + counted |
+| Resident home-turn raw payload excerpts | derived from `resident_state.continuation_context_max_chars` per observation | Prompt budget | Kept; labelled "bounded", with the archive ref | Error log + counted |
 | **Delivery** | | | | |
 | `gateway.channels.<telegram/discord/slack/matrix/whatsapp>.message_max_chars` | 4096 / 2000 / 3000 / 32000 / 4096 | Platform message limit | **Split** into several messages instead of cut with "..." | Nothing lost; Telegram 4xx now logged |
 | Discord image caption | same knob | Platform limit | Kept | Error log + counted |

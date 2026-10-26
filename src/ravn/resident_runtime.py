@@ -1693,6 +1693,8 @@ class ResidentRuntime:
                                 default=str,
                             ),
                             payload_budget,
+                            knob="resident_state.continuation_context_max_chars",
+                            what=f"the raw payload of observation {signal.id}",
                         ),
                         "  ",
                     ),
@@ -2260,6 +2262,8 @@ def _extreme_payload_lines(
                             default=str,
                         ),
                         payload_budget,
+                        knob="resident_state.continuation_context_max_chars",
+                        what=f"the archived payload {ref}",
                     ),
                     "  ",
                 ),
@@ -2269,18 +2273,12 @@ def _extreme_payload_lines(
     return lines
 
 
-def _bounded(value: Any, max_chars: int, *, knob: str = "", what: str = "") -> str:
-    """*value* as text of at most *max_chars*, marked when cut.
-
-    With a *knob*, a cut is a cap hit: the content is something the resident
-    carries forward (its working state, its questions, a turn handed on), not
-    a deliberately bounded excerpt such as a raw payload with its archive ref.
-    """
+def _bounded(value: Any, max_chars: int, *, knob: str, what: str) -> str:
+    """*value* as text of at most *max_chars*; a cut is marked and counted against *knob*."""
     text = str(value or "")
     if len(text) <= max_chars:
         return text
-    if knob:
-        record_truncation(knob, what=what, kept=max_chars, total=len(text))
+    record_truncation(knob, what=what, kept=max_chars, total=len(text))
     return text[:max_chars].rstrip() + "\n… (truncated)"
 
 

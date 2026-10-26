@@ -271,7 +271,9 @@ class ThreadEnricher(TriggerPort):
         prompt = _CLASSIFICATION_PROMPT.format(
             title=page.meta.title,
             summary=page.meta.summary,
-            content=page.content[: self._config.enricher_content_excerpt_chars],
+            # Whole: the model's context window is the bound, and a head-only
+            # excerpt classified pages by their preamble.
+            content=page.content,
         )
         response = await self._llm.generate(
             messages=[{"role": "user", "content": prompt}],

@@ -26,6 +26,7 @@ import pytest
 from niuu.domain.mimir import EntityType, MimirSource, PageConfidence
 from ravn.adapters.tools.entity_extractor import EntityExtractor, ExtractedEntity
 from ravn.adapters.tools.mimir_tools import MimirIngestTool, build_mimir_tools
+from ravn.cap_telemetry import cap_hit_counts
 from ravn.config import MimirIngestConfig
 from ravn.domain.exceptions import OutputTruncatedError
 from ravn.domain.models import LLMResponse, StopReason, TokenUsage
@@ -219,6 +220,7 @@ class TestExtractEntities:
         assert "first 5 chars" in prompt
         assert "abcde" in prompt
         assert "abcdef" not in prompt
+        assert cap_hit_counts() == {"mimir.ingest.entity_source_excerpt_chars": 1}
 
     @pytest.mark.asyncio
     async def test_skips_malformed_entity(self) -> None:

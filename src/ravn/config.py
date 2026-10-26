@@ -2210,8 +2210,9 @@ class MimirIngestConfig(BaseModel):
         gt=0,
         description=(
             "Characters of a source's head the extractor reads (the prompt says so). "
-            "A deliberate excerpt, not a cap that is hit: entities named only further "
-            "down are not extracted from that source."
+            "Raw sources reach megabytes, past any extraction model's window; entities "
+            "named only further down are not extracted, so a cut counts on "
+            "ravn.cap.hits."
         ),
     )
 
@@ -2707,16 +2708,6 @@ class ThreadConfig(BaseModel):
         description=(
             "LLM alias used by the enricher.  Should resolve to the cheapest/fastest "
             "model configured in the llm aliases map."
-        ),
-    )
-    enricher_content_excerpt_chars: int = Field(
-        default=500,
-        gt=0,
-        description=(
-            "Characters of a page's body the enricher shows the classifier, after its "
-            "title and summary. A deliberate excerpt, not a cap that is hit: whether a "
-            "page is an open thread shows in its head, and the whole page would cost "
-            "prefill on every new page."
         ),
     )
     decay_rate_per_day: float = Field(

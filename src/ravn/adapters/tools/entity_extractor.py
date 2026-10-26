@@ -30,7 +30,7 @@ from mimir.compiled_truth import (
 )
 from niuu.domain.mimir import EntityType, MimirSource, PageConfidence, slugify
 from niuu.ports.mimir import MimirPort
-from ravn.cap_telemetry import require_complete
+from ravn.cap_telemetry import record_truncation, require_complete
 from ravn.config import MimirIngestConfig
 from ravn.ports.llm import LLMPort
 
@@ -124,6 +124,13 @@ class EntityExtractor:
         used to return the same empty list, so the source read as entity-free.
         """
         excerpt_chars = self._config.entity_source_excerpt_chars
+        if len(source.content) > excerpt_chars:
+            record_truncation(
+                "mimir.ingest.entity_source_excerpt_chars",
+                what=f"source {source.source_id!r} read for entity extraction",
+                kept=excerpt_chars,
+                total=len(source.content),
+            )
         prompt = _EXTRACTION_PROMPT.format(
             title=source.title,
             content=source.content[:excerpt_chars],
