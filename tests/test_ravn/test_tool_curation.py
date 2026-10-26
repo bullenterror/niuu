@@ -1360,3 +1360,48 @@ async def test_judged_verdicts_survive_a_pass_cut_short(tmp_path: Path) -> None:
 
     # alpha's pairs were saved before the interruption; only the rest are judged.
     assert second.calls == 1
+
+
+async def test_tool_curation_runs_before_learning_curation(tmp_path: Path) -> None:
+    """A Mímir outage in learning curation must not stop the tool library being kept."""
+    from ravn.adapters.skill.file_registry import FileSkillRegistry
+    from ravn.skills.management import SkillManagementRegistry
+    from ravn.valkyrie_evolution.resident_learning import ResidentLearningIdentity
+    from ravn.valkyrie_evolution.wakefulness import ResidentWakefulness
+    from sleipnir.adapters.in_process import InProcessBus
+
+    order: list[str] = []
+
+    class ToolCurator:
+        async def curate(self) -> dict[str, Any]:
+            order.append("tools")
+            return {}
+
+    class LearningCurator:
+        def due(self) -> bool:
+            return True
+
+        async def curate(self) -> Any:
+            order.append("learnings")
+            raise RuntimeError("Mímir mount failed during list_pages: 503")
+
+    skill_dir = tmp_path / "skills"
+    machine = ResidentWakefulness(
+        identity=ResidentLearningIdentity(
+            environment_id="cluster-a", valkyrie_id="valkyrie:a", domain="k8s"
+        ),
+        skills=SkillManagementRegistry(
+            FileSkillRegistry(
+                skill_dirs=[str(skill_dir)], write_dir=skill_dir, include_builtin=False
+            ),
+            metadata_path=tmp_path / "skill_management.json",
+        ),
+        publisher=InProcessBus(),
+        learning_curator=LearningCurator(),
+        tool_curator=ToolCurator(),
+    )
+
+    with pytest.raises(RuntimeError, match="503"):
+        await machine.dream()
+
+    assert order == ["tools", "learnings"]
