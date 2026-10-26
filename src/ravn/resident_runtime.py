@@ -186,6 +186,7 @@ class ResidentRuntime:
         # out of the metrics backend between refreshes.
         self._health_snapshot: dict[str, int] = {}
         self._health_refreshed_at: float | None = None
+        self._learned_tool_health: Callable[[], Mapping[str, int]] | None = None
 
     @property
     def state(self) -> ResidentStatePort:
@@ -204,6 +205,10 @@ class ResidentRuntime:
 
     def bind_review_requester(self, requester: ReviewRequester | None) -> None:
         self._review_requester = requester
+
+    def bind_learned_tool_health(self, counts: Callable[[], Mapping[str, int]] | None) -> None:
+        """Add the learned-tool library's counts (installed, unused, retired) to health."""
+        self._learned_tool_health = counts
 
     def bind_notification_outbox(self, outbox: ResidentNotificationOutboxPort | None) -> None:
         """Tell the owner (through Forge's notification feed) when a question waits on them."""
@@ -280,6 +285,9 @@ class ResidentRuntime:
         streak = await self._state.read_decision_streak(self._resident_id)
         snapshot["repeated_decision_streak"] = streak.count if streak is not None else 0
 
+        if self._learned_tool_health is not None:
+            snapshot.update(self._learned_tool_health())
+
         self._health_snapshot = snapshot
         self._health_refreshed_at = time.monotonic()
         self._emit_health_gauges(snapshot)
@@ -325,6 +333,18 @@ class ResidentRuntime:
             "inbox_pending": (
                 "ravn.resident.inbox.pending",
                 "Resident inbox signals not yet triaged.",
+            ),
+            "learned_tools_installed": (
+                "ravn.resident.learned_tools.installed",
+                "Learned tools installed and runnable by name.",
+            ),
+            "learned_tools_never_used": (
+                "ravn.resident.learned_tools.never_used",
+                "Installed learned tools with no recorded run.",
+            ),
+            "learned_tools_retired": (
+                "ravn.resident.learned_tools.retired",
+                "Learned tools retired by curation and not restored.",
             ),
             "repeated_decision_streak": (
                 "ravn.resident.decision_streak",

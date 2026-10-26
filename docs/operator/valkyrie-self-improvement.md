@@ -290,6 +290,53 @@ resident_evolution:
 Rollback archives the tool, prunes its venv, restores the superseded version
 when one exists (through the same review gate), and reopens the capability gap.
 
+### 7. Repair, usage evidence and retirement
+
+A resident keeps **one tool per capability**:
+
+- **Repair over variant.** Before anything is commissioned, `build_tool` looks
+  for the tool that already serves the request: the declared `capability_id`,
+  the exact name, the same name in another spelling, and — when
+  `reflection.matching.mode: semantic` — the same capability in other words
+  (the lesson embedding shortlist and judge, with
+  `reflection.matching.similarity_threshold` / `max_related`). A healthy match
+  answers `already_installed`. A match that is failing, unverified or rolled
+  back, or a request with `replace: true`, is rebuilt **as that tool's next
+  version**: same name, `version` + 1, `supersedes` the previous artifact id,
+  `provenance.repair_of` recording what was asked. A build that fails
+  verification is kept under `learned_tool_artifacts/_failed/` and never
+  replaces the installed envelope.
+- **Usage evidence.** Every run (dispatch, a tool registered live, a selected
+  capability) is recorded in `learned_tool_artifacts/_curation/usage.json`:
+  runs, successes, failures, first and last use, and the installed version's own
+  counts. The first load seeds it from `skill_management.json`. `capability_list`
+  shows it per tool; the resident health snapshot carries
+  `learned_tools_installed`, `learned_tools_never_used`, `learned_tools_retired`,
+  `learned_tool_retirements.<reason>` and `learned_tool_restores_total`.
+- **Retirement.** Each consolidation dream retires, in this order: tools
+  **superseded** by another runnable tool for the same capability (the
+  best-evidenced one is kept), **debug leftovers** (name starts with one of
+  `tool_curation.leftover_name_prefixes` and never succeeded), **unrunnable**
+  tools (no passing verification, or rolled back), and **unused** tools —
+  never run, and installed longer than the longest install-to-first-use wait
+  observed on this resident. That window is read from the ledger, not
+  configured; until one first use has been observed nothing is retired as
+  unused. Retirement moves the files under `_retired/` and records the reason
+  in `_curation/retirements.json`. A `capability_list` query that matches a
+  retired tool says so, and asking `build_tool` for its capability restores it.
+  A peer's copy of a tool retired here as superseded or a debug leftover is
+  ignored.
+
+```yaml
+resident_evolution:
+  tool_curation:
+    enabled: true                       # needs resident_wakefulness
+    leftover_name_prefixes: [test, debug, tmp, temp, scratch]
+```
+
+`ravn learned-tools-plan --config <file>` prints what the next dream would
+retire, and why, without changing anything.
+
 ## Security model — read this honestly
 
 What each layer actually provides:
