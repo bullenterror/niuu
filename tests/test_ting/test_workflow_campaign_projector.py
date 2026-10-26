@@ -911,10 +911,20 @@ async def test_a_flock_session_that_went_idle_names_its_last_outcome() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_busy_session_that_only_heartbeats_expires_as_no_progress() -> None:
+async def test_a_busy_session_that_only_heartbeats_expires_as_no_progress(
+    monkeypatch, caplog
+) -> None:
     """Skuld re-sends its busy report as a heartbeat for as long as the broker
     lives. Two builder sessions claimed busy for eleven hours after their last
     peer finished; heartbeats kept last_active fresh, so the sweep never fired."""
+    counted: list[tuple[str, dict]] = []
+    telemetry = SimpleNamespace(
+        count=lambda name, *, attributes, description="": counted.append((name, attributes)),
+        duration=lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "ting.domain.services.workflow_campaign_projector.get_observability", lambda: telemetry
+    )
     now = datetime.now(UTC)
     projector, repo = _sweeping_projector(
         _IdleAdapter(
@@ -926,11 +936,19 @@ async def test_a_busy_session_that_only_heartbeats_expires_as_no_progress() -> N
     )
     repo.list_active_campaigns.return_value = [_aged(WorkflowCampaignStatus.RUNNING, 11)]
 
-    assert await projector.expire_stale_campaigns(now=now) == 1
+    with caplog.at_level("ERROR"):
+        assert await projector.expire_stale_campaigns(now=now) == 1
 
-    error = repo.save_campaign.await_args_list[0].args[0].metadata["failure_error"]
+    failed = repo.save_campaign.await_args_list[0].args[0]
+    error = failed.metadata["failure_error"]
+    assert failed.status == WorkflowCampaignStatus.FAILED
     assert "reported busy with no recorded progress for over 2 hours" in error
     assert "only heartbeats since" in error
+    assert ("ting_a2a_campaigns_expired_total", {"reason": "no_progress"}) in counted
+    expiry_logs = [r for r in caplog.records if "Expiring workflow campaign" in r.getMessage()]
+    assert [r.levelname for r in expiry_logs] == ["ERROR"]
+    assert "idle_timeout_seconds=7200s" in expiry_logs[0].getMessage()
+    assert "no recorded progress" in expiry_logs[0].getMessage()
 
 
 @pytest.mark.asyncio
