@@ -3126,6 +3126,54 @@ class SelfImprovementConfig(BaseModel):
     )
 
 
+_CONTINUATION_TURN_BOUND = (
+    "resident case continuations are bounded by budget.daily_cap_usd, one turn per "
+    "scheduled wake, and repeated_decision_escalate_after"
+)
+_CONTINUATION_CONTENT_BOUND = (
+    "what a turn carries forward is bounded by the model's context window "
+    "(context_management.max_prompt_tokens and compaction), and the durable record by "
+    "resident_state.case_retention_max_cases / case_retention_max_age_days"
+)
+_REMOVED_RESIDENT_STATE_KEYS: dict[str, str] = {
+    "continuation_max_turns": _CONTINUATION_TURN_BOUND,
+    "continuation_max_tokens": _CONTINUATION_TURN_BOUND,
+    "continuation_context_max_chars": (
+        "the prior working state, A2A handles, open questions, turn handoff and "
+        "observation payloads reach the resident whole; " + _CONTINUATION_CONTENT_BOUND
+    ),
+    "continuation_tool_result_max_chars": (
+        "every tool result is persisted whole in the turn record; " + _CONTINUATION_CONTENT_BOUND
+    ),
+    "directed_message_context_max_chars": (
+        "a directed message and the room message it replies to reach the resident whole; "
+        "the prompt is bounded by context_management.max_prompt_tokens and compaction"
+    ),
+}
+_REMOVED_REFLECTION_KEYS: dict[str, str] = {
+    "context_max_chars": (
+        "the session's recorded work context is sent to the reflection model whole; "
+        "the reflection model's context window bounds it, and a prompt that does not fit "
+        "fails loudly"
+    ),
+}
+
+
+def _refuse_removed_keys(section: str, data: Any, removed_keys: dict[str, str]) -> Any:
+    """Refuse a config that still sets a removed key, naming what bounds the content now."""
+    if not isinstance(data, dict):
+        return data
+    present = sorted(set(removed_keys) & set(data))
+    if not present:
+        return data
+    raise ValueError(
+        "; ".join(
+            f"{section}.{key} no longer exists: {removed_keys[key]}; remove the key"
+            for key in present
+        )
+    )
+
+
 class PostSessionReflectionConfig(BaseModel):
     """Post-session reflection configuration (NIU-588).
 
@@ -3135,6 +3183,12 @@ class PostSessionReflectionConfig(BaseModel):
     Disabled by default — enable via ``reflection.enabled: true`` in the
     deployment YAML.
     """
+
+    @model_validator(mode="before")
+    @classmethod
+    def _refuse_removed_caps(cls, data: Any) -> Any:
+        """A removed cap left in a config would read as enforced while doing nothing."""
+        return _refuse_removed_keys("reflection", data, _REMOVED_REFLECTION_KEYS)
 
     enabled: bool = Field(
         default=False,
@@ -3159,16 +3213,6 @@ class PostSessionReflectionConfig(BaseModel):
             "guess from non-reasoning models that Qwen3.8 spent thinking. A reply "
             "cut off at a cap raises ReflectionError instead of reading as 'no "
             "learning', and counts on ravn.cap.hits."
-        ),
-    )
-    context_max_chars: int = Field(
-        default=12_000,
-        gt=0,
-        description=(
-            "Characters of the session's recorded work context (structured outcome) the "
-            "reflection prompt carries. The reflection model's context window is the "
-            "real bound; this keeps one long session from dominating the prompt. A cut "
-            "counts on ravn.cap.hits."
         ),
     )
     inject_learnings: bool = Field(
@@ -3863,16 +3907,7 @@ class ResidentStateConfig(BaseModel):
     @classmethod
     def _refuse_removed_turn_caps(cls, data: Any) -> Any:
         """A removed cap left in a config would read as enforced while doing nothing."""
-        if isinstance(data, dict):
-            removed = sorted({"continuation_max_turns", "continuation_max_tokens"} & set(data))
-            if removed:
-                raise ValueError(
-                    f"resident_state.{', resident_state.'.join(removed)} no longer exist: "
-                    "resident case continuations are bounded by budget.daily_cap_usd, one "
-                    "turn per scheduled wake, and repeated_decision_escalate_after; remove "
-                    "the key"
-                )
-        return data
+        return _refuse_removed_keys("resident_state", data, _REMOVED_RESIDENT_STATE_KEYS)
 
     adapter: str = Field(
         default="ravn.adapters.resident_state.mimir.LocalResidentState",
@@ -3885,16 +3920,6 @@ class ResidentStateConfig(BaseModel):
     secret_kwargs_env: dict[str, str] = Field(
         default_factory=dict,
         description="Maps adapter kwarg names to env var names for secret injection.",
-    )
-    continuation_context_max_chars: int = Field(
-        default=12000,
-        ge=1000,
-        description="Maximum durable prior-turn characters restored into a continuation.",
-    )
-    continuation_tool_result_max_chars: int = Field(
-        default=2000,
-        ge=100,
-        description="Maximum characters persisted from each resident tool result.",
     )
     case_retention_max_cases: int = Field(
         default=200,
@@ -3925,14 +3950,6 @@ class ResidentStateConfig(BaseModel):
             "Minimum seconds between case retention sweeps. Sweeps run off the "
             "turn write path in a worker thread; this throttle bounds how often "
             "the cases directory is rescanned."
-        ),
-    )
-    directed_message_context_max_chars: int = Field(
-        default=4000,
-        ge=200,
-        description=(
-            "Maximum characters of prior room content carried into a directed-message "
-            "task. The human's current message is never truncated by this setting."
         ),
     )
     home_wake_interval_seconds: float = Field(

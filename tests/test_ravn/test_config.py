@@ -1199,3 +1199,57 @@ class TestRemovedContinuationCaps:
     def test_a_config_still_setting_it_is_refused(self, key: str) -> None:
         with pytest.raises(ValueError, match=f"resident_state.{key} no longer exist"):
             Settings(resident_state={key: 3})
+
+
+class TestRemovedCharacterCaps:
+    """Content a resident carries is bounded by the model's window, not a character guess."""
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "continuation_context_max_chars",
+            "continuation_tool_result_max_chars",
+            "directed_message_context_max_chars",
+        ],
+    )
+    def test_a_resident_state_config_still_setting_it_is_refused(self, key: str) -> None:
+        with pytest.raises(ValueError) as refused:
+            Settings(resident_state={key: 4000})
+
+        message = str(refused.value)
+        assert f"resident_state.{key} no longer exists" in message
+        assert "context_management.max_prompt_tokens" in message
+        assert "remove the key" in message
+
+    def test_a_reflection_config_still_setting_the_context_cap_is_refused(self) -> None:
+        with pytest.raises(ValueError) as refused:
+            Settings(reflection={"context_max_chars": 12000})
+
+        message = str(refused.value)
+        assert "reflection.context_max_chars no longer exists" in message
+        assert "sent to the reflection model whole" in message
+        assert "remove the key" in message
+
+    def test_every_removed_key_is_named_when_several_are_set(self) -> None:
+        with pytest.raises(ValueError) as refused:
+            Settings(
+                resident_state={
+                    "continuation_context_max_chars": 1,
+                    "continuation_tool_result_max_chars": 1,
+                }
+            )
+
+        message = str(refused.value)
+        assert "resident_state.continuation_context_max_chars no longer exists" in message
+        assert "resident_state.continuation_tool_result_max_chars no longer exists" in message
+
+    def test_the_defaults_carry_none_of_the_removed_keys(self) -> None:
+        settings = Settings()
+
+        for key in (
+            "continuation_context_max_chars",
+            "continuation_tool_result_max_chars",
+            "directed_message_context_max_chars",
+        ):
+            assert not hasattr(settings.resident_state, key)
+        assert not hasattr(settings.reflection, "context_max_chars")

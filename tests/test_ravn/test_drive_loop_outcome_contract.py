@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from niuu.domain.outcome import OutcomeField
+from ravn.cap_telemetry import cap_hit_counts
 from ravn.domain.events import RavnEventType
 from ravn.domain.models import TokenUsage, ToolCall, ToolResult, TurnResult
 from ravn.domain.valkyrie_contracts import normalize_valkyrie_outcome
@@ -2473,13 +2474,23 @@ summary: post-mortem source captured
         assert "ignored the transport-only check" in recent_context
         assert recent_context.endswith("Human message: makes sense, ignore")
 
-        dl._settings.resident_state.directed_message_context_max_chars = 200
-        bounded_context = dl._directed_message_context(
+        long_prior = "x" * 50_000
+        whole_context = dl._directed_message_context(
             "current message",
-            {"recent_room_context": {"content": "x" * 500}},
+            {"recent_room_context": {"content": long_prior}},
         )
-        assert "prior room context truncated: 300 characters omitted" in bounded_context
-        assert bounded_context.endswith("Human message: current message")
+        assert long_prior in whole_context
+        assert "truncated" not in whole_context
+        assert whole_context.endswith("Human message: current message")
+
+        long_reply = "y" * 50_000
+        whole_reply = dl._directed_message_context(
+            "current message",
+            {"reply_context": {"content": long_reply}},
+        )
+        assert long_reply in whole_reply
+        assert "truncated" not in whole_reply
+        assert cap_hit_counts() == {}
 
     def test_record_tool_outcome_fields_merges_existing_values(self) -> None:
         dl = _make_drive_loop()
