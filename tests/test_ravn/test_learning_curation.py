@@ -20,8 +20,8 @@ from ravn.adapters.reflection.learning_curation import (
     CurationReport,
     LearningCurator,
     _PassState,
-    _timeline_entries,
 )
+from ravn.adapters.reflection.lesson_consolidation import timeline_entries as _timeline_entries
 from ravn.adapters.reflection.lesson_judge import LessonJudge, LessonJudgeError
 from ravn.adapters.reflection.lessons import (
     LessonIndex,
@@ -70,6 +70,7 @@ def _curator(
         judge=_judge(llm or ScriptedLLM()),
         config=LearningCurationConfig(enabled=True, **config),
         similarity_threshold=0.5,
+        max_related=5,
         evidence_duplicate_similarity=0.9,
         min_repetitions=3,
         verified_recovery_promotes=True,
@@ -199,7 +200,7 @@ async def test_verified_evidence_beats_more_observations(tmp_path: Path) -> None
     await mimir.upsert_page("learning-candidates/general/blocked.md", blocked)
     await mimir.upsert_page("learning-candidates/general/verified.md", verified)
 
-    report = await _curator(mimir, max_rewrites=0).curate()
+    report = await _curator(mimir).curate()
 
     assert report.paths("superseded") == ["learning-candidates/general/blocked.md"]
     assert "verified evidence" in report.actions[0].reason
@@ -261,11 +262,10 @@ async def test_a_merge_carries_verification_and_promotes_on_it(tmp_path: Path) -
     await mimir.upsert_page("learning-candidates/general/plain.md", plain)
     await mimir.upsert_page("learning-candidates/general/verified.md", verified)
 
-    report = await _curator(mimir, max_rewrites=0).curate()
+    report = await _curator(mimir).curate()
 
     assert report.paths("merged") == ["learning-candidates/general/plain.md"]
-    promoted = report.actions[-1]
-    assert promoted.action == "promoted"
+    [promoted] = [action for action in report.actions if action.action == "promoted"]
     assert promoted.reason == "verified_route_recovery"
 
 
@@ -308,14 +308,34 @@ async def test_scoped_learnings_are_never_curated(tmp_path: Path) -> None:
     assert "status: candidate" in await mimir.read_page("learnings/shared/blocked.md")
 
 
-async def test_judgments_are_bounded_per_pass(tmp_path: Path) -> None:
+async def test_each_lesson_is_judged_once_and_never_again(tmp_path: Path) -> None:
+    """No pair budget: one judgment per uncurated lesson, then it is marked curated."""
     mimir = MarkdownMimirAdapter(root=tmp_path)
     await _seed_regin(mimir)
     llm = ScriptedLLM()
+    curator = _curator(mimir, llm)
 
-    report = await _curator(mimir, llm, max_judgments=1, max_rewrites=0).curate(max_judgments=1)
+    first = await curator.curate()
+    calls = llm.judge_calls
+    later = candidate_page(
+        DISTINCT_HOSTS,
+        session_id="s-late",
+        evidence="the web host answered again",
+        date=datetime(2026, 10, 25, tzinfo=UTC),
+    )
+    await mimir.upsert_page("learning-candidates/general/s-late.md", later)
+    second = await curator.curate()
 
-    assert report.pairs_judged == 1
+    # The newest lesson goes first: the "all routes 403" claim, which only
+    # contradicts the others. The next judgment folds the three paraphrases into
+    # one; the unrelated lesson has no neighbour above the threshold and needs no
+    # model call at all.
+    assert first.neighbourhoods_judged == 2
+    assert second.neighbourhoods_judged == 1
+    assert second.paths("merged") == ["learning-candidates/general/s-late.md"]
+    assert llm.judge_calls == calls + 1
+    for page in await mimir.list_pages(category="learnings"):
+        assert "curated: " in await mimir.read_page(page.path)
 
 
 async def test_a_failed_pass_is_audited_and_raised(tmp_path: Path) -> None:
@@ -339,8 +359,9 @@ async def test_a_failed_pass_is_audited_and_raised(tmp_path: Path) -> None:
 
 
 async def test_a_lesson_without_frontmatter_cannot_be_retired_silently() -> None:
+    from ravn.adapters.reflection.lesson_consolidation import mark_curated, retire
+
     mimir = AsyncMock()
-    curator = _curator(mimir)
     lesson = parse_lesson(
         "learning-candidates/general/x.md",
         "# no frontmatter\n## What was learned\nclaim\n",
@@ -348,7 +369,11 @@ async def test_a_lesson_without_frontmatter_cannot_be_retired_silently() -> None
     )
 
     with pytest.raises(RuntimeError, match="cannot retire"):
-        await curator._retire(lesson, status="pruned", field="", target="", why="test")
+        await retire(mimir, lesson, status="pruned", field="", target="", why="test")
+    # Nor marked curated: it would be judged again on every pass, forever.
+    with pytest.raises(RuntimeError, match="cannot mark"):
+        await mark_curated(mimir, lesson, now=NOW)
+    mimir.upsert_page.assert_not_awaited()
 
 
 async def test_curation_runs_at_most_once_per_interval() -> None:
@@ -363,7 +388,7 @@ async def test_curation_runs_at_most_once_per_interval() -> None:
 
 
 def test_report_summary_lists_every_action() -> None:
-    report = CurationReport(started_at=NOW, lessons_reviewed=3, pairs_judged=2)
+    report = CurationReport(started_at=NOW, lessons_reviewed=3, neighbourhoods_judged=2)
     report.record("merged", "a", "b", "same")
     summary = report.summary()
     assert summary["merged"] == ["a"]
@@ -469,18 +494,9 @@ async def test_index_refuses_a_misaligned_embedding_batch() -> None:
     )
 
     with pytest.raises(RuntimeError, match="misaligned"):
-        await index.similar_pairs([lesson, other], threshold=0.5)
+        await index.rank("x", [lesson, other])
     with pytest.raises(RuntimeError, match="misaligned"):
         await index.max_similarity("x", ["a", "b"])
-
-
-async def test_identical_lessons_pair_without_a_similarity_score() -> None:
-    index = LessonIndex(KeywordEmbedding(), batch_size=64)
-    content = "---\ntitle: same\n---\n## What was learned\nclaim\n"
-    left = parse_lesson("learning-candidates/general/a.md", content, updated_at=NOW)
-    right = parse_lesson("learning-candidates/general/b.md", content, updated_at=NOW)
-
-    assert await index.similar_pairs([left, right], threshold=0.99) == [(left, right, 1.0)]
 
 
 async def test_evidence_novelty_by_meaning() -> None:
@@ -517,25 +533,41 @@ def _lesson(title: str, claim: str = "claim") -> object:
     )
 
 
-async def test_judge_match_returns_the_named_lesson() -> None:
-    judge = _judge(_llm('{"same": 2, "reason": "same"}'))
-    match = await judge.match(title="t", claim="c", recorded=[_lesson("a"), _lesson("b")])
-    assert match.index == 1
-
-
-async def test_judge_match_accepts_no_match_and_skips_an_empty_shortlist() -> None:
-    llm = _llm('{"same": null, "reason": "different"}')
-    judge = _judge(llm)
-    assert (await judge.match(title="t", claim="c", recorded=[_lesson("a")])).index is None
-    assert (await judge.match(title="t", claim="c", recorded=[])).index is None
+async def test_judge_classifies_a_whole_neighbourhood_in_one_call() -> None:
+    llm = _llm('{"same": [3, 1, 1], "contradicts": [2], "reason": "r"}')
+    verdict = await _judge(llm).classify(
+        title="t", claim="c", lessons=[_lesson("a"), _lesson("b"), _lesson("c")]
+    )
+    assert verdict.same == (2, 0)
+    assert verdict.contradicts == (1,)
     assert llm.generate.await_count == 1
 
 
-@pytest.mark.parametrize("same", ['"two"', "true", "3", "0"])
-async def test_judge_match_rejects_answers_naming_no_shown_lesson(same: str) -> None:
-    judge = _judge(_llm(f'{{"same": {same}}}'))
+async def test_judge_accepts_none_and_a_bare_number_and_skips_an_empty_neighbourhood() -> None:
+    llm = _llm('{"same": null, "reason": "different"}', '{"same": "2", "contradicts": null}')
+    judge = _judge(llm)
+    assert (await judge.classify(title="t", claim="c", lessons=[_lesson("a")])).same == ()
+    assert (
+        await judge.classify(title="t", claim="c", lessons=[_lesson("a"), _lesson("b")])
+    ).same == (1,)
+    assert (await judge.classify(title="t", claim="c", lessons=[])).same == ()
+    assert llm.generate.await_count == 2
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        '{"same": ["two"]}',
+        '{"same": [true]}',
+        '{"same": [3]}',
+        '{"contradicts": [0]}',
+        '{"same": [1], "contradicts": [1]}',
+    ],
+)
+async def test_judge_rejects_answers_naming_no_shown_lesson(answer: str) -> None:
+    judge = _judge(_llm(answer))
     with pytest.raises(LessonJudgeError):
-        await judge.match(title="t", claim="c", recorded=[_lesson("a"), _lesson("b")])
+        await judge.classify(title="t", claim="c", lessons=[_lesson("a"), _lesson("b")])
 
 
 async def test_judge_cut_off_by_its_budget_names_the_setting() -> None:
@@ -545,25 +577,20 @@ async def test_judge_cut_off_by_its_budget_names_the_setting() -> None:
     llm = AsyncMock()
     llm.generate.return_value = response
     with pytest.raises(LessonJudgeError, match="reflection.matching.judge_max_tokens"):
-        await _judge(llm).match(title="t", claim="c", recorded=[_lesson("a")])
+        await _judge(llm).classify(title="t", claim="c", lessons=[_lesson("a")])
     assert llm.generate.await_count == 1
     assert cap_hit_counts() == {"reflection.matching.judge_max_tokens": 1}
 
 
-async def test_judge_relate_and_procedure() -> None:
+async def test_judge_procedure() -> None:
     judge = _judge(
         _llm(
-            '{"relation": "Contradicts", "reason": "opposite"}',
-            '{"relation": "maybe"}',
             json.dumps({"procedure": "When x, do y."}),
             json.dumps({"procedure": "Do y."}),
             json.dumps({"procedure": "When " + "x" * 300}),
         )
     )
     verified = _lesson("a")
-    assert (await judge.relate(verified, _lesson("b"))).relation == "contradicts"
-    with pytest.raises(LessonJudgeError, match="unknown relation"):
-        await judge.relate(verified, _lesson("b"))
     assert await judge.procedure(verified, max_chars=100) == "When x, do y."
     with pytest.raises(LessonJudgeError, match="When X, do Y"):
         await judge.procedure(verified, max_chars=100)
@@ -579,12 +606,12 @@ async def test_judge_procedure_mentions_verification() -> None:
 
 
 async def test_judge_retries_a_malformed_answer_then_fails_loudly() -> None:
-    recovered = _judge(_llm("not json", '{"relation": "same"}'))
-    assert (await recovered.relate(_lesson("a"), _lesson("b"))).relation == "same"
+    recovered = _judge(_llm("not json", '{"same": [1]}'))
+    assert (await recovered.classify(title="t", claim="c", lessons=[_lesson("a")])).same == (0,)
 
     broken = _judge(_llm("", "still not json"))
     with pytest.raises(LessonJudgeError, match="judge_llm_alias"):
-        await broken.relate(_lesson("a"), _lesson("b"))
+        await broken.classify(title="t", claim="c", lessons=[_lesson("a")])
 
 
 def test_judge_needs_at_least_one_attempt() -> None:
@@ -736,10 +763,10 @@ def test_learnings_curate_command_requires_curation() -> None:
     assert "curation.enabled is false" in result.output
 
 
-def test_learnings_curate_command_runs_one_pass_with_overrides() -> None:
+def test_learnings_curate_command_runs_one_pass() -> None:
     from ravn.cli import commands
 
-    report = CurationReport(started_at=NOW, lessons_reviewed=214, pairs_judged=300)
+    report = CurationReport(started_at=NOW, lessons_reviewed=214, neighbourhoods_judged=300)
     report.record("merged", "a", "b", "same")
     curator = MagicMock()
     curator.curate = AsyncMock(return_value=report)
@@ -751,17 +778,15 @@ def test_learnings_curate_command_runs_one_pass_with_overrides() -> None:
         patch.object(commands, "_build_learning_consolidation", return_value=MagicMock()),
         patch.object(commands, "_build_learning_curator", return_value=curator),
     ):
-        result = CliRunner().invoke(
-            commands.app, ["learnings-curate", "--max-judgments", "500", "--max-rewrites", "0"]
-        )
+        result = CliRunner().invoke(commands.app, ["learnings-curate"])
 
     assert result.exit_code == 0, result.output
-    curator.curate.assert_awaited_once_with(max_judgments=500, max_rewrites=0)
-    assert "lessons_reviewed : 214" in result.output
-    assert "merged           : 1" in result.output
+    curator.curate.assert_awaited_once_with()
+    assert "lessons_reviewed     : 214" in result.output
+    assert "merged               : 1" in result.output
 
 
-async def test_pairs_judged_distinct_are_not_judged_again(tmp_path: Path) -> None:
+async def test_a_lesson_judged_distinct_is_not_judged_again(tmp_path: Path) -> None:
     mimir = MarkdownMimirAdapter(root=tmp_path)
     lint = (
         "Helm migration lint runs on GitHub",
@@ -776,8 +801,9 @@ async def test_pairs_judged_distinct_are_not_judged_again(tmp_path: Path) -> Non
     first = await curator.curate()
     second = await curator.curate()
 
-    assert first.pairs_judged == 1
-    assert second.pairs_judged == 0
+    # Both are judged once (each against the other); after that both are curated.
+    assert first.neighbourhoods_judged == 2
+    assert second.neighbourhoods_judged == 0
     assert first.actions == second.actions == []
 
 
@@ -802,7 +828,7 @@ async def test_merging_into_a_learning_keeps_it_and_takes_the_verification(
     )
     await mimir.upsert_page("learning-candidates/general/verified.md", verified)
 
-    report = await _curator(mimir, max_rewrites=0).curate()
+    report = await _curator(mimir).curate()
 
     assert report.paths("merged") == ["learning-candidates/general/verified.md"]
     kept = await mimir.read_page("learnings/general/diff.md")

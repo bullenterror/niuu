@@ -2921,7 +2921,12 @@ class LearningMatchingConfig(BaseModel):
     max_related: int = Field(
         default=5,
         ge=1,
-        description="Most similar recorded lessons the judge sees for one new candidate.",
+        description=(
+            "Nearest learnings, and separately nearest candidates, above the threshold "
+            "that the judge compares one lesson with. Learnings get their own share so "
+            "a crowd of paraphrased candidates cannot push the trusted learning out of "
+            "view; this is the size of one judge prompt, not a cap on the work done."
+        ),
     )
     judge_llm_alias: str = Field(
         default="",
@@ -3019,19 +3024,13 @@ class LearningCurationConfig(BaseModel):
         description="Curate learnings during resident consolidation dreams.",
     )
     min_interval_seconds: float = Field(
-        default=24 * 3600.0,
+        default=0.0,
         ge=0.0,
-        description="Minimum seconds between curation passes; dreams in between skip it.",
-    )
-    max_judgments: int = Field(
-        default=40,
-        ge=1,
-        description="Most lesson pairs one pass may send to the judge.",
-    )
-    max_rewrites: int = Field(
-        default=10,
-        ge=0,
-        description="Most promoted learnings one pass may rewrite into procedural form.",
+        description=(
+            "Minimum seconds between curation passes; dreams in between skip it. 0 runs "
+            "it in every consolidation dream, which is cheap: a pass judges only lessons "
+            "never consolidated before, one model call each, and marks them `curated`."
+        ),
     )
     procedure_max_chars: int = Field(
         default=280,
