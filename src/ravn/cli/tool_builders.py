@@ -146,14 +146,9 @@ def _build_tools(
 
     resolver = runtime_ctx.get("learned_tool_resolver")
     if resolver is not None:
-        from ravn.valkyrie_evolution.tool_curation import (  # noqa: PLC0415
-            LearnedToolUsageLedger,
-        )
-
         runtime_ctx["learned_tools_provider"] = resolver.list_artifacts
-        runtime_ctx["learned_tool_usage"] = LearnedToolUsageLedger(resolver.artifacts_dir).snapshot
         runtime_ctx["retired_learned_tools"] = _retired_learned_tools(
-            _resident_ravn_state_dir(workspace, settings)
+            _resident_ravn_state_dir(workspace, settings), runtime_ctx.get("skill_manager")
         )
 
     if "workflow" in include_groups:
@@ -430,9 +425,7 @@ def _build_learned_tool_resolver(settings: Settings, workspace: Path) -> Any | N
     from ravn.valkyrie_evolution.learned_tools import (  # noqa: PLC0415
         LearnedToolError,
         LearnedToolResolver,
-        learned_tool_storage,
     )
-    from ravn.valkyrie_evolution.tool_curation import LearnedToolUsageLedger  # noqa: PLC0415
 
     state_dir = _resident_ravn_state_dir(workspace, settings)
     try:
@@ -446,7 +439,6 @@ def _build_learned_tool_resolver(settings: Settings, workspace: Path) -> Any | N
             ),
             workspace_root=workspace,
             timeout_seconds=settings.resident_evolution.tool_timeout_seconds,
-            usage_recorder=LearnedToolUsageLedger(learned_tool_storage(state_dir)[1]).record_run,
         )
     except LearnedToolError as exc:
         logger.warning("Skipping learned tools: %s", exc)
@@ -458,7 +450,7 @@ def _build_learned_tool_resolver(settings: Settings, workspace: Path) -> Any | N
     return resolver
 
 
-def _retired_learned_tools(state_dir: Path) -> Any:
+def _retired_learned_tools(state_dir: Path, skill_manager: Any | None) -> Any:
     """List the retired learned tools under *state_dir*, read fresh each call."""
     from ravn.valkyrie_evolution.learned_tools import learned_tool_storage  # noqa: PLC0415
     from ravn.valkyrie_evolution.tool_curation import tool_inventory  # noqa: PLC0415
@@ -469,9 +461,12 @@ def _retired_learned_tools(state_dir: Path) -> Any:
         return [
             entry
             for entry in tool_inventory(
-                tools_dir=code_dir, artifacts_dir=artifacts_dir, include_retired=True
+                tools_dir=code_dir,
+                artifacts_dir=artifacts_dir,
+                skills=skill_manager,
+                include_retired=True,
             )
-            if entry.retired is not None
+            if entry.retired
         ]
 
     return retired

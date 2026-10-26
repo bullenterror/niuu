@@ -161,8 +161,9 @@ async def _run_daemon(
         from ravn.valkyrie_evolution.tool_curation import learned_tool_health  # noqa: PLC0415
 
         learned_tool_state_dir = _resident_ravn_state_dir(workspace, settings)
+        learned_tool_skills = resident_learning_runtime.skills
         resident_runtime.bind_learned_tool_health(
-            lambda: learned_tool_health(learned_tool_state_dir)
+            lambda: learned_tool_health(learned_tool_state_dir, learned_tool_skills)
         )
         resident_runtime.bind_review_requester(resident_learning_runtime.review_requester)
         resident_learning_runtime.bind_operator_answerer(resident_runtime.submit_operator_answer)

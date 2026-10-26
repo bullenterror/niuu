@@ -25,6 +25,7 @@ from ravn.ports.tool_build_backend import (
     ToolBuildPendingError,
     ToolBuildTaskEndedError,
 )
+from ravn.skills.management import SkillLifecycle
 from ravn.tool_observability import publish_learned_tool_inventory
 from ravn.valkyrie_evolution.adapters import PolicyCourtReviewer
 from ravn.valkyrie_evolution.learned_tools import (
@@ -54,14 +55,14 @@ from ravn.valkyrie_evolution.resident_learning import (
     risk_class_for_safety,
 )
 from ravn.valkyrie_evolution.tool_curation import (
+    CAPABILITY_MATCHED_KEY,
     RETIRED_UNRUNNABLE,
-    LearnedToolUsageLedger,
     LineageMatch,
-    RetirementRecord,
-    ToolUsage,
-    find_lineage,
+    capability_matched_marker,
+    find_installed_capability,
     lineage_problems,
     restore_learned_tool,
+    retire_superseded_predecessor,
 )
 from ravn.valkyrie_evolution.tool_verification import (
     VerificationResult,
@@ -144,10 +145,9 @@ class BuildTool(ToolPort):
         # Meaning-based lineage lookup; None means only declared capability ids
         # and names (in any spelling) link a request to an installed tool.
         self._capability_matcher = capability_matcher
-        # The lifecycle registry, for rolled-back status and restoring the
-        # lifecycle of a tool brought back from retirement.
+        # The lifecycle registry: usage and rolled-back status for lineage,
+        # and the record a retirement or restore is written to.
         self._skill_manager = skill_manager
-        self._usage_ledger = LearnedToolUsageLedger(self._artifacts_dir)
 
     def _investigation_prompt(self) -> str:
         """The investigation prompt that drove this build, for review provenance."""
@@ -738,29 +738,23 @@ class BuildTool(ToolPort):
                 },
             )
 
-            def _load(*, record_usage: bool) -> Any:
-                return load_learned_tool(
-                    artifact=artifact,
-                    tool_path=tool_path,
-                    timeout_seconds=self._timeout_seconds,
-                    runner=self._runner_for_backend(),
-                    # Canonical venv home beside the learned-tools dir: a freshly
-                    # built tool with requirements must be runnable on the local
-                    # backend, not refuse for want of a venvs_dir.
-                    venvs_dir=learned_tool_venvs_dir(self._tools_dir.parent),
-                    usage_recorder=self._usage_ledger.record_run if record_usage else None,
-                )
-
-            # The canary is the build checking itself, not a use: counted as
-            # one, every built tool would look used the moment it installed.
-            learned_tool = _load(record_usage=True)
+            learned_tool = load_learned_tool(
+                artifact=artifact,
+                tool_path=tool_path,
+                timeout_seconds=self._timeout_seconds,
+                runner=self._runner_for_backend(),
+                # Canonical venv home beside the learned-tools dir: a freshly
+                # built tool with requirements must be runnable on the local
+                # backend, not refuse for want of a venvs_dir.
+                venvs_dir=learned_tool_venvs_dir(self._tools_dir.parent),
+            )
 
             if isinstance(canary_input, dict):
                 with telemetry.span(
                     "ravn.tool_build.canary",
                     attributes={"ravn.tool_build.name": artifact.manifest.name},
                 ) as canary_span:
-                    canary = await _load(record_usage=False).execute(canary_input)
+                    canary = await learned_tool.execute(canary_input)
                     canary_outcome = "error" if canary.is_error else "passed"
                     canary_span.set_attribute("ravn.tool_build.canary.outcome", canary_outcome)
                     telemetry.event(
@@ -825,10 +819,13 @@ class BuildTool(ToolPort):
                         attributes=lifecycle_attributes,
                     )
             self._register_tool(learned_tool, replace=replace)  # type: ignore[call-arg]
-            self._usage_ledger.record_install(
-                artifact.manifest.name,
-                artifact.artifact_id,
-                repair="repair_of" in artifact.provenance,
+            # A version that supersedes a differently named tool replaces it:
+            # the predecessor is archived and uninstalled, not left beside it.
+            await retire_superseded_predecessor(
+                tools_dir=self._tools_dir,
+                artifacts_dir=self._artifacts_dir,
+                skills=self._skill_manager,
+                artifact=artifact,
             )
             publish_learned_tool_inventory([artifact])
             telemetry.event(
@@ -909,9 +906,10 @@ class BuildTool(ToolPort):
         schema = manifest.get("input_schema")
         properties = schema.get("properties") if isinstance(schema, dict) else None
         try:
-            match = await find_lineage(
+            match = await find_installed_capability(
                 tools_dir=self._tools_dir,
                 artifacts_dir=self._artifacts_dir,
+                skills=self._skill_manager,
                 capability_id=str(input.get("capability_id") or ""),
                 name=name,
                 description=str(manifest.get("description") or ""),
@@ -924,36 +922,28 @@ class BuildTool(ToolPort):
                 f"capability, so nothing was built: {exc}"
             ) from exc
         if match is None:
-            return None, input
+            if self._capability_matcher is None:
+                return None, input
+            # Judged against every tool and found new: record that, so the
+            # dream's capability backfill does not judge it again.
+            provenance = dict(input.get("provenance") or {})
+            provenance[CAPABILITY_MATCHED_KEY] = capability_matched_marker(by="build_tool")
+            return None, {**input, "provenance": provenance}
 
         telemetry = get_observability()
         entry = match.entry
-        restored: RetirementRecord | None = None
-        if entry.retired is not None:
-            restored = (
-                restore_learned_tool(
-                    tools_dir=self._tools_dir,
-                    artifacts_dir=self._artifacts_dir,
-                    name=entry.name,
-                    why=f"build_tool was asked for {name!r} ({match.matched_by} match)",
-                )
-                or entry.retired
+        restored: SkillLifecycle | None = None
+        if entry.retired:
+            restored = await restore_learned_tool(
+                tools_dir=self._tools_dir,
+                artifacts_dir=self._artifacts_dir,
+                skills=self._skill_manager,
+                name=entry.name,
+                why=f"build_tool was asked for {name!r} ({match.matched_by} match)",
             )
-            if (
-                self._skill_manager is not None
-                and self._skill_manager.status(entry.name) == "archived"
-            ):
-                await self._skill_manager.restore(entry.name)
-        usage = self._usage_ledger.get(entry.name)
-        problems = lineage_problems(
-            entry,
-            usage,
-            lifecycle_status=(
-                self._skill_manager.status(entry.name) if self._skill_manager is not None else None
-            ),
-        )
-        if restored is not None and restored.reason == RETIRED_UNRUNNABLE:
-            problems.append(f"it had been retired as unrunnable: {restored.detail}")
+        problems = lineage_problems(entry)
+        if restored is not None and restored.archived_reason == RETIRED_UNRUNNABLE:
+            problems.append(f"it had been retired as unrunnable: {restored.archived_detail}")
 
         replace = bool(input.get("replace"))
         outcome = "repair" if problems or replace else "already_installed"
@@ -981,7 +971,11 @@ class BuildTool(ToolPort):
                 ToolResult(
                     tool_call_id="",
                     content=_already_serves_summary(
-                        input, entry.artifact, match=match, usage=usage, restored=restored
+                        input,
+                        entry.artifact,
+                        match=match,
+                        usage=entry.lifecycle,
+                        restored=restored,
                     ),
                 ),
                 input,
@@ -2069,8 +2063,8 @@ def _already_serves_summary(
     installed: LearnedToolArtifact,
     *,
     match: LineageMatch,
-    usage: ToolUsage | None,
-    restored: RetirementRecord | None,
+    usage: SkillLifecycle | None,
+    restored: SkillLifecycle | None,
 ) -> str:
     """Tell the resident it already owns this, before anything is commissioned."""
     manifest = input.get("manifest")
@@ -2088,9 +2082,9 @@ def _already_serves_summary(
         "description": installed.manifest.description,
         "usage": (
             {
-                "runs": usage.runs,
-                "successes": usage.successes,
-                "failures": usage.failures,
+                "runs": usage.run_count,
+                "successes": usage.success_count,
+                "failures": usage.failure_count,
                 "last_used_at": usage.last_used_at,
             }
             if usage is not None
@@ -2106,9 +2100,9 @@ def _already_serves_summary(
     }
     if restored is not None:
         payload["restored_from_retirement"] = {
-            "reason": restored.reason,
-            "detail": restored.detail,
-            "retired_at": restored.retired_at,
+            "reason": restored.archived_reason,
+            "detail": restored.archived_detail,
+            "retired_at": restored.archived_at,
         }
     return json.dumps(payload, indent=2)
 
@@ -2137,6 +2131,9 @@ def _repair_input(
         "match_reason": match.reason,
         "problems": list(problems),
     }
+    provenance[CAPABILITY_MATCHED_KEY] = capability_matched_marker(
+        by="build_tool", same_as=target.manifest.name, reason=match.reason
+    )
     repaired["provenance"] = provenance
     commissioned = bool(str(input.get("build_request") or "").strip()) and not bool(
         str(input.get("tool_code") or "").strip()

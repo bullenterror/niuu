@@ -3671,9 +3671,10 @@ class LearnedToolCurationConfig(BaseModel):
     Retires tools that another installed tool supersedes, that can never run,
     that are named as debug probes and never succeeded, or that were never run
     for longer than any tool on the resident waited before its first use. That
-    window is derived from the resident's own usage ledger, not configured.
-    Retirement moves the tool under ``_retired/`` and records why; asking
-    build_tool for the capability again restores it.
+    window is derived from the resident's lifecycle records, not configured.
+    Retirement moves the envelope into the ``_archive`` directory, removes the
+    code, and archives the lifecycle record with the reason; asking build_tool
+    for the capability again restores it.
     """
 
     enabled: bool = Field(

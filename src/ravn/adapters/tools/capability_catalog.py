@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from niuu.domain.agent_directory import AgentSkill
@@ -39,7 +39,6 @@ class CapabilityListTool(ToolPort):
         skill_manager: SkillManagementRegistry | None = None,
         workflow_sources: Sequence[WorkflowCapabilityPort] | None = None,
         learned_tools_provider: Callable[[], Sequence[Any]] | None = None,
-        learned_tool_usage: Callable[[], Mapping[str, Any]] | None = None,
         retired_learned_tools: Callable[[], Sequence[Any]] | None = None,
         agent_directory: PeerAgentDirectoryPort | None = None,
     ) -> None:
@@ -50,10 +49,6 @@ class CapabilityListTool(ToolPort):
         # Returns learned-tool artifact envelopes (manifest name/description/
         # schema) read from disk — never loaded as callables here (NIU-1118).
         self._learned_tools_provider = learned_tools_provider
-        # Per-tool usage from the ledger beside the artifacts (runs, successes,
-        # last use, the installed version's own record): the evidence that says
-        # which of two similar tools actually works.
-        self._learned_tool_usage = learned_tool_usage
         # Retired tools stay out of the listing — that is what retiring is for —
         # but a query that matches one says so, because asking build_tool for
         # it restores it instead of building it again.
@@ -274,7 +269,6 @@ class CapabilityListTool(ToolPort):
                         if self._skill_manager.status(artifact.manifest.name) != "archived"
                     ]
                 publish_learned_tool_inventory(learned_artifacts)
-                usage = dict(self._learned_tool_usage()) if self._learned_tool_usage else {}
                 for artifact in learned_artifacts:
                     manifest = artifact.manifest
                     verification = artifact.provenance.get("verification")
@@ -306,7 +300,6 @@ class CapabilityListTool(ToolPort):
                                 "supersedes": artifact.supersedes,
                                 "version": artifact.version,
                                 "lifecycle": self._learned_tool_lifecycle(manifest.name),
-                                "usage": _usage_metadata(usage.get(manifest.name)),
                             },
                         )
                     )
@@ -423,13 +416,13 @@ class CapabilityListTool(ToolPort):
                 manifest.description.casefold()
             ):
                 continue
-            record = entry.retired
+            record = entry.lifecycle
             matches.append(
                 {
                     "name": manifest.name,
                     "description": manifest.description,
-                    "retired_reason": record.reason if record else "",
-                    "retired_detail": record.detail if record else "",
+                    "retired_reason": record.archived_reason if record else "",
+                    "retired_detail": record.archived_detail if record else "",
                     "superseded_by": record.superseded_by if record else "",
                     "next_step": (
                         f"Use {record.superseded_by!r} instead."
@@ -458,8 +451,10 @@ class CapabilityListTool(ToolPort):
                 "success_count",
                 "failure_count",
                 "consecutive_failures",
+                "first_used_at",
                 "last_used_at",
             )
+            if key in metadata
         }
 
 
@@ -539,41 +534,18 @@ def _index_entry(capability: Capability) -> dict[str, Any]:
         if metadata.get(key):
             entry[key] = metadata[key]
     lifecycle = metadata.get("lifecycle")
-    usage = metadata.get("usage")
-    if isinstance(usage, dict):
-        entry["usage"] = {
-            "runs": usage.get("runs"),
-            "successes": usage.get("successes"),
-            "last_used": usage.get("last_used_at") or None,
-        }
-        if isinstance(lifecycle, dict) and lifecycle.get("status"):
-            entry["usage"]["status"] = lifecycle.get("status")
-    elif isinstance(lifecycle, dict) and lifecycle.get("status"):
+    if isinstance(lifecycle, dict) and lifecycle.get("status"):
         entry["usage"] = {
             "status": lifecycle.get("status"),
             "runs": lifecycle.get("run_count"),
             "failures": lifecycle.get("failure_count"),
         }
+        # Which of two similar tools actually works, and is still used.
+        if "success_count" in lifecycle:
+            entry["usage"]["successes"] = lifecycle.get("success_count")
+        if lifecycle.get("last_used_at"):
+            entry["usage"]["last_used"] = lifecycle.get("last_used_at")
     return entry
-
-
-def _usage_metadata(usage: Any | None) -> dict[str, Any] | None:
-    """The ledger's record for one learned tool, as catalog metadata."""
-    if usage is None:
-        return None
-    return {
-        "runs": usage.runs,
-        "successes": usage.successes,
-        "failures": usage.failures,
-        "consecutive_failures": usage.consecutive_failures,
-        "first_used_at": usage.first_used_at,
-        "last_used_at": usage.last_used_at,
-        "last_success_at": usage.last_success_at,
-        "installed_at": usage.installed_at,
-        "version_runs": usage.version_runs,
-        "version_successes": usage.version_successes,
-        "repairs": usage.repairs,
-    }
 
 
 #: Names-and-kinds only, so a miss can show the whole catalog cheaply. Bounded

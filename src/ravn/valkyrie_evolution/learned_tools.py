@@ -123,20 +123,6 @@ class LearnedToolInfrastructureError(RuntimeError):
     """
 
 
-class LearnedToolUsageError(RuntimeError):
-    """A finished learned-tool run could not be recorded in the usage ledger.
-
-    Distinct from the tool failing: the run happened and its result is real.
-    Callers that turn tool exceptions into tool errors must let this through,
-    or a full disk would read as a failing tool and count toward rollback.
-    """
-
-
-#: Records one finished run of a learned tool: ``(name, artifact_id, succeeded)``.
-#: Raises :class:`LearnedToolUsageError` when the record cannot be written.
-LearnedToolUsageRecorder = Callable[[str, str, bool], None]
-
-
 def grant_reaches_network(grant: ToolReachGrant) -> bool:
     """True when *grant* reaches past this machine (see :data:`LOCAL_REACH_KINDS`)."""
     if grant.access == "none":
@@ -1502,8 +1488,6 @@ class LearnedTool(ToolPort):
         runner: LearnedToolRunner | None = None,
         requirements: Sequence[str] = (),
         host_call: HostCall | None = None,
-        artifact_id: str = "",
-        usage_recorder: LearnedToolUsageRecorder | None = None,
     ) -> None:
         _validate_manifest(manifest)
         self._manifest = manifest
@@ -1528,11 +1512,6 @@ class LearnedTool(ToolPort):
             )
         self._requirements = list(requirements)
         self._host_call = host_call
-        self._artifact_id = artifact_id
-        # Every path that runs this tool records here — learned_tool_run and a
-        # tool build_tool registered live — so usage evidence does not depend
-        # on which door the call came through.
-        self._usage_recorder = usage_recorder
 
     @property
     def name(self) -> str:
@@ -1582,17 +1561,11 @@ class LearnedTool(ToolPort):
                 detail = f"{detail}\n{result.stderr}"
             if result.infrastructure:
                 raise LearnedToolInfrastructureError(detail)
-            self._record_usage(succeeded=False)
             return ToolResult(tool_call_id="", content=detail, is_error=True)
-        self._record_usage(succeeded=True)
         return ToolResult(
             tool_call_id="",
             content=json.dumps(result.result, indent=2, sort_keys=True),
         )
-
-    def _record_usage(self, *, succeeded: bool) -> None:
-        if self._usage_recorder is not None:
-            self._usage_recorder(self._manifest.name, self._artifact_id, succeeded)
 
 
 def write_learned_tool(
@@ -1817,7 +1790,6 @@ def load_learned_tool(
     requirements: list[str] | None = None,
     venvs_dir: str | Path | None = None,
     host_call: HostCall | None = None,
-    usage_recorder: LearnedToolUsageRecorder | None = None,
 ) -> LearnedTool:
     """Create an agent-callable ToolPort from a learned artifact.
 
@@ -1837,8 +1809,6 @@ def load_learned_tool(
         runner=runner,
         requirements=resolved_requirements,
         host_call=host_call,
-        artifact_id=artifact.artifact_id,
-        usage_recorder=usage_recorder,
     )
 
 
@@ -1868,30 +1838,19 @@ def superseded_artifact_path(
     return Path(artifacts_dir) / SUPERSEDED_ARTIFACTS_DIRNAME / f"{stem}__{suffix}.json"
 
 
-#: Subdirectory (of both the code and the artifacts dir) holding retired tools.
-#: Retirement moves a tool here instead of deleting it, so it is reversible;
-#: nothing that globs ``*.py`` / ``*.json`` at the top level sees it.
-RETIRED_DIRNAME = "_retired"
-
 #: Subdirectory of the artifacts dir for builds that failed verification. They
 #: are kept for audit but never written over the installed tool's envelope: a
 #: failed rebuild used to replace a working tool's envelope, which made the
 #: working code on disk unrunnable.
 FAILED_ARTIFACTS_DIRNAME = "_failed"
 
-#: Subdirectory of the artifacts dir for curation state: the usage ledger,
-#: retirement records, and capability verdicts.
-CURATION_DIRNAME = "_curation"
 
-
-def retired_tool_path(tools_dir: str | Path, tool_name: str) -> Path:
-    """Where a retired tool's code is kept."""
-    return Path(tools_dir) / RETIRED_DIRNAME / f"{_filename_for_tool(tool_name)}.py"
-
-
-def retired_artifact_path(artifacts_dir: str | Path, tool_name: str) -> Path:
-    """Where a retired tool's envelope is kept."""
-    return Path(artifacts_dir) / RETIRED_DIRNAME / f"{_filename_for_tool(tool_name)}.json"
+def archived_artifact_paths(artifacts_dir: str | Path, tool_name: str) -> list[Path]:
+    """Every archived (superseded or retired) envelope kept for *tool_name*."""
+    directory = Path(artifacts_dir) / SUPERSEDED_ARTIFACTS_DIRNAME
+    if not directory.is_dir():
+        return []
+    return sorted(directory.glob(f"{_filename_for_tool(tool_name)}__*.json"))
 
 
 def failed_artifact_path(artifacts_dir: str | Path, tool_name: str, artifact_id: str) -> Path:
@@ -2078,7 +2037,6 @@ class LearnedToolResolver:
         workspace_root: str | Path | None = None,
         timeout_seconds: float = DEFAULT_TOOL_TIMEOUT_SECONDS,
         execution_backend_kwargs: Mapping[str, Any] | None = None,
-        usage_recorder: LearnedToolUsageRecorder | None = None,
     ) -> None:
         if execution_backend not in KNOWN_EXECUTION_BACKENDS:
             raise LearnedToolError(f"unknown learned tool execution backend: {execution_backend!r}")
@@ -2089,7 +2047,6 @@ class LearnedToolResolver:
         self._execution_backend_kwargs = dict(execution_backend_kwargs or {})
         self._code_dir, self._artifacts_dir = learned_tool_storage(self._state_dir)
         self._venvs_dir = learned_tool_venvs_dir(self._state_dir)
-        self._usage_recorder = usage_recorder
 
     @property
     def artifacts_dir(self) -> Path:
@@ -2151,11 +2108,12 @@ class LearnedToolResolver:
             raise LearnedToolError(f"invalid learned tool name: {name!r}")
         artifact_path = learned_tool_artifact_path(self._artifacts_dir, name)
         if not artifact_path.is_file():
-            if retired_artifact_path(self._artifacts_dir, name).is_file():
+            if any(archived_artifact_paths(self._artifacts_dir, name)):
                 raise LearnedToolError(
-                    f"learned tool {name!r} is retired. Use the installed tool that serves "
-                    "the same capability (capability_list), or ask build_tool for this "
-                    "capability, which restores it when it is still the right tool"
+                    f"learned tool {name!r} is not installed; only archived versions of it "
+                    "exist. Use the installed tool that serves the same capability "
+                    "(capability_list), or ask build_tool for this capability, which "
+                    "restores it when it is still the right tool"
                 )
             raise LearnedToolError(f"no learned tool named {name!r} is installed")
         artifact = read_learned_tool_artifact(artifact_path)
@@ -2170,7 +2128,6 @@ class LearnedToolResolver:
             runner=self._runner(),
             venvs_dir=self._venvs_dir,
             host_call=host_call,
-            usage_recorder=self._usage_recorder,
         )
 
     def _tool_path(self, name: str) -> Path:

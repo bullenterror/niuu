@@ -1255,7 +1255,7 @@ def learned_tools_plan(
     """Print what the next consolidation dream would retire from the learned tools.
 
     Read-only: it computes the same plan the dream applies, with the same
-    usage ledger, capability judge and never-used window, and prints it as
+    lifecycle usage, capability judge and never-used window, and prints it as
     JSON. Nothing is moved, archived or written; retirement happens only in
     the dream, so the running resident's lifecycle registry stays the one
     writer.
