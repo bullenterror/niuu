@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 from niuu.observability import get_observability
 from niuu.ports.mimir import MimirPort
 from ravn.budget import IterationBudget, TokenEstimator
-from ravn.cap_telemetry import record_truncation, require_complete
+from ravn.cap_telemetry import record_cap_hit, record_truncation, require_complete
 from ravn.compression import CompressionResult, ContextCompressor
 from ravn.config import ExtendedThinkingConfig
 from ravn.domain.budget import compute_cost as _compute_cost_usd
@@ -455,6 +455,7 @@ class RavnAgent:
     async def repair_outcome(self, prompt: str) -> TurnResult:
         """Repair output formatting without replaying history or executing tools."""
         if self._iteration_budget is not None and self._iteration_budget.exhausted:
+            self._record_iteration_cap("iteration_budget.total")
             raise MaxIterationsError(self._max_iterations)
         system = "Repair the supplied outcome contract. Preserve the evidence and decisions."
         messages = [{"role": "user", "content": prompt}]
@@ -537,6 +538,7 @@ class RavnAgent:
 
         # Check budget before starting the turn.
         if self._iteration_budget is not None and self._iteration_budget.exhausted:
+            self._record_iteration_cap("iteration_budget.total")
             raise MaxIterationsError(self._max_iterations)
 
         # Build the effective system prompt. When using a prompt_builder,
@@ -611,6 +613,7 @@ class RavnAgent:
                     last_tool_result=turn_tool_results[-1] if turn_tool_results else None,
                     interrupted_by=InterruptReason.BUDGET_EXHAUSTED,
                 )
+                self._record_iteration_cap("iteration_budget.total")
                 raise MaxIterationsError(self._max_iterations)
 
             # Optionally compress context before calling the LLM.
@@ -798,6 +801,7 @@ class RavnAgent:
                 last_tool_result=turn_tool_results[-1] if turn_tool_results else None,
                 interrupted_by=InterruptReason.BUDGET_EXHAUSTED,
             )
+            self._record_iteration_cap("agent.max_iterations")
             raise MaxIterationsError(self._max_iterations)
 
         self._session.record_turn(cumulative_usage)
@@ -1490,6 +1494,14 @@ class RavnAgent:
             purpose="the post-task reflection",
         )
         return response.content
+
+    def _record_iteration_cap(self, knob: str) -> None:
+        """Count a turn stopped by its iteration limit (it raises MaxIterationsError)."""
+        record_cap_hit(
+            knob,
+            f"turn stopped after {self._max_iterations} model iteration(s) with the work "
+            f"unfinished (checkpointed); raise {knob} if the work needs more steps",
+        )
 
     def _resolve_thinking(
         self,

@@ -13,12 +13,15 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from ravn.agent import RavnAgent
+from ravn.budget import IterationBudget
 from ravn.cap_telemetry import (
     CAP_HITS,
     HEALTH_TOTAL_KEY,
     cap_hit_counts,
+    degraded_counts,
     health_counts,
     record_cap_hit,
+    record_degraded,
     record_truncation,
     require_complete,
 )
@@ -26,6 +29,7 @@ from ravn.compression import ContextCompressor
 from ravn.domain.exceptions import (
     ConfigurationError,
     ContextCompressionError,
+    MaxIterationsError,
     OutputTruncatedError,
 )
 from ravn.domain.models import (
@@ -72,11 +76,24 @@ class TestRecord:
         assert telemetry.count.call_args.kwargs["attributes"] == {"ravn.cap.knob": "wakefulness"}
 
     def test_health_counts_total_and_per_knob(self) -> None:
-        assert health_counts() == {HEALTH_TOTAL_KEY: 0}
+        assert health_counts() == {HEALTH_TOTAL_KEY: 0, "degraded_total": 0}
         record_cap_hit("a", "x")
         record_cap_hit("b", "x")
         record_cap_hit("b", "x")
-        assert health_counts() == {"cap_hits.a": 1, "cap_hits.b": 2, HEALTH_TOTAL_KEY: 3}
+        record_degraded("operator_reply.persist", "x")
+        assert health_counts() == {
+            "cap_hits.a": 1,
+            "cap_hits.b": 2,
+            HEALTH_TOTAL_KEY: 3,
+            "degraded.operator_reply.persist": 1,
+            "degraded_total": 1,
+        }
+
+    def test_a_degraded_path_logs_an_error_and_counts(self, caplog) -> None:
+        with caplog.at_level(logging.ERROR, logger="ravn.cap_telemetry"):
+            record_degraded("directed_message.persist", "not written; delivered live")
+        assert degraded_counts() == {"directed_message.persist": 1}
+        assert "degraded [directed_message.persist]" in caplog.records[0].getMessage()
 
     def test_truncation_names_what_was_cut(self, caplog) -> None:
         with caplog.at_level(logging.ERROR, logger="ravn.cap_telemetry"):
@@ -134,6 +151,25 @@ class TestAgentTurn:
         with pytest.raises(OutputTruncatedError):
             await agent.run_turn("go")
         tool.execute.assert_not_awaited()
+
+    async def test_running_out_of_iterations_is_counted(self) -> None:
+        call = ToolCall(id="c1", name="echo", input={"message": "again"})
+        looping = [_response(StopReason.TOOL_USE, "", tool_calls=[call]) for _ in range(3)]
+        agent, _ = make_agent(MockLLM(looping), tools=[EchoTool()], max_iterations=2)
+
+        with pytest.raises(MaxIterationsError):
+            await agent.run_turn("loop")
+        assert cap_hit_counts() == {"agent.max_iterations": 1}
+
+    async def test_an_exhausted_iteration_budget_is_counted(self) -> None:
+        agent, _ = make_agent(MockLLM([]))
+        agent._iteration_budget = IterationBudget(total=1, consumed=1)
+
+        with pytest.raises(MaxIterationsError):
+            await agent.run_turn("anything")
+        with pytest.raises(MaxIterationsError):
+            await agent.repair_outcome("fix it")
+        assert cap_hit_counts() == {"iteration_budget.total": 2}
 
     async def test_outcome_repair_refuses_a_cut_off_repair(self) -> None:
         agent, _ = make_agent(MockLLM([_response(StopReason.MAX_TOKENS, "---outcome---")]))

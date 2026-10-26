@@ -37,7 +37,6 @@ class TestResidentContext:
         assert text.endswith("(truncated)")
         assert cap_hit_counts() == {"resident_state.continuation_context_max_chars": 1}
 
-
     def test_text_within_the_bound_is_untouched(self) -> None:
         assert _bounded("short", 10, knob="k", what="w") == "short"
         assert cap_hit_counts() == {}

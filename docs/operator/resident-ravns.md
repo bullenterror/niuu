@@ -348,17 +348,13 @@ superseded) is not applied to any other case. The resident logs
 `ravn.resident.operator_reply.unbound`, and receives your words labelled as a
 reply that bound to nothing.
 
-Each case has a continuation budget:
-
-```yaml
-resident_state:
-  continuation_max_turns: 3     # turns one case may take on its own
-  continuation_max_tokens: 0    # cumulative tokens per case; 0 = no cap
-```
-
-A spent budget stops the resident from scheduling another recheck of that case.
-It never stops it asking you: a question hands the case to you, and your answer
-is the only way it continues.
+A case has no turn or token cap of its own. Its rechecks are bounded by the
+resident's daily budget (`budget.daily_cap_usd`; a spent budget holds tasks
+until the UTC day rolls over and counts on `ravn.cap.hits`), by one turn per
+scheduled wake, and by the repeated-decision guard below. The former
+`resident_state.continuation_max_turns` and `continuation_max_tokens` are
+refused at config load: a 3-turn cap once stopped a case on the turn that asked
+you a question, so the question was never saved.
 
 ## When a resident stops making progress
 

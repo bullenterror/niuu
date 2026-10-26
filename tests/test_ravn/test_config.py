@@ -1190,3 +1190,12 @@ class TestPromptBudgetDerivation:
             context_management={"context_window_tokens": 131072, "max_prompt_tokens": 100000}
         )
         assert settings.effective_max_tokens() is None
+
+
+class TestRemovedContinuationCaps:
+    """Rechecks are bounded by the daily budget, one turn per wake and the decision guard."""
+
+    @pytest.mark.parametrize("key", ["continuation_max_turns", "continuation_max_tokens"])
+    def test_a_config_still_setting_it_is_refused(self, key: str) -> None:
+        with pytest.raises(ValueError, match=f"resident_state.{key} no longer exist"):
+            Settings(resident_state={key: 3})

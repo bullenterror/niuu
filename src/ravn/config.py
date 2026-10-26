@@ -3851,6 +3851,21 @@ class ResidentStateConfig(BaseModel):
     reachable.
     """
 
+    @model_validator(mode="before")
+    @classmethod
+    def _refuse_removed_turn_caps(cls, data: Any) -> Any:
+        """A removed cap left in a config would read as enforced while doing nothing."""
+        if isinstance(data, dict):
+            removed = sorted({"continuation_max_turns", "continuation_max_tokens"} & set(data))
+            if removed:
+                raise ValueError(
+                    f"resident_state.{', resident_state.'.join(removed)} no longer exist: "
+                    "resident case continuations are bounded by budget.daily_cap_usd, one "
+                    "turn per scheduled wake, and repeated_decision_escalate_after; remove "
+                    "the key"
+                )
+        return data
+
     adapter: str = Field(
         default="ravn.adapters.resident_state.mimir.LocalResidentState",
         description="Fully-qualified ResidentStatePort adapter class. No fallback.",
@@ -3862,16 +3877,6 @@ class ResidentStateConfig(BaseModel):
     secret_kwargs_env: dict[str, str] = Field(
         default_factory=dict,
         description="Maps adapter kwarg names to env var names for secret injection.",
-    )
-    continuation_max_turns: int = Field(
-        default=3,
-        ge=1,
-        description="Maximum model turns in one automatically continued resident case.",
-    )
-    continuation_max_tokens: int = Field(
-        default=0,
-        ge=0,
-        description="Cumulative resident-case token cap; 0 leaves the token cap disabled.",
     )
     continuation_context_max_chars: int = Field(
         default=12000,

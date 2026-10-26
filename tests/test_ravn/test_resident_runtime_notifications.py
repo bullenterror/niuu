@@ -205,7 +205,7 @@ async def test_a_question_asked_on_a_spent_budget_still_takes_its_reply(tmp_path
         queued.append(task)
         return True
 
-    runtime = ResidentRuntime(state=LocalResidentState(tmp_path / "state"), max_turns=3)
+    runtime = ResidentRuntime(state=LocalResidentState(tmp_path / "state"))
     runtime.bind_enqueue(enqueue)
     case_id = "resident-stewardship-20261026T002939Z"
     disposition = await runtime.handle_completed_turn(

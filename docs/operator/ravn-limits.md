@@ -26,6 +26,14 @@ counted it.
   `cap_hits_total` plus one `cap_hits.<knob>` per limit that was hit since the
   resident started. The `ravn.resident.cap_hits` gauge restates the total next
   to the other scorecard gauges.
+- Where raising would lose more than continuing, the degradation is an error
+  log plus `ravn.degraded` (attribute `ravn.degraded.path`), and appears in
+  the health snapshot as `degraded_total` / `degraded.<path>` with the
+  `ravn.resident.degraded` gauge. That covers three paths. An operator reply
+  that could not be saved as an answer (`operator_reply.persist`) is
+  delivered as an ordinary task, and its question stays open. A reply naming
+  a closed question (`operator_reply.unbound`) and a directed message not
+  written to the durable inbox (`directed_message.persist`) are also counted.
 - `ravn.cap_telemetry` is the only implementation: `require_complete()` for
   model answers, `record_truncation()` / `record_cap_hit()` for everything else.
 
@@ -65,7 +73,9 @@ ref).
 | `resident_state.directed_message_context_max_chars` | 4000 | Prompt budget | Kept | Error log + counted |
 | Mandate in turn, operator-needed and wake records | was hard-coded 4000 | Input that created it (already stored whole in the turn's prompt) | **Removed**: the mandate was read back shortened on resume | — |
 | Operator question in the operator-needed record | was hard-coded 1000 | Notification body (`niuu.notifications.MAX_BODY_CHARS`, 4000) | Bound by the notification limit instead | Error log + counted |
-| `resident_state.continuation_max_turns` | 3 | — | Handled by the regin-reply-binding work (`272116c4d`), not changed here | STOP disposition |
+| `resident_state.continuation_max_turns` / `continuation_max_tokens` | 3 / 0 | `budget.daily_cap_usd` (on by default; flat pricing counts self-hosted tokens too), one turn per scheduled wake, `repeated_decision_escalate_after` | **Removed**. The turn cap stopped a case on the turn it asked the operator a question (fixed separately in `272116c4d`) and still cut scheduled rechecks short. A config that sets either key is refused at load. The unused `ResidentRunBudget` is removed too | — |
+| `budget.daily_cap_usd` | 1.0 | Operator's spend limit | Kept: the real bound on autonomous work | Error log + counted (it used to be an info log); the task waits for the UTC day to roll over |
+| `repeated_decision_escalate_after` | 5 | — | Kept: escalates a loop to the operator rather than stopping it | Operator question; `repeated_decision_streak` on the health snapshot |
 | **Tool output** | | | | |
 | `tools.bash.max_output_bytes` | 100 KiB | Prompt budget | Kept; output carries a notice | Error log + counted |
 | `tools.web.fetch.content_budget` | 20000 | Prompt budget | Kept; output carries a notice | Error log + counted |
@@ -81,6 +91,7 @@ ref).
 | Skuld Telegram `TELEGRAM_MAX_MESSAGE_LENGTH` | 4096 | Telegram: 4096 UTF-16 units after entity parsing | Measured in UTF-16 units; HTML chunks never split inside a tag or entity, and open tags are closed and reopened across a split | A failed chunk logs at error, and the event is not marked delivered, so a redelivery resends it |
 | **Retries and time** | | | | |
 | `llm.max_retries` / `llm.retry_base_delay` / `llm.timeout` | 3 / 1.0 s / 120 s | Provider availability | Kept; `timeout` is the bound for an uncapped answer | `LLMError` after the retries |
+| `agent.max_iterations` / `iteration_budget.total` | 20 / 90 | `budget.daily_cap_usd` bounds spend, but not how long one task holds its slot | Kept: a turn whose tool loop does not converge must end so the queue moves; `0` (max_iterations) is no cap | `MaxIterationsError` (checkpointed); counted |
 | `reflection.matching.judge_attempts`, post-session reflection 2 attempts, gate review 2 attempts | 2 | — | Kept: one retry on an unparseable answer, never on truncation | Raises after the last attempt |
 
 ## Remaining fallbacks (not changed in this sweep)

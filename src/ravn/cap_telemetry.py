@@ -37,8 +37,14 @@ ATTR_KNOB = "ravn.cap.knob"
 HEALTH_KEY_PREFIX = "cap_hits."
 HEALTH_TOTAL_KEY = "cap_hits_total"
 
+DEGRADED = "ravn.degraded"
+ATTR_PATH = "ravn.degraded.path"
+DEGRADED_KEY_PREFIX = "degraded."
+DEGRADED_TOTAL_KEY = "degraded_total"
+
 _lock = threading.Lock()
 _counts: Counter[str] = Counter()
+_degraded: Counter[str] = Counter()
 
 
 def record_cap_hit(knob: str, message: str) -> None:
@@ -71,6 +77,30 @@ def record_truncation(knob: str, *, what: str, kept: int, total: int, remedy: st
     )
 
 
+def record_degraded(path: str, message: str) -> None:
+    """Report that *path* carried on without part of what it should have done.
+
+    For the few places where raising would lose more than continuing — an
+    operator's reply that could not be saved still has to reach the resident —
+    the degradation is an error log and a count on the health snapshot, never
+    a silent continue.
+    """
+    with _lock:
+        _degraded[path] += 1
+    logger.error("degraded [%s]: %s", path, message)
+    get_observability().count(
+        DEGRADED,
+        attributes={ATTR_PATH: path},
+        description="Ravn paths that continued without completing their durable work.",
+    )
+
+
+def degraded_counts() -> dict[str, int]:
+    """Degraded paths taken since process start, keyed by path."""
+    with _lock:
+        return dict(_degraded)
+
+
 def cap_hit_counts() -> dict[str, int]:
     """Cap hits since process start, keyed by knob."""
     with _lock:
@@ -82,13 +112,19 @@ def health_counts() -> dict[str, int]:
     counts = cap_hit_counts()
     snapshot = {f"{HEALTH_KEY_PREFIX}{knob}": count for knob, count in sorted(counts.items())}
     snapshot[HEALTH_TOTAL_KEY] = sum(counts.values())
+    degraded = degraded_counts()
+    snapshot.update(
+        {f"{DEGRADED_KEY_PREFIX}{path}": count for path, count in sorted(degraded.items())}
+    )
+    snapshot[DEGRADED_TOTAL_KEY] = sum(degraded.values())
     return snapshot
 
 
 def reset_cap_hits() -> None:
-    """Forget every recorded hit (tests and process re-initialisation only)."""
+    """Forget every recorded hit and degradation (tests and process re-initialisation only)."""
     with _lock:
         _counts.clear()
+        _degraded.clear()
 
 
 def require_complete(

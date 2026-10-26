@@ -16,9 +16,9 @@ from typing import Any
 from niuu.domain.notifications import MAX_BODY_CHARS
 from niuu.domain.resident_notifications import AttentionInputKind
 from niuu.observability import get_observability
+from ravn.cap_telemetry import DEGRADED_TOTAL_KEY, record_truncation
 from ravn.cap_telemetry import HEALTH_TOTAL_KEY as CAP_HEALTH_TOTAL_KEY
 from ravn.cap_telemetry import health_counts as cap_health_counts
-from ravn.cap_telemetry import record_truncation
 from ravn.domain.exceptions import UnboundOperatorReplyError
 from ravn.domain.models import AgentTask, OutputMode, TokenUsage, TurnResult
 from ravn.domain.resident_continuation import (
@@ -146,8 +146,6 @@ class ResidentRuntime:
         resident_id: str = "resident",
         resident_personality: str = "",
         charter: str = "",
-        max_turns: int = 3,
-        max_tokens: int = 0,
         context_max_chars: int = 12000,
         tool_result_max_chars: int = 2000,
         scheduled_wake_default_seconds: float = 3600.0,
@@ -167,8 +165,6 @@ class ResidentRuntime:
         self._resident_id = resident_id.strip() or "resident"
         self._resident_personality = resident_personality.strip()
         self._charter = charter.strip()
-        self._max_turns = max(1, int(max_turns))
-        self._max_tokens = max(0, int(max_tokens))
         self._context_max_chars = max(1000, int(context_max_chars))
         self._tool_result_max_chars = max(100, int(tool_result_max_chars))
         self._scheduled_wake_default_seconds = max(1.0, float(scheduled_wake_default_seconds))
@@ -339,11 +335,18 @@ class ResidentRuntime:
             telemetry.gauge(name, value, attributes=attributes, description=description)
         # The hits themselves are the ravn.cap.hits counter (cap_telemetry);
         # this restates the resident's total next to the other scorecard gauges.
+        live = cap_health_counts()
         telemetry.gauge(
             "ravn.resident.cap_hits",
-            cap_health_counts()[CAP_HEALTH_TOTAL_KEY],
+            live[CAP_HEALTH_TOTAL_KEY],
             attributes=attributes,
             description="Configured Ravn limits reached since the resident started.",
+        )
+        telemetry.gauge(
+            "ravn.resident.degraded",
+            live[DEGRADED_TOTAL_KEY],
+            attributes=attributes,
+            description="Paths that continued without their durable work since start.",
         )
 
     async def prepare_context(self, task: AgentTask) -> str:
@@ -880,22 +883,11 @@ class ResidentRuntime:
         self._inflight_refs.difference_update(task.resident_inbox_refs)
         control = str(fields.get("continuation") or "").strip().casefold()
         if control == "sleep":
-            timing = str(fields.get("next_action_timing") or "").strip().casefold()
-            if timing == "scheduled_time":
-                budget_reason = _budget_stop_reason(
-                    turn_index=turn_index,
-                    total_tokens=cumulative.total_tokens,
-                    max_turns=self._max_turns,
-                    max_tokens=self._max_tokens,
-                )
-                if budget_reason:
-                    return ResidentTurnDisposition(
-                        kind=ContinuationDecisionKind.STOP,
-                        case_id=case_id,
-                        turn_ref=turn_ref,
-                        budget_ref=budget_ref,
-                        reason=budget_reason,
-                    )
+            # No per-case turn or token cap: rechecks are bounded by the daily
+            # budget (budget.daily_cap_usd, which prices self-hosted tokens too),
+            # by one turn per scheduled wake, and by the repeated-decision guard
+            # below. A turn cap stopped cases mid-work — once on the turn that
+            # asked the operator a question, so the question was never saved.
             stuck_reason = await self._repeated_decision_reason(
                 fields, record=record, case_id=case_id
             )
@@ -2074,20 +2066,6 @@ def _reply_case_id(metadata: Mapping[str, Any]) -> str:
         case_id = str(source.get("resident_case_id") or source.get("case_id") or "").strip()
         if case_id:
             return case_id
-    return ""
-
-
-def _budget_stop_reason(
-    *,
-    turn_index: int,
-    total_tokens: int,
-    max_turns: int,
-    max_tokens: int,
-) -> str:
-    if turn_index >= max_turns:
-        return f"resident continuation turn budget reached: {max_turns}"
-    if max_tokens > 0 and total_tokens >= max_tokens:
-        return f"resident continuation token budget reached: {max_tokens}"
     return ""
 
 
