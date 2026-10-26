@@ -30,7 +30,7 @@ thing. Tools that only share a topic are not the same — listing pods and \
 reading pod logs are different capabilities, and so are logs since a time and \
 logs of the previous container. A candidate that does strictly more than the \
 subject, including everything the subject does, IS the same capability. \
-Descriptions may be shortened.
+Descriptions may be shortened.{revision}
 
 Subject:
 {subject}
@@ -42,6 +42,15 @@ Respond with a single JSON object:
 {{"same": [<numbers of the candidates that provide the same capability>], \
 "reason": "one sentence"}}\
 """
+
+#: Added when the subject is a build request: it is what a tool's next version
+#: should do, so a request that adds to a candidate belongs to that candidate.
+_REVISION_CLAUSE = (
+    " The subject is a request for a tool to be built. A candidate the subject "
+    "only adds to (an extra output field, an extra option, a related count or "
+    "summary) IS the same capability too: the subject is what that candidate's "
+    "next version should do, not a new tool."
+)
 
 
 class SemanticCapabilityMatcher:
@@ -71,6 +80,8 @@ class SemanticCapabilityMatcher:
         self,
         subject: CapabilityDescriptor,
         candidates: Sequence[CapabilityDescriptor],
+        *,
+        as_revision: bool = False,
     ) -> list[CapabilityVerdict]:
         others = [candidate for candidate in candidates if candidate.key != subject.key]
         if not others:
@@ -91,7 +102,11 @@ class SemanticCapabilityMatcher:
             f"[{number}] {self._describe(item)}" for number, (item, _) in enumerate(shortlist, 1)
         )
         answer = await self._judge.ask_json(
-            _SAME_CAPABILITY_PROMPT.format(subject=self._describe(subject), candidates=listing)
+            _SAME_CAPABILITY_PROMPT.format(
+                subject=self._describe(subject),
+                candidates=listing,
+                revision=_REVISION_CLAUSE if as_revision else "",
+            )
         )
         chosen = _chosen_numbers(answer.get("same"), shown=len(shortlist))
         reason = str(answer.get("reason") or "")

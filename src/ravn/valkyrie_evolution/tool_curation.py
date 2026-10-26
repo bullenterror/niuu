@@ -727,7 +727,9 @@ async def find_lineage(
             description=description,
             inputs=tuple(inputs),
         )
-        verdicts = await matcher.same_capability(subject, [entry.descriptor() for entry in entries])
+        verdicts = await matcher.same_capability(
+            subject, [entry.descriptor() for entry in entries], as_revision=True
+        )
         same = sorted(
             (verdict for verdict in verdicts if verdict.same),
             key=lambda verdict: verdict.similarity,

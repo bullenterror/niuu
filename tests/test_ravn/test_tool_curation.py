@@ -107,13 +107,17 @@ class FakeMatcher:
     def __init__(self, *groups: set[str]) -> None:
         self._groups = groups
         self.calls = 0
+        self.revisions: list[bool] = []
 
     async def same_capability(
         self,
         subject: CapabilityDescriptor,
         candidates: Sequence[CapabilityDescriptor],
+        *,
+        as_revision: bool = False,
     ) -> list[CapabilityVerdict]:
         self.calls += 1
+        self.revisions.append(as_revision)
         return [
             CapabilityVerdict(
                 candidate_key=candidate.key,
@@ -372,6 +376,8 @@ class TestLineage:
         assert found is not None
         assert found.entry.name == "list_pods_in_namespace_sa"
         assert found.matched_by == "semantic"
+        # A build request is judged as a possible next version of a tool.
+        assert matcher.revisions == [True]
 
     async def test_no_tools_means_no_lineage(self, tmp_path: Path) -> None:
         code_dir, artifacts_dir = learned_tool_storage(tmp_path)
@@ -508,6 +514,8 @@ class TestCurator:
         assert [(d.name, d.superseded_by) for d in plan.retire] == [
             ("list_pods_in_namespace_working", "k8s_pods_list_namespace")
         ]
+        # Retiring needs a stand-in, not a possible next version.
+        assert set(matcher.revisions) == {False}
         assert plan.judged_pairs > 0
         assert matcher.calls == calls
         assert again.judged_pairs == 0
@@ -609,6 +617,16 @@ class TestSemanticMatcher:
         await matcher.same_capability(_descriptor("pods"), [_descriptor("pods2")])
         # Descriptions are embedded once per matcher, not once per comparison.
         assert sorted(index.embedded) == ["events: events", "pods2: pods2", "pods: pods"]
+
+    async def test_a_build_request_is_judged_as_a_revision(self) -> None:
+        judge = _Judge({"same": [1]})
+        matcher, _ = self._matcher(judge)
+
+        await matcher.same_capability(_descriptor("pods"), [_descriptor("pods2")])
+        await matcher.same_capability(_descriptor("pods"), [_descriptor("pods2")], as_revision=True)
+
+        assert "next version" not in judge.prompts[0]
+        assert "next version should do" in judge.prompts[1]
 
     async def test_nothing_close_enough_makes_no_model_call(self) -> None:
         judge = _Judge({"same": []})
@@ -799,7 +817,7 @@ class TestRepairOverVariant:
         _install(tmp_path, "some_tool")
 
         class BrokenMatcher:
-            async def same_capability(self, *_: Any) -> list[CapabilityVerdict]:
+            async def same_capability(self, *_: Any, **__: Any) -> list[CapabilityVerdict]:
                 raise LessonJudgeError("unusable judge answer")
 
         backend = RecordingBackend()
