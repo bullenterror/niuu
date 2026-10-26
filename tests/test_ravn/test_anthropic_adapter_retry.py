@@ -9,8 +9,14 @@ import pytest
 import respx
 
 from ravn.adapters.llm.anthropic import AnthropicAdapter
+from ravn.cap_telemetry import cap_hit_counts, reset_cap_hits, retry_counts
 from ravn.domain.exceptions import LLMError
 from ravn.domain.models import StreamEventType
+
+
+@pytest.fixture(autouse=True)
+def _fresh_counts() -> None:
+    reset_cap_hits()
 
 
 def _sse(event: dict) -> str:
@@ -164,8 +170,13 @@ async def test_transport_error_exhausted_raises() -> None:
 
     respx.post("https://api.anthropic.com/v1/messages").mock(side_effect=side_effect)
 
-    with pytest.raises(LLMError):
+    with pytest.raises(LLMError, match="llm.max_retries") as raised:
         await adapter.generate([], tools=[], system="", model="m", max_tokens=100)
+
+    # The failure that was retried is the cause, not swallowed between attempts.
+    assert isinstance(raised.value.__cause__, httpx.ConnectError)
+    assert retry_counts() == {"llm.anthropic.connect": 1}
+    assert cap_hit_counts() == {"llm.max_retries": 1}
 
 
 @respx.mock

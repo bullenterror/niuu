@@ -24,6 +24,14 @@ from ravn.adapters.llm.provider_items import (
     provider_items_of,
     refuse_foreign_compaction,
 )
+from ravn.adapters.llm.transient import (
+    RETRYABLE_STATUS_CODES,
+    connection_retries_exhausted,
+    describe_failure,
+    note_connection_retry,
+    reissue_request,
+    resumable_stream,
+)
 from ravn.domain.exceptions import ConfigurationError, LLMError
 from ravn.domain.models import (
     LLMResponse,
@@ -47,7 +55,6 @@ _COMPACTION_EDIT = "compact_20260112"
 # The API refuses a compaction trigger below this many input tokens.
 _MIN_COMPACTION_TRIGGER_TOKENS = 50_000
 
-_RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503})
 # Stop reasons that mean the answer ran out of room: the output cap, or the
 # context window filling up before the model finished.
 _TRUNCATED_STOP_REASONS = frozenset({"max_tokens", "model_context_window_exceeded"})
@@ -245,6 +252,8 @@ class AnthropicAdapter(LLMPort, NativeCompactionPort):
         max_retries: int = 3,
         retry_base_delay: float = 1.0,
         timeout: float = 120.0,
+        stream_resume_window_seconds: float = 120.0,
+        stream_resume_max_backoff_seconds: float = 10.0,
     ) -> None:
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
@@ -254,6 +263,8 @@ class AnthropicAdapter(LLMPort, NativeCompactionPort):
         self._max_retries = max_retries
         self._retry_base_delay = retry_base_delay
         self._timeout = timeout
+        self._stream_resume_window_seconds = stream_resume_window_seconds
+        self._stream_resume_max_backoff_seconds = stream_resume_max_backoff_seconds
         # Model → compaction trigger, for the models set to native compaction.
         self._compaction_triggers: dict[str, int] = {}
 
@@ -399,34 +410,36 @@ class AnthropicAdapter(LLMPort, NativeCompactionPort):
                 else:
                     response = await client.post(url, json=payload)
 
-                if response.status_code not in _RETRYABLE_STATUS_CODES:
+                if response.status_code not in RETRYABLE_STATUS_CODES:
                     return response
 
                 if stream:
                     await response.aclose()
-
-                if attempt < self._max_retries:
-                    delay = self._retry_base_delay * (2**attempt)
-                    logger.warning(
-                        "Anthropic API returned %s, retrying in %.1fs (attempt %d/%d)",
-                        response.status_code,
-                        delay,
-                        attempt + 1,
-                        self._max_retries,
-                    )
-                    await asyncio.sleep(delay)
-                    last_exc = LLMError(
-                        f"Anthropic API error {response.status_code}",
-                        status_code=response.status_code,
-                    )
-
+                last_exc = LLMError(
+                    f"Anthropic API error {response.status_code}",
+                    status_code=response.status_code,
+                )
             except httpx.TransportError as exc:
                 last_exc = exc
-                if attempt < self._max_retries:
-                    delay = self._retry_base_delay * (2**attempt)
-                    await asyncio.sleep(delay)
 
-        raise LLMError(f"Anthropic API failed after {self._max_retries} retries") from last_exc
+            if attempt < self._max_retries:
+                delay = self._retry_base_delay * (2**attempt)
+                note_connection_retry(
+                    provider="anthropic",
+                    failure=last_exc,
+                    delay=delay,
+                    attempt=attempt + 1,
+                    max_retries=self._max_retries,
+                )
+                await asyncio.sleep(delay)
+
+        status_code = last_exc.status_code if isinstance(last_exc, LLMError) else None
+        raise connection_retries_exhausted(
+            provider="Anthropic API",
+            max_retries=self._max_retries,
+            detail=f" ({describe_failure(last_exc)})" if last_exc is not None else "",
+            status_code=status_code,
+        ) from last_exc
 
     async def stream(
         self,
@@ -449,135 +462,158 @@ class AnthropicAdapter(LLMPort, NativeCompactionPort):
             thinking=thinking,
         )
 
+        url = f"{self._base_url}/v1/messages"
+        capture = self._native_compaction_for(model) is not None
+
         async with httpx.AsyncClient(
             headers=self._headers(thinking_enabled=thinking_enabled, model=model),
             timeout=self._timeout,
         ) as client:
-            response = await self._post_with_retry(client, payload, stream=True)
 
-            if response.status_code != 200:
-                body = await response.aread()
-                raise LLMError(
-                    f"Anthropic API error {response.status_code}: {body.decode()}",
-                    status_code=response.status_code,
-                )
+            async def open_response(resumed: bool) -> httpx.Response:
+                if resumed:
+                    return await reissue_request(client, url, payload)
+                return await self._post_with_retry(client, payload, stream=True)
 
-            # With native compaction the turn's blocks are kept verbatim, by index.
-            capture = self._native_compaction_for(model) is not None
-            blocks: dict[int, dict] = {}
-            # Accumulate partial tool inputs keyed by tool_use block index.
-            partial_inputs: dict[int, dict] = {}
-            tool_ids: dict[int, str] = {}
-            tool_names: dict[int, str] = {}
-            # Accumulate thinking block text keyed by block index.
-            partial_thinking: dict[int, str] = {}
-            current_block_index = -1
-            accumulated_thinking_chars = 0
+            # A stream the gateway cuts mid-answer is re-issued within the
+            # window; the consumer discards the partial answer on STREAM_RESTART.
+            async for event in resumable_stream(
+                provider="anthropic",
+                window_seconds=self._stream_resume_window_seconds,
+                base_delay=self._retry_base_delay,
+                max_backoff_seconds=self._stream_resume_max_backoff_seconds,
+                open_response=open_response,
+                read_events=lambda response: self._read_events(response, capture=capture),
+            ):
+                yield event
 
-            async for line in response.aiter_lines():
-                if not line.startswith("data: "):
-                    continue
-                raw = line[len("data: ") :]
-                if raw == "[DONE]":
-                    break
+    async def _read_events(
+        self, response: httpx.Response, *, capture: bool
+    ) -> AsyncIterator[StreamEvent]:
+        """Parse one streaming Messages response into events.
 
-                try:
-                    event_data = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
+        All per-answer state lives here, so a re-issued request starts clean.
+        """
+        if response.status_code != 200:
+            body = await response.aread()
+            raise LLMError(
+                f"Anthropic API error {response.status_code}: {body.decode()}",
+                status_code=response.status_code,
+            )
 
-                event_type = event_data.get("type", "")
+        # With native compaction (`capture`) the turn's blocks are kept verbatim, by index.
+        blocks: dict[int, dict] = {}
+        # Accumulate partial tool inputs keyed by tool_use block index.
+        partial_inputs: dict[int, dict] = {}
+        tool_ids: dict[int, str] = {}
+        tool_names: dict[int, str] = {}
+        # Accumulate thinking block text keyed by block index.
+        partial_thinking: dict[int, str] = {}
+        current_block_index = -1
+        accumulated_thinking_chars = 0
 
-                match event_type:
-                    case "content_block_start":
-                        block = event_data.get("content_block", {})
-                        current_block_index = event_data.get("index", current_block_index)
-                        if capture:
-                            blocks[current_block_index] = dict(block)
-                        if block.get("type") == "tool_use":
-                            tool_ids[current_block_index] = block.get("id", "")
-                            tool_names[current_block_index] = block.get("name", "")
-                            partial_inputs[current_block_index] = {}
-                        elif block.get("type") == "thinking":
-                            partial_thinking[current_block_index] = ""
+        async for line in response.aiter_lines():
+            if not line.startswith("data: "):
+                continue
+            raw = line[len("data: ") :]
+            if raw == "[DONE]":
+                break
 
-                    case "content_block_delta":
-                        delta = event_data.get("delta", {})
-                        idx = event_data.get("index", current_block_index)
+            try:
+                event_data = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+
+            event_type = event_data.get("type", "")
+
+            match event_type:
+                case "content_block_start":
+                    block = event_data.get("content_block", {})
+                    current_block_index = event_data.get("index", current_block_index)
+                    if capture:
+                        blocks[current_block_index] = dict(block)
+                    if block.get("type") == "tool_use":
+                        tool_ids[current_block_index] = block.get("id", "")
+                        tool_names[current_block_index] = block.get("name", "")
+                        partial_inputs[current_block_index] = {}
+                    elif block.get("type") == "thinking":
+                        partial_thinking[current_block_index] = ""
+
+                case "content_block_delta":
+                    delta = event_data.get("delta", {})
+                    idx = event_data.get("index", current_block_index)
+                    if capture and idx in blocks:
+                        _accumulate_block(blocks[idx], delta)
+                    match delta.get("type"):
+                        case "text_delta":
+                            yield StreamEvent(
+                                type=StreamEventType.TEXT_DELTA,
+                                text=delta.get("text", ""),
+                            )
+                        case "thinking_delta":
+                            chunk = delta.get("thinking", "")
+                            if idx not in partial_thinking:
+                                partial_thinking[idx] = ""
+                            partial_thinking[idx] += chunk
+                            accumulated_thinking_chars += len(chunk)
+                            yield StreamEvent(
+                                type=StreamEventType.THINKING,
+                                text=chunk,
+                            )
+                        case "input_json_delta":
+                            # Accumulate partial JSON — emit when block stops.
+                            if idx not in partial_inputs:
+                                partial_inputs[idx] = {}
+                            chunk = delta.get("partial_json", "")
+                            partial_inputs[idx]["_raw"] = (
+                                partial_inputs[idx].get("_raw", "") + chunk
+                            )
+
+                case "content_block_stop":
+                    idx = event_data.get("index", current_block_index)
+                    if idx in partial_inputs:
+                        raw_json = partial_inputs[idx].get("_raw", "")
+                        try:
+                            parsed_input = json.loads(raw_json) if raw_json else {}
+                        except json.JSONDecodeError:
+                            parsed_input = {}
                         if capture and idx in blocks:
-                            _accumulate_block(blocks[idx], delta)
-                        match delta.get("type"):
-                            case "text_delta":
-                                yield StreamEvent(
-                                    type=StreamEventType.TEXT_DELTA,
-                                    text=delta.get("text", ""),
-                                )
-                            case "thinking_delta":
-                                chunk = delta.get("thinking", "")
-                                if idx not in partial_thinking:
-                                    partial_thinking[idx] = ""
-                                partial_thinking[idx] += chunk
-                                accumulated_thinking_chars += len(chunk)
-                                yield StreamEvent(
-                                    type=StreamEventType.THINKING,
-                                    text=chunk,
-                                )
-                            case "input_json_delta":
-                                # Accumulate partial JSON — emit when block stops.
-                                if idx not in partial_inputs:
-                                    partial_inputs[idx] = {}
-                                chunk = delta.get("partial_json", "")
-                                partial_inputs[idx]["_raw"] = (
-                                    partial_inputs[idx].get("_raw", "") + chunk
-                                )
-
-                    case "content_block_stop":
-                        idx = event_data.get("index", current_block_index)
-                        if idx in partial_inputs:
-                            raw_json = partial_inputs[idx].get("_raw", "")
-                            try:
-                                parsed_input = json.loads(raw_json) if raw_json else {}
-                            except json.JSONDecodeError:
-                                parsed_input = {}
-                            if capture and idx in blocks:
-                                blocks[idx]["input"] = parsed_input
-                            yield StreamEvent(
-                                type=StreamEventType.TOOL_CALL,
-                                tool_call=ToolCall(
-                                    id=tool_ids.get(idx, ""),
-                                    name=tool_names.get(idx, ""),
-                                    input=parsed_input,
-                                ),
-                            )
-                            del partial_inputs[idx]
-                        if idx in partial_thinking:
-                            del partial_thinking[idx]
-
-                    case "message_delta":
-                        usage_data = event_data.get("usage", {})
-                        stop_reason = _stop_reason(
-                            (event_data.get("delta") or {}).get("stop_reason")
-                        )
-                        # Approximate thinking tokens from accumulated char count.
-                        thinking_tokens = accumulated_thinking_chars // 4
-                        if capture:
-                            yield StreamEvent(
-                                type=StreamEventType.PROVIDER_ITEMS,
-                                provider_items=[blocks[index] for index in sorted(blocks)],
-                                provider_protocol=ANTHROPIC_MESSAGES,
-                            )
-                        compaction_in, compaction_out = _compaction_usage(usage_data)
+                            blocks[idx]["input"] = parsed_input
                         yield StreamEvent(
-                            type=StreamEventType.MESSAGE_DONE,
-                            usage=TokenUsage(
-                                input_tokens=usage_data.get("input_tokens", 0) + compaction_in,
-                                output_tokens=usage_data.get("output_tokens", 0) + compaction_out,
-                                cache_read_tokens=usage_data.get("cache_read_input_tokens", 0),
-                                cache_write_tokens=usage_data.get("cache_creation_input_tokens", 0),
-                                thinking_tokens=thinking_tokens,
+                            type=StreamEventType.TOOL_CALL,
+                            tool_call=ToolCall(
+                                id=tool_ids.get(idx, ""),
+                                name=tool_names.get(idx, ""),
+                                input=parsed_input,
                             ),
-                            stop_reason=stop_reason,
                         )
+                        del partial_inputs[idx]
+                    if idx in partial_thinking:
+                        del partial_thinking[idx]
+
+                case "message_delta":
+                    usage_data = event_data.get("usage", {})
+                    stop_reason = _stop_reason((event_data.get("delta") or {}).get("stop_reason"))
+                    # Approximate thinking tokens from accumulated char count.
+                    thinking_tokens = accumulated_thinking_chars // 4
+                    if capture:
+                        yield StreamEvent(
+                            type=StreamEventType.PROVIDER_ITEMS,
+                            provider_items=[blocks[index] for index in sorted(blocks)],
+                            provider_protocol=ANTHROPIC_MESSAGES,
+                        )
+                    compaction_in, compaction_out = _compaction_usage(usage_data)
+                    yield StreamEvent(
+                        type=StreamEventType.MESSAGE_DONE,
+                        usage=TokenUsage(
+                            input_tokens=usage_data.get("input_tokens", 0) + compaction_in,
+                            output_tokens=usage_data.get("output_tokens", 0) + compaction_out,
+                            cache_read_tokens=usage_data.get("cache_read_input_tokens", 0),
+                            cache_write_tokens=usage_data.get("cache_creation_input_tokens", 0),
+                            thinking_tokens=thinking_tokens,
+                        ),
+                        stop_reason=stop_reason,
+                    )
 
     async def generate(
         self,
