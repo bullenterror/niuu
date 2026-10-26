@@ -459,6 +459,25 @@ def _resolve_service_name(config: ObservabilityConfig, default_service_name: str
     return default_service_name
 
 
+#: The SDK names every thread that exports telemetry ``Otel…``
+#: (``OtelBatchLogRecordProcessor``, ``OtelBatchSpanRecordProcessor``,
+#: ``OtelPeriodicExportingMetricReader``).
+_EXPORT_THREAD_PREFIX = "Otel"
+
+
+def _not_from_export_threads(record: logging.LogRecord) -> bool:
+    """Keep a record out of OTLP when the export itself emitted it.
+
+    A record logged while telemetry is being exported (the exporter's HTTP
+    client, gRPC, the SDK) describes that export. Exporting it queues another
+    export, which logs again: on Ting at debug level this fed itself at ~145
+    lines a second, 99.7% of them urllib3 reporting its own log posts. Such
+    records still reach the process's other handlers (stdout), so an export
+    failure stays visible; they are only kept off the path they describe.
+    """
+    return not record.threadName.startswith(_EXPORT_THREAD_PREFIX)
+
+
 def configure_observability(
     config: ObservabilityConfig,
     *,
@@ -578,6 +597,7 @@ def configure_observability(
         def __init__(self, provider: Any) -> None:
             logging.Handler.__init__(self, level=logging.NOTSET)
             self._logger_provider = provider
+            self.addFilter(_not_from_export_threads)
 
     log_handler = OTLPLoggingHandler(logger_provider)
     logging.getLogger().addHandler(log_handler)
