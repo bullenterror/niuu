@@ -119,24 +119,12 @@ RUN uv pip install --system --break-system-packages --no-cache \
 
 # What resident-authored learned tools import when they run as k8s_job Jobs
 # on this image: the backend never installs packages at run time, it checks
-# a tool's declared requirements against what is baked in here.
+# a tool's declared requirements against what is baked in here. No kubectl:
+# every upstream release binary so far is built with a Go that the image scan
+# rejects, and tools reach the API through the client library instead.
 RUN uv pip install --system --break-system-packages --no-cache \
     kubernetes==37.0.1 \
     requests==2.34.2
-
-# kubectl for learned tools that shell out to it, matching the clusters' minor.
-RUN set -eux; \
-    KUBECTL_VERSION="v1.36.3"; \
-    case "${TARGETARCH}" in \
-      amd64) KUBECTL_SHA256="ebbd080e7c2e275093b55915722043257eb24004363e20acb3c4d71919f88336" ;; \
-      arm64) KUBECTL_SHA256="3d86f24401c41ae5a46ac50eef8865fe891d3647d324a0836f6c63757a126e62" ;; \
-      *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
-    esac; \
-    curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${TARGETARCH}/kubectl" -o /tmp/kubectl; \
-    echo "${KUBECTL_SHA256}  /tmp/kubectl" | sha256sum -c -; \
-    install -m 0755 /tmp/kubectl /usr/local/bin/kubectl; \
-    rm -f /tmp/kubectl; \
-    kubectl version --client
 
 # Install Homebrew dependencies (so users can brew install without root)
 RUN apt-get update && apt-get install -y --no-install-recommends \

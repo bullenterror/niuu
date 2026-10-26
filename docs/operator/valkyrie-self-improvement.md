@@ -185,8 +185,8 @@ resident_evolution:
   without them (no silent unenforced fallback). Jobs run digest-pinned,
   read-only-root, non-root/seccomp/capability-restricted. Requirements are
   never installed: a gate inside the Job checks them against the pinned image
-  (the devrunner image bakes in `kubernetes`, `requests`, `PyYAML` and
-  `kubectl`) and refuses the run, naming what is missing, otherwise.
+  (the devrunner image bakes in `kubernetes`, `requests` and `PyYAML`; no
+  `kubectl`, so a tool that only shells out to it fails at run time) and refuses the run, naming what is missing, otherwise.
 
   Each run's egress is derived from the tool's declared reach
   (`ravn.valkyrie_evolution.reach_plan`):
