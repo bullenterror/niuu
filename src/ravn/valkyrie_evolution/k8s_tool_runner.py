@@ -18,11 +18,12 @@ from typing import Any, Protocol
 
 from ravn.valkyrie_evolution.learned_tools import (
     DEFAULT_CONTAINED_TOOL_IMAGE,
-    NETWORK_REACH_KINDS,
+    PURE_COMPUTE_REACH_KINDS,
     REACH_ENFORCEMENT_ENFORCED,
     REACH_ENFORCEMENT_UNAVAILABLE,
     LearnedToolError,
     LearnedToolInfrastructureError,
+    grant_reaches_network,
 )
 from ravn.valkyrie_evolution.models import ToolReachGrant
 from ravn.valkyrie_evolution.tool_runtime import HostCall, ToolRunResult
@@ -109,6 +110,9 @@ class KubernetesJobLearnedToolRunner:
     @property
     def enforces_reach(self) -> bool:
         return bool(self._executor.enforces_reach)
+
+    def check_reach(self, declared_reach: Sequence[ToolReachGrant]) -> None:
+        _network_reach(declared_reach)
 
     async def run(
         self,
@@ -328,11 +332,10 @@ def _verification_result_from_job(
 def _network_reach(declared_reach: Sequence[ToolReachGrant]) -> bool:
     network = False
     for grant in declared_reach:
-        kind = grant.kind.casefold()
-        if kind in {"", "pure_compute"} or grant.access == "none":
+        kind = grant.kind.strip().casefold()
+        if kind in PURE_COMPUTE_REACH_KINDS or grant.access == "none":
             continue
-        is_network = kind in NETWORK_REACH_KINDS or kind.startswith("http")
-        if not is_network:
+        if not grant_reaches_network(grant):
             raise LearnedToolError(
                 f"k8s_job cannot enforce declared reach kind {grant.kind!r}; refusing to run"
             )
