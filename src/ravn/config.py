@@ -76,6 +76,33 @@ def _config_paths() -> tuple[Path, ...]:
 # ---------------------------------------------------------------------------
 
 
+#: LLM retry settings that were replaced by the gateway-outage window. A config that
+#: still sets one is refused (naming the replacement) rather than ignored: ignoring
+#: it would run the model calls on a bound the operator did not choose.
+_REMOVED_LLM_RETRY_KEYS: dict[str, str] = {
+    "max_retries": (
+        "model-call retries are now bounded by wall-clock time, not an attempt count: "
+        "set llm.gateway_outage_window_seconds (default 120) to the longest gateway "
+        "restart to survive, and drop max_retries"
+    ),
+    "stream_resume_window_seconds": (
+        "it was renamed because the window now bounds every retry of a model call, not "
+        "only a cut stream: use llm.gateway_outage_window_seconds"
+    ),
+    "stream_resume_max_backoff_seconds": (
+        "it was renamed: use llm.gateway_outage_max_backoff_seconds"
+    ),
+}
+
+
+def _refuse_removed_llm_retry_keys(where: str, values: object) -> None:
+    if not isinstance(values, dict):
+        return
+    for key, replacement in _REMOVED_LLM_RETRY_KEYS.items():
+        if key in values:
+            raise ValueError(f"{where}{key} is no longer supported: {replacement}")
+
+
 class LLMProviderConfig(BaseModel):
     """A single LLM provider entry in the fallback chain."""
 
@@ -91,6 +118,12 @@ class LLMProviderConfig(BaseModel):
         default_factory=dict,
         description="Maps kwarg names to env var names for credential injection.",
     )
+
+    @field_validator("kwargs")
+    @classmethod
+    def _refuse_removed_retry_kwargs(cls, value: dict[str, Any]) -> dict[str, Any]:
+        _refuse_removed_llm_retry_keys("llm.provider.kwargs.", value)
+        return value
 
 
 class ExtendedThinkingConfig(BaseModel):
@@ -136,47 +169,35 @@ class LLMConfig(BaseModel):
             "and counts on ravn.cap.hits."
         ),
     )
-    max_retries: int = Field(
-        default=3,
-        ge=0,
-        description=(
-            "Retries of a model call that got no response header (connection refused, "
-            "reset, 429, 5xx), with exponential backoff from retry_base_delay. Bounded "
-            "by retrying being pointless past a short outage; a stream that is cut after "
-            "its header arrived is bounded by stream_resume_window_seconds instead. "
-            "Exhausting it raises LLMError naming this knob and counts on ravn.cap.hits."
-        ),
-    )
     retry_base_delay: float = Field(
         default=1.0,
         gt=0.0,
         description=(
-            "Seconds before the first retry or stream re-issue; doubles per attempt "
-            "up to stream_resume_max_backoff_seconds (stream re-issues) or without "
-            "a ceiling (max_retries)."
+            "Seconds before the first retry of a failed model call; doubles per attempt up "
+            "to gateway_outage_max_backoff_seconds."
         ),
     )
-    stream_resume_window_seconds: float = Field(
+    gateway_outage_window_seconds: float = Field(
         default=120.0,
         ge=0.0,
         description=(
-            "How long to keep re-issuing a model call whose stream was cut by a gateway "
-            "restart (RemoteProtocolError, ReadError, ConnectError, 502/503/504). Bounded "
-            "by how long a gateway rollout takes: the time one call may spend failing, "
-            "counted from each failure until a re-issued stream delivers its first "
-            "event (a stream that then runs long does not use it up). The partial "
-            "answer is discarded and the same request is sent again, so no tool call "
-            "runs twice. Exhausting it raises LLMError naming this knob and counts on "
-            "ravn.cap.hits; each re-issue logs at warning and counts on ravn.retries. "
-            "0 disables re-issuing: a cut stream fails the task."
+            "How long one model call keeps being retried while the gateway or provider is "
+            "down (refused or reset connection, 429/500/502/503/504, or a stream cut or "
+            "ended without its terminator), before the response header or mid-answer. "
+            "Bounded by how long a gateway rollout takes: the time the call may spend "
+            "failing, counted from each failure until the gateway answers again (the first "
+            "event of a re-sent stream), so a stream that then runs long does not use it "
+            "up. A cut answer is discarded and the same request sent again, so no tool "
+            "call runs twice. Deterministic failures (other 4xx, truncation, a malformed "
+            "answer) are never retried. Exhausting it raises LLMError naming this knob and "
+            "counts on ravn.cap.hits; each retry logs at warning and counts on ravn.retries. "
+            "0 disables retrying: the first failure fails the call."
         ),
     )
-    stream_resume_max_backoff_seconds: float = Field(
+    gateway_outage_max_backoff_seconds: float = Field(
         default=10.0,
         gt=0.0,
-        description=(
-            "Ceiling for the delay between stream re-issues within stream_resume_window_seconds."
-        ),
+        description=("Ceiling for the delay between retries within gateway_outage_window_seconds."),
     )
     timeout: float = Field(default=120.0)
     provider: LLMProviderConfig = Field(default_factory=LLMProviderConfig)
@@ -184,6 +205,12 @@ class LLMConfig(BaseModel):
         default_factory=ExtendedThinkingConfig,
         description="Extended thinking (deliberate reasoning budget) configuration.",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _refuse_removed_retry_settings(cls, data: Any) -> Any:
+        _refuse_removed_llm_retry_keys("llm.", data)
+        return data
 
 
 class ToolAdapterConfig(BaseModel):
@@ -1041,19 +1068,6 @@ class ContextManagementConfig(BaseModel):
 # ---------------------------------------------------------------------------
 # Legacy adapter config (kept for backwards compat with NIU-426 wiring)
 # ---------------------------------------------------------------------------
-
-
-class LLMAdapterConfig(BaseModel):
-    """Dynamic LLM adapter configuration (legacy; prefer llm.provider)."""
-
-    adapter: str = Field(
-        default="ravn.adapters.llm.anthropic.AnthropicAdapter",
-        description="Fully-qualified class path for the LLM adapter.",
-    )
-    kwargs: dict[str, Any] = Field(default_factory=dict)
-    max_retries: int = Field(default=3)
-    retry_base_delay: float = Field(default=1.0)
-    timeout: float = Field(default=120.0)
 
 
 class EvolutionConfig(BaseModel):
@@ -5716,7 +5730,6 @@ class Settings(BaseSettings):
     )
 
     # Legacy — kept so existing CLI wiring (NIU-426) continues to work
-    llm_adapter: LLMAdapterConfig = Field(default_factory=LLMAdapterConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
 

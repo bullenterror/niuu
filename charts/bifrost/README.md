@@ -112,4 +112,4 @@ With `envoy.enabled`, the Envoy container sleeps through both phases so it does
 not drop the connections the gateway is still draining.
 
 Ravn also re-issues a model stream that is cut anyway
-(`llm.stream_resume_window_seconds`, see `docs/operator/ravn-limits.md`).
+(`llm.gateway_outage_window_seconds`, see `docs/operator/ravn-limits.md`).

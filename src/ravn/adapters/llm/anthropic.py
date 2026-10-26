@@ -8,7 +8,6 @@ transient-error retries.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -25,11 +24,9 @@ from ravn.adapters.llm.provider_items import (
     refuse_foreign_compaction,
 )
 from ravn.adapters.llm.transient import (
-    RETRYABLE_STATUS_CODES,
-    connection_retries_exhausted,
-    describe_failure,
-    note_connection_retry,
-    reissue_request,
+    GatewayOutage,
+    StreamIncompleteError,
+    post_within_window,
     resumable_stream,
 )
 from ravn.domain.exceptions import ConfigurationError, LLMError
@@ -59,6 +56,9 @@ _MIN_COMPACTION_TRIGGER_TOKENS = 50_000
 # context window filling up before the model finished.
 _TRUNCATED_STOP_REASONS = frozenset({"max_tokens", "model_context_window_exceeded"})
 _DEFAULT_BASE_URL = "https://api.anthropic.com"
+# In-stream error types that mean the upstream was unavailable, not that the
+# request was wrong: sending it again can succeed.
+_TRANSIENT_STREAM_ERRORS = frozenset({"overloaded_error", "api_error"})
 
 # Ravn's transport-neutral message keys that the Anthropic API does not accept.
 _INTERNAL_MESSAGE_KEYS = frozenset({"reasoning", "reasoning_details"}) | PROVIDER_KEYS
@@ -249,22 +249,20 @@ class AnthropicAdapter(LLMPort, NativeCompactionPort):
         api_key: str = "",
         base_url: str = _DEFAULT_BASE_URL,
         model: str = "claude-sonnet-4-6",
-        max_retries: int = 3,
         retry_base_delay: float = 1.0,
         timeout: float = 120.0,
-        stream_resume_window_seconds: float = 120.0,
-        stream_resume_max_backoff_seconds: float = 10.0,
+        gateway_outage_window_seconds: float = 120.0,
+        gateway_outage_max_backoff_seconds: float = 10.0,
     ) -> None:
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
         self._default_model = model
         # Model → maximum output tokens, as the Models API reports it.
         self._output_limits: dict[str, int] = {}
-        self._max_retries = max_retries
         self._retry_base_delay = retry_base_delay
         self._timeout = timeout
-        self._stream_resume_window_seconds = stream_resume_window_seconds
-        self._stream_resume_max_backoff_seconds = stream_resume_max_backoff_seconds
+        self._gateway_outage_window_seconds = gateway_outage_window_seconds
+        self._gateway_outage_max_backoff_seconds = gateway_outage_max_backoff_seconds
         # Model → compaction trigger, for the models set to native compaction.
         self._compaction_triggers: dict[str, int] = {}
 
@@ -390,56 +388,32 @@ class AnthropicAdapter(LLMPort, NativeCompactionPort):
         self._output_limits[effective_model] = limit
         return limit
 
+    def _new_outage(self, payload: dict) -> GatewayOutage:
+        """The retry bound of one model call (``llm.gateway_outage_window_seconds``)."""
+        return GatewayOutage(
+            provider="anthropic",
+            window_seconds=self._gateway_outage_window_seconds,
+            base_delay=self._retry_base_delay,
+            max_backoff_seconds=self._gateway_outage_max_backoff_seconds,
+            context=f"model={payload.get('model')}, endpoint={self._base_url}/v1/messages",
+        )
+
     async def _post_with_retry(
         self,
         client: httpx.AsyncClient,
         payload: dict,
         *,
         stream: bool,
+        outage: GatewayOutage | None = None,
     ) -> httpx.Response:
-        url = f"{self._base_url}/v1/messages"
-        last_exc: Exception | None = None
-
-        for attempt in range(self._max_retries + 1):
-            try:
-                if stream:
-                    response = await client.send(
-                        client.build_request("POST", url, json=payload),
-                        stream=True,
-                    )
-                else:
-                    response = await client.post(url, json=payload)
-
-                if response.status_code not in RETRYABLE_STATUS_CODES:
-                    return response
-
-                if stream:
-                    await response.aclose()
-                last_exc = LLMError(
-                    f"Anthropic API error {response.status_code}",
-                    status_code=response.status_code,
-                )
-            except httpx.TransportError as exc:
-                last_exc = exc
-
-            if attempt < self._max_retries:
-                delay = self._retry_base_delay * (2**attempt)
-                note_connection_retry(
-                    provider="anthropic",
-                    failure=last_exc,
-                    delay=delay,
-                    attempt=attempt + 1,
-                    max_retries=self._max_retries,
-                )
-                await asyncio.sleep(delay)
-
-        status_code = last_exc.status_code if isinstance(last_exc, LLMError) else None
-        raise connection_retries_exhausted(
-            provider="Anthropic API",
-            max_retries=self._max_retries,
-            detail=f" ({describe_failure(last_exc)})" if last_exc is not None else "",
-            status_code=status_code,
-        ) from last_exc
+        """POST the request, riding out a gateway outage for up to the configured window."""
+        return await post_within_window(
+            client,
+            f"{self._base_url}/v1/messages",
+            payload,
+            stream=stream,
+            outage=outage or self._new_outage(payload),
+        )
 
     async def stream(
         self,
@@ -462,7 +436,6 @@ class AnthropicAdapter(LLMPort, NativeCompactionPort):
             thinking=thinking,
         )
 
-        url = f"{self._base_url}/v1/messages"
         capture = self._native_compaction_for(model) is not None
 
         async with httpx.AsyncClient(
@@ -470,18 +443,13 @@ class AnthropicAdapter(LLMPort, NativeCompactionPort):
             timeout=self._timeout,
         ) as client:
 
-            async def open_response(resumed: bool) -> httpx.Response:
-                if resumed:
-                    return await reissue_request(client, url, payload)
-                return await self._post_with_retry(client, payload, stream=True)
+            async def open_response(outage: GatewayOutage) -> httpx.Response:
+                return await self._post_with_retry(client, payload, stream=True, outage=outage)
 
-            # A stream the gateway cuts mid-answer is re-issued within the
+            # A stream the gateway cuts mid-answer is sent again within the
             # window; the consumer discards the partial answer on STREAM_RESTART.
             async for event in resumable_stream(
-                provider="anthropic",
-                window_seconds=self._stream_resume_window_seconds,
-                base_delay=self._retry_base_delay,
-                max_backoff_seconds=self._stream_resume_max_backoff_seconds,
+                outage=self._new_outage(payload),
                 open_response=open_response,
                 read_events=lambda response: self._read_events(response, capture=capture),
             ):
@@ -511,12 +479,15 @@ class AnthropicAdapter(LLMPort, NativeCompactionPort):
         partial_thinking: dict[int, str] = {}
         current_block_index = -1
         accumulated_thinking_chars = 0
+        # Every complete answer ends with `message_stop` (or the gateway's [DONE]).
+        finished = False
 
         async for line in response.aiter_lines():
             if not line.startswith("data: "):
                 continue
             raw = line[len("data: ") :]
             if raw == "[DONE]":
+                finished = True
                 break
 
             try:
@@ -527,6 +498,20 @@ class AnthropicAdapter(LLMPort, NativeCompactionPort):
             event_type = event_data.get("type", "")
 
             match event_type:
+                case "message_stop":
+                    finished = True
+
+                case "error":
+                    # An in-stream error after the 200 was sent. An overloaded or
+                    # restarting upstream is worth sending again; anything else
+                    # would fail identically, so it raises.
+                    error = event_data.get("error") or {}
+                    kind = error.get("type", "unknown")
+                    detail = f"Anthropic stream reported {kind}: {error.get('message', '')}"
+                    if kind in _TRANSIENT_STREAM_ERRORS:
+                        raise StreamIncompleteError(detail)
+                    raise LLMError(detail)
+
                 case "content_block_start":
                     block = event_data.get("content_block", {})
                     current_block_index = event_data.get("index", current_block_index)
@@ -614,6 +599,14 @@ class AnthropicAdapter(LLMPort, NativeCompactionPort):
                         ),
                         stop_reason=stop_reason,
                     )
+
+        if not finished:
+            # A clean close without message_stop is a cut answer, not an answer:
+            # a pod shutting down can end the connection this way.
+            raise StreamIncompleteError(
+                "Anthropic stream ended without message_stop; the gateway closed the "
+                "connection mid-answer"
+            )
 
     async def generate(
         self,

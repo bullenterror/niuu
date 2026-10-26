@@ -46,7 +46,7 @@ class LLMPort(ABC):
         the answer, and any tool call in it, was cut off.
 
         A ``STREAM_RESTART`` event means the connection dropped mid-answer and
-        the adapter re-issued the request within ``llm.stream_resume_window_seconds``:
+        the adapter re-issued the request within ``llm.gateway_outage_window_seconds``:
         the consumer must discard everything it received since the stream began
         (text, thinking, tool calls, provider items, usage) and take the events
         that follow as the whole answer. A consumer must not act on a tool call

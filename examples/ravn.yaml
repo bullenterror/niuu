@@ -39,10 +39,10 @@ observability:
 # llm:
 #   model: ""                    # your model name
 #   max_tokens: 8192
-#   max_retries: 3              # retries of a call that got no response (connection refused, 5xx)
-#   retry_base_delay: 1.0       # first retry / re-issue delay (seconds); doubles each attempt
-#   stream_resume_window_seconds: 120   # how long a cut stream is re-issued: size to a gateway rollout (0 disables)
-#   stream_resume_max_backoff_seconds: 10
+#   gateway_outage_window_seconds: 120  # how long one model call is retried while the gateway is down
+#                                       # (refused connection, 5xx, cut stream): size to a gateway rollout; 0 disables
+#   retry_base_delay: 1.0               # first retry delay (seconds); doubles each attempt
+#   gateway_outage_max_backoff_seconds: 10
 #   timeout: 120
 #   provider:
 #     adapter: ravn.adapters.llm.openai.OpenAICompatibleAdapter

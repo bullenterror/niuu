@@ -59,11 +59,9 @@ from niuu.ports.http_auth import HttpAuthPort
 from niuu.utils import import_class
 from ravn.adapters.llm.provider_items import refuse_foreign_compaction, without_provider_keys
 from ravn.adapters.llm.transient import (
-    RETRYABLE_STATUS_CODES,
-    connection_retries_exhausted,
-    describe_failure,
-    note_connection_retry,
-    reissue_request,
+    GatewayOutage,
+    StreamIncompleteError,
+    post_within_window,
     resumable_stream,
 )
 from ravn.budget import TokenEstimator
@@ -336,11 +334,10 @@ class OpenAICompatibleAdapter(LLMPort):
         api_key: str = "",
         base_url: str = _DEFAULT_BASE_URL,
         model: str = "gpt-4o",
-        max_retries: int = 3,
         retry_base_delay: float = 1.0,
         timeout: float = 120.0,
-        stream_resume_window_seconds: float = 120.0,
-        stream_resume_max_backoff_seconds: float = 10.0,
+        gateway_outage_window_seconds: float = 120.0,
+        gateway_outage_max_backoff_seconds: float = 10.0,
         system_prefix: str = "",
         request_options: dict | None = None,
         thinking_request_options: dict | None = None,
@@ -352,11 +349,10 @@ class OpenAICompatibleAdapter(LLMPort):
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
         self._default_model = model
-        self._max_retries = max_retries
         self._retry_base_delay = retry_base_delay
         self._timeout = timeout
-        self._stream_resume_window_seconds = stream_resume_window_seconds
-        self._stream_resume_max_backoff_seconds = stream_resume_max_backoff_seconds
+        self._gateway_outage_window_seconds = gateway_outage_window_seconds
+        self._gateway_outage_max_backoff_seconds = gateway_outage_max_backoff_seconds
         self._system_prefix = system_prefix
         self._request_options = copy.deepcopy(request_options or {})
         self._thinking_request_options = copy.deepcopy(thinking_request_options or {})
@@ -493,66 +489,38 @@ class OpenAICompatibleAdapter(LLMPort):
         )
         return body
 
+    def _new_outage(self, payload: dict) -> GatewayOutage:
+        """The retry bound of one model call (``llm.gateway_outage_window_seconds``)."""
+        model_name = str(payload.get("model") or self._default_model)
+        return GatewayOutage(
+            provider="openai",
+            window_seconds=self._gateway_outage_window_seconds,
+            base_delay=self._retry_base_delay,
+            max_backoff_seconds=self._gateway_outage_max_backoff_seconds,
+            context=f"model={model_name}, endpoint={self._base_url}/v1/chat/completions",
+        )
+
     async def _post_with_retry(
         self,
         client: httpx.AsyncClient,
         payload: dict,
         *,
         stream: bool,
+        outage: GatewayOutage | None = None,
     ) -> httpx.Response:
-        url = f"{self._base_url}/v1/chat/completions"
-        last_exc: Exception | None = None
-        last_status_code: int | None = None
-        model_name = str(payload.get("model") or self._default_model)
+        """POST the request, riding out a gateway outage for up to the configured window.
 
-        for attempt in range(self._max_retries + 1):
-            try:
-                if stream:
-                    response = await client.send(
-                        client.build_request("POST", url, json=payload),
-                        stream=True,
-                    )
-                else:
-                    response = await client.post(url, json=payload)
-
-                if response.status_code not in RETRYABLE_STATUS_CODES:
-                    return response
-
-                last_status_code = response.status_code
-                if stream:
-                    await response.aclose()
-                last_exc = LLMError(
-                    f"OpenAI-compatible API error {response.status_code}",
-                    status_code=response.status_code,
-                )
-            except httpx.TransportError as exc:
-                last_exc = exc
-
-            if attempt < self._max_retries:
-                delay = self._retry_base_delay * (2**attempt)
-                note_connection_retry(
-                    provider="openai",
-                    failure=last_exc,
-                    delay=delay,
-                    attempt=attempt + 1,
-                    max_retries=self._max_retries,
-                )
-                await asyncio.sleep(delay)
-
-        details = [
-            f"model={model_name}",
-            f"endpoint={url}",
-        ]
-        if last_status_code is not None:
-            details.append(f"status={last_status_code}")
-        if last_exc is not None and not isinstance(last_exc, LLMError):
-            details.append(f"cause={describe_failure(last_exc)}")
-        raise connection_retries_exhausted(
-            provider="OpenAI-compatible API",
-            max_retries=self._max_retries,
-            detail=f" ({', '.join(details)})",
-            status_code=last_status_code,
-        ) from last_exc
+        Every attempt carries freshly minted credentials: a retry minutes into
+        a rollout must not reuse a token that has since expired.
+        """
+        return await post_within_window(
+            client,
+            f"{self._base_url}/v1/chat/completions",
+            payload,
+            stream=stream,
+            outage=outage or self._new_outage(payload),
+            headers=self._request_headers,
+        )
 
     # ------------------------------------------------------------------
     # LLMPort implementation
@@ -578,26 +546,15 @@ class OpenAICompatibleAdapter(LLMPort):
             thinking=thinking,
         )
 
-        url = f"{self._base_url}/v1/chat/completions"
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
 
-        async with httpx.AsyncClient(
-            headers=await self._request_headers(), timeout=self._timeout
-        ) as client:
+            async def open_response(outage: GatewayOutage) -> httpx.Response:
+                return await self._post_with_retry(client, payload, stream=True, outage=outage)
 
-            async def open_response(resumed: bool) -> httpx.Response:
-                if resumed:
-                    return await reissue_request(
-                        client, url, payload, headers=await self._request_headers()
-                    )
-                return await self._post_with_retry(client, payload, stream=True)
-
-            # A stream the gateway cuts mid-answer is re-issued within the
+            # A stream the gateway cuts mid-answer is sent again within the
             # window; the consumer discards the partial answer on STREAM_RESTART.
             async for event in resumable_stream(
-                provider="openai",
-                window_seconds=self._stream_resume_window_seconds,
-                base_delay=self._retry_base_delay,
-                max_backoff_seconds=self._stream_resume_max_backoff_seconds,
+                outage=self._new_outage(payload),
                 open_response=open_response,
                 read_events=lambda response: self._read_events(
                     response, messages=messages, system=system, model=model
@@ -771,7 +728,7 @@ class OpenAICompatibleAdapter(LLMPort):
         # as an empty answer let a resident's schema repair invent an outcome
         # and consume the operator's reply.
         if not saw_done and finish_reason is None:
-            raise LLMError(
+            raise StreamIncompleteError(
                 f"OpenAI-compatible stream for {model or self._default_model!r} ended "
                 "before completion (no [DONE] and no finish_reason); the server "
                 "aborted the response"
@@ -852,9 +809,7 @@ class OpenAICompatibleAdapter(LLMPort):
             thinking=thinking,
         )
 
-        async with httpx.AsyncClient(
-            headers=await self._request_headers(), timeout=self._timeout
-        ) as client:
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
             response = await self._post_with_retry(client, payload, stream=False)
 
         if response.status_code != 200:

@@ -98,39 +98,99 @@ class TestBuildLlm:
         assert kwargs["api_key"] == "custom-key"
 
 
-class TestBuildLlmStreamResume:
+class TestBuildLlmGatewayOutage:
     @pytest.mark.usefixtures("_api_key")
-    def test_the_resume_window_and_backoff_reach_the_adapter(self, settings: Settings) -> None:
+    def test_the_outage_window_and_backoff_reach_the_adapter(self, settings: Settings) -> None:
         from ravn.cli.commands import _build_llm
 
-        settings.llm.stream_resume_window_seconds = 300.0
-        settings.llm.stream_resume_max_backoff_seconds = 15.0
+        settings.llm.gateway_outage_window_seconds = 300.0
+        settings.llm.gateway_outage_max_backoff_seconds = 15.0
         settings.llm.retry_base_delay = 2.0
 
         llm = _build_llm(settings)
 
-        assert llm._stream_resume_window_seconds == 300.0
-        assert llm._stream_resume_max_backoff_seconds == 15.0
+        assert llm._gateway_outage_window_seconds == 300.0
+        assert llm._gateway_outage_max_backoff_seconds == 15.0
         assert llm._retry_base_delay == 2.0
 
     @pytest.mark.usefixtures("_api_key")
     def test_a_provider_kwarg_wins_over_the_llm_section(self, settings: Settings) -> None:
         from ravn.cli.commands import _build_llm
 
-        settings.llm.provider.kwargs = {"stream_resume_window_seconds": 7.0}
+        settings.llm.provider.kwargs = {"gateway_outage_window_seconds": 7.0}
 
-        assert _build_llm(settings)._stream_resume_window_seconds == 7.0
+        assert _build_llm(settings)._gateway_outage_window_seconds == 7.0
 
-    def test_defaults_outlast_a_gateway_restart_and_zero_disables(self) -> None:
+    def test_defaults_outlast_a_gateway_restart_and_zero_disables_retrying(self) -> None:
         settings = Settings()
 
-        assert settings.llm.stream_resume_window_seconds == 120.0
-        assert settings.llm.stream_resume_max_backoff_seconds == 10.0
-        settings.llm.model_validate({"stream_resume_window_seconds": 0})
+        assert settings.llm.gateway_outage_window_seconds == 120.0
+        assert settings.llm.gateway_outage_max_backoff_seconds == 10.0
+        settings.llm.model_validate({"gateway_outage_window_seconds": 0})
         with pytest.raises(ValueError):
-            settings.llm.model_validate({"stream_resume_window_seconds": -1})
+            settings.llm.model_validate({"gateway_outage_window_seconds": -1})
         with pytest.raises(ValueError):
-            settings.llm.model_validate({"stream_resume_max_backoff_seconds": 0})
+            settings.llm.model_validate({"gateway_outage_max_backoff_seconds": 0})
+
+
+class TestRemovedLlmRetrySettingsAreRefused:
+    """A config that still sets a retired knob must fail, not run on a bound nobody chose."""
+
+    @pytest.mark.parametrize(
+        ("key", "replacement"),
+        [
+            ("max_retries", "llm.gateway_outage_window_seconds"),
+            ("stream_resume_window_seconds", "llm.gateway_outage_window_seconds"),
+            ("stream_resume_max_backoff_seconds", "llm.gateway_outage_max_backoff_seconds"),
+        ],
+    )
+    def test_the_llm_section_names_the_replacement(self, key: str, replacement: str) -> None:
+        from pydantic import ValidationError
+
+        from ravn.config import LLMConfig
+
+        with pytest.raises(ValidationError) as raised:
+            LLMConfig.model_validate({key: 3})
+
+        assert f"llm.{key} is no longer supported" in str(raised.value)
+        assert replacement in str(raised.value)
+
+    def test_settings_loaded_from_a_config_refuse_it_too(self) -> None:
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError, match="llm.max_retries is no longer supported"):
+            Settings(llm={"max_retries": 5})
+
+    def test_provider_kwargs_are_checked_because_they_reach_the_adapter(self) -> None:
+        from pydantic import ValidationError
+
+        from ravn.config import LLMProviderConfig
+
+        with pytest.raises(ValidationError, match="llm.provider.kwargs.max_retries"):
+            LLMProviderConfig(kwargs={"max_retries": 5})
+        with pytest.raises(ValidationError, match="gateway_outage_max_backoff_seconds"):
+            LLMProviderConfig(kwargs={"stream_resume_max_backoff_seconds": 5})
+
+    def test_the_replacements_and_other_kwargs_are_accepted(self) -> None:
+        from ravn.config import LLMConfig, LLMProviderConfig
+
+        LLMConfig.model_validate({"gateway_outage_window_seconds": 60, "retry_base_delay": 2})
+        LLMProviderConfig(kwargs={"gateway_outage_window_seconds": 60, "base_url": "http://x"})
+
+    @pytest.mark.parametrize(
+        "adapter",
+        [
+            "ravn.adapters.llm.anthropic.AnthropicAdapter",
+            "ravn.adapters.llm.bifrost.BifrostAdapter",
+            "ravn.adapters.llm.openai.OpenAICompatibleAdapter",
+            "ravn.adapters.llm.openai_responses.OpenAIResponsesAdapter",
+        ],
+    )
+    def test_no_adapter_still_takes_max_retries(self, adapter: str) -> None:
+        from niuu.utils import import_class
+
+        with pytest.raises(TypeError, match="max_retries"):
+            import_class(adapter)(max_retries=3)
 
 
 class TestBuildExecutor:

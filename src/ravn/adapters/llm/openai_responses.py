@@ -57,11 +57,9 @@ from ravn.adapters.llm.provider_items import (
     refuse_foreign_compaction,
 )
 from ravn.adapters.llm.transient import (
-    RETRYABLE_STATUS_CODES,
-    connection_retries_exhausted,
-    describe_failure,
-    note_connection_retry,
-    reissue_request,
+    GatewayOutage,
+    StreamIncompleteError,
+    post_within_window,
     resumable_stream,
 )
 from ravn.domain.exceptions import ConfigurationError, LLMError
@@ -353,11 +351,10 @@ class OpenAIResponsesAdapter(LLMPort, NativeCompactionPort):
         api_key: str = "",
         base_url: str = _DEFAULT_BASE_URL,
         model: str = "gpt-6-sol",
-        max_retries: int = 3,
         retry_base_delay: float = 1.0,
         timeout: float = 120.0,
-        stream_resume_window_seconds: float = 120.0,
-        stream_resume_max_backoff_seconds: float = 10.0,
+        gateway_outage_window_seconds: float = 120.0,
+        gateway_outage_max_backoff_seconds: float = 10.0,
         reasoning_effort: str = "",
         reasoning_summary: str = "auto",
         parallel_tool_calls: bool = True,
@@ -370,11 +367,10 @@ class OpenAIResponsesAdapter(LLMPort, NativeCompactionPort):
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
         self._default_model = model
-        self._max_retries = max_retries
         self._retry_base_delay = retry_base_delay
         self._timeout = timeout
-        self._stream_resume_window_seconds = stream_resume_window_seconds
-        self._stream_resume_max_backoff_seconds = stream_resume_max_backoff_seconds
+        self._gateway_outage_window_seconds = gateway_outage_window_seconds
+        self._gateway_outage_max_backoff_seconds = gateway_outage_max_backoff_seconds
         self._reasoning_effort = reasoning_effort
         self._reasoning_summary = reasoning_summary
         self._parallel_tool_calls = parallel_tool_calls
@@ -464,49 +460,36 @@ class OpenAIResponsesAdapter(LLMPort, NativeCompactionPort):
             body["context_management"] = [{"type": COMPACTION_TYPE, "compact_threshold": threshold}]
         return body
 
-    async def _open_stream(self, client: httpx.AsyncClient, payload: dict) -> httpx.Response:
+    def _new_outage(self, payload: dict) -> GatewayOutage:
+        """The retry bound of one model call (``llm.gateway_outage_window_seconds``)."""
+        return GatewayOutage(
+            provider="openai_responses",
+            window_seconds=self._gateway_outage_window_seconds,
+            base_delay=self._retry_base_delay,
+            max_backoff_seconds=self._gateway_outage_max_backoff_seconds,
+            context=f"model={payload.get('model')}, endpoint={self._base_url}/v1/responses",
+        )
+
+    async def _open_stream(
+        self,
+        client: httpx.AsyncClient,
+        payload: dict,
+        outage: GatewayOutage | None = None,
+    ) -> httpx.Response:
         """POST the request and return the open streaming response.
 
-        Transient failures (429, 5xx, transport errors) are retried with
-        exponential back-off before any of the stream is read (``llm.max_retries``).
-        A stream that is cut after this returns is re-issued by :meth:`stream`.
+        A gateway outage (refused connection, 429 or 5xx) is ridden out for up to
+        the configured window, with freshly minted credentials on every attempt.
+        A stream that is cut after this returns is sent again by :meth:`stream`.
         """
-        url = f"{self._base_url}/v1/responses"
-        last_exc: Exception | None = None
-        last_status: int | None = None
-        for attempt in range(self._max_retries + 1):
-            try:
-                response = await client.send(
-                    client.build_request("POST", url, json=payload), stream=True
-                )
-                if response.status_code not in RETRYABLE_STATUS_CODES:
-                    return response
-                last_status = response.status_code
-                await response.aclose()
-                last_exc = LLMError(
-                    f"Responses API error {response.status_code}", status_code=last_status
-                )
-            except httpx.TransportError as exc:
-                last_exc = exc
-            if attempt < self._max_retries:
-                delay = self._retry_base_delay * (2**attempt)
-                note_connection_retry(
-                    provider="openai_responses",
-                    failure=last_exc,
-                    delay=delay,
-                    attempt=attempt + 1,
-                    max_retries=self._max_retries,
-                )
-                await asyncio.sleep(delay)
-        raise connection_retries_exhausted(
-            provider="Responses API",
-            max_retries=self._max_retries,
-            detail=(
-                f" (model={payload.get('model')}, endpoint={url}, status={last_status}, "
-                f"cause={describe_failure(last_exc) if last_exc is not None else 'unknown'})"
-            ),
-            status_code=last_status,
-        ) from last_exc
+        return await post_within_window(
+            client,
+            f"{self._base_url}/v1/responses",
+            payload,
+            stream=True,
+            outage=outage or self._new_outage(payload),
+            headers=self._headers,
+        )
 
     # ------------------------------------------------------------------
     # LLMPort
@@ -531,25 +514,15 @@ class OpenAIResponsesAdapter(LLMPort, NativeCompactionPort):
             thinking=thinking,
         )
         effective_model = payload["model"]
-        url = f"{self._base_url}/v1/responses"
-        async with httpx.AsyncClient(
-            headers=await self._headers(), timeout=self._timeout
-        ) as client:
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
 
-            async def open_response(resumed: bool) -> httpx.Response:
-                if resumed:
-                    return await reissue_request(
-                        client, url, payload, headers=await self._headers()
-                    )
-                return await self._open_stream(client, payload)
+            async def open_response(outage: GatewayOutage) -> httpx.Response:
+                return await self._open_stream(client, payload, outage)
 
-            # A stream the gateway cuts mid-answer is re-issued within the
+            # A stream the gateway cuts mid-answer is sent again within the
             # window; the consumer discards the partial answer on STREAM_RESTART.
             async for event in resumable_stream(
-                provider="openai_responses",
-                window_seconds=self._stream_resume_window_seconds,
-                base_delay=self._retry_base_delay,
-                max_backoff_seconds=self._stream_resume_max_backoff_seconds,
+                outage=self._new_outage(payload),
                 open_response=open_response,
                 read_events=lambda response: self._events(response, effective_model),
             ):
@@ -592,7 +565,7 @@ class OpenAIResponsesAdapter(LLMPort, NativeCompactionPort):
                 usage = _usage(terminal.get("usage"))
                 break
         if terminal is None:
-            raise LLMError(
+            raise StreamIncompleteError(
                 f"Responses stream for {model!r} ended before completion (no "
                 "response.completed); the server aborted the response"
             )

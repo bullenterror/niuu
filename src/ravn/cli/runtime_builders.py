@@ -389,11 +389,10 @@ def _build_llm(settings: Settings) -> Any:
     kwargs = _inject_secrets(dict(prov.kwargs), prov.secret_kwargs_env)
 
     kwargs.setdefault("model", settings.effective_model())
-    kwargs.setdefault("max_retries", settings.llm.max_retries)
     kwargs.setdefault("retry_base_delay", settings.llm.retry_base_delay)
-    kwargs.setdefault("stream_resume_window_seconds", settings.llm.stream_resume_window_seconds)
+    kwargs.setdefault("gateway_outage_window_seconds", settings.llm.gateway_outage_window_seconds)
     kwargs.setdefault(
-        "stream_resume_max_backoff_seconds", settings.llm.stream_resume_max_backoff_seconds
+        "gateway_outage_max_backoff_seconds", settings.llm.gateway_outage_max_backoff_seconds
     )
     kwargs.setdefault("timeout", settings.llm.timeout)
 

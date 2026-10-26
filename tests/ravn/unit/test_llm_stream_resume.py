@@ -28,10 +28,12 @@ from ravn.adapters.llm.bifrost import BifrostAdapter
 from ravn.adapters.llm.openai import OpenAICompatibleAdapter
 from ravn.adapters.llm.openai_responses import OpenAIResponsesAdapter
 from ravn.adapters.llm.transient import (
+    GATEWAY_OUTAGE_KNOB,
     RETRYABLE_STATUS_CODES,
-    STREAM_RESUME_KNOB,
+    GatewayOutage,
+    StreamIncompleteError,
     TransientStatusError,
-    reissue_request,
+    post_within_window,
     resumable_stream,
 )
 from ravn.cap_telemetry import cap_hit_counts, retry_counts
@@ -119,6 +121,7 @@ def _anthropic_body(text: list[str], *, finish: bool, stop_reason: str = "tool_u
                 "usage": {"input_tokens": 7, "output_tokens": 3},
             }
         )
+        events.append({"type": "message_stop"})
     return _data(*events)
 
 
@@ -183,11 +186,12 @@ class Wire:
     url: str
     body: Callable[..., bytes]
     poison: bytes  # a deterministic failure delivered inside a 200 stream
+    incomplete: bytes  # a stream that ends cleanly without its terminator
     model: str
 
     @property
     def path(self) -> str:
-        return f"llm.{self.name}.stream"
+        return f"llm.{self.name}"
 
 
 def _wire_adapters() -> list[Wire]:
@@ -205,6 +209,7 @@ def _wire_adapters() -> list[Wire]:
                     "usage": {"input_tokens": 1, "output_tokens": 1},
                 }
             ),
+            incomplete=_anthropic_body(["Hel"], finish=False),
             model="claude-sonnet-4-6",
         ),
         Wire(
@@ -219,6 +224,7 @@ def _wire_adapters() -> list[Wire]:
                     "usage": {"input_tokens": 1, "output_tokens": 1},
                 }
             ),
+            incomplete=_anthropic_body(["Hel"], finish=False),
             model="claude-sonnet-4-6",
         ),
         Wire(
@@ -227,6 +233,7 @@ def _wire_adapters() -> list[Wire]:
             url="http://gw/v1/chat/completions",
             body=_openai_body,
             poison=_data({"error": {"message": "context length exceeded"}}),
+            incomplete=_data({"choices": [{"delta": {"content": "Hel"}, "finish_reason": None}]}),
             model="gpt-4o",
         ),
         Wire(
@@ -235,6 +242,7 @@ def _wire_adapters() -> list[Wire]:
             url="http://gw/v1/responses",
             body=_responses_body,
             poison=_data({"type": "response.failed", "response": {"error": {"message": "no"}}}),
+            incomplete=_responses_body(["Hel"], finish=False),
             model="gpt-6-sol",
         ),
     ]
@@ -248,7 +256,7 @@ def _wire_param():
     return pytest.mark.parametrize("wire", WIRES, ids=WIRE_IDS)
 
 
-_FAST = dict(retry_base_delay=0.001, stream_resume_window_seconds=5.0)
+_FAST = dict(retry_base_delay=0.001, gateway_outage_window_seconds=5.0)
 
 
 async def _stream(adapter: LLMPort, wire: Wire) -> list[StreamEvent]:
@@ -326,8 +334,8 @@ class TestStreamCutMidAnswer:
         assert wire.path in message
         assert "RemoteProtocolError" in message
         assert "incomplete chunked read" in message
-        assert "re-issue 1" in message
-        assert "0.0s into the 5s llm.stream_resume_window_seconds window" in message
+        assert "retry 1," in message
+        assert "0.0s into the 5s llm.gateway_outage_window_seconds window" in message
         assert cap_hit_counts() == {}
 
     @respx.mock
@@ -391,8 +399,7 @@ class TestStreamCutMidAnswer:
             ]
         )
 
-        # max_retries=0 proves the pre-header count is not what bounds a re-issue.
-        events = await _stream(wire.build(max_retries=0, **_FAST), wire)
+        events = await _stream(wire.build(**_FAST), wire)
 
         assert route.call_count == 6
         assert _answer(events)[0] == "back"
@@ -405,18 +412,18 @@ class TestStreamCutMidAnswer:
         route = respx.post(wire.url).mock(
             side_effect=lambda request: _cut(wire.body(["Hel"], finish=False))
         )
-        adapter = wire.build(retry_base_delay=0.01, stream_resume_window_seconds=0.05)
+        adapter = wire.build(retry_base_delay=0.01, gateway_outage_window_seconds=0.05)
 
         with caplog.at_level(logging.WARNING), pytest.raises(LLMError) as raised:
             await _stream(adapter, wire)
 
         message = str(raised.value)
-        assert STREAM_RESUME_KNOB in message
+        assert GATEWAY_OUTAGE_KNOB in message
         assert "0.05s" in message
-        assert "raise llm.stream_resume_window_seconds" in message
+        assert "raise llm.gateway_outage_window_seconds" in message
         assert "RemoteProtocolError" in message
         assert isinstance(raised.value.__cause__, httpx.RemoteProtocolError)
-        assert cap_hit_counts() == {STREAM_RESUME_KNOB: 1}
+        assert cap_hit_counts() == {GATEWAY_OUTAGE_KNOB: 1}
         assert retry_counts()[wire.path] >= 1
         assert route.call_count == retry_counts()[wire.path] + 1
 
@@ -426,12 +433,12 @@ class TestStreamCutMidAnswer:
             side_effect=[_cut(wire.body(["Hel"], finish=False)), _ok(b"")]
         )
 
-        with pytest.raises(LLMError, match="disables re-issuing it") as raised:
-            await _stream(wire.build(retry_base_delay=0.001, stream_resume_window_seconds=0), wire)
+        with pytest.raises(LLMError, match="disables retrying it") as raised:
+            await _stream(wire.build(retry_base_delay=0.001, gateway_outage_window_seconds=0), wire)
 
-        assert STREAM_RESUME_KNOB in str(raised.value)
+        assert GATEWAY_OUTAGE_KNOB in str(raised.value)
         assert route.call_count == 1
-        assert cap_hit_counts() == {STREAM_RESUME_KNOB: 1}
+        assert cap_hit_counts() == {GATEWAY_OUTAGE_KNOB: 1}
         assert retry_counts() == {}
 
     @respx.mock
@@ -445,9 +452,7 @@ class TestStreamCutMidAnswer:
             return httpx.Response(503, text="down")
 
         respx.post(wire.url).mock(side_effect=respond)
-        adapter = wire.build(
-            max_retries=0, retry_base_delay=0.01, stream_resume_window_seconds=0.05
-        )
+        adapter = wire.build(retry_base_delay=0.01, gateway_outage_window_seconds=0.05)
 
         with pytest.raises(LLMError) as raised:
             await _stream(adapter, wire)
@@ -523,78 +528,8 @@ class TestTruncatedAnswerIsAnAnswerNotAnOutage:
 
 
 # ---------------------------------------------------------------------------
-# The connection phase: the retry that always existed no longer hides itself
-# ---------------------------------------------------------------------------
-
-
-@_wire_param()
-class TestConnectionPhaseRetries:
-    @respx.mock
-    @pytest.mark.parametrize(
-        "unavailable",
-        [httpx.ConnectError("connection refused"), httpx.Response(504, text="timeout")],
-        ids=["ConnectError", "504"],
-    )
-    async def test_a_retried_connection_is_logged_and_counted(
-        self, wire, unavailable, caplog
-    ) -> None:
-        route = respx.post(wire.url).mock(
-            side_effect=[unavailable, _ok(wire.body(["ok"], finish=True))]
-        )
-
-        with caplog.at_level(logging.WARNING, logger="ravn.cap_telemetry"):
-            events = await _stream(wire.build(max_retries=2, retry_base_delay=0.001), wire)
-
-        assert route.call_count == 2
-        assert _answer(events)[0] == "ok"
-        assert retry_counts() == {f"llm.{wire.name}.connect": 1}
-        message = caplog.records[0].getMessage()
-        assert "attempt 1/2" in message
-        assert "llm.max_retries" in message
-
-    @respx.mock
-    async def test_exhausting_max_retries_names_the_knob_and_is_counted(self, wire) -> None:
-        respx.post(wire.url).mock(side_effect=httpx.ConnectError("connection refused"))
-
-        with pytest.raises(LLMError) as raised:
-            await _stream(wire.build(max_retries=1, retry_base_delay=0.001), wire)
-
-        assert "failed after 1 retries" in str(raised.value)
-        assert "Raise llm.max_retries" in str(raised.value)
-        assert "ConnectError" in str(raised.value)
-        assert isinstance(raised.value.__cause__, httpx.ConnectError)
-        assert cap_hit_counts() == {"llm.max_retries": 1}
-        assert retry_counts() == {f"llm.{wire.name}.connect": 1}
-
-
-class TestNonStreamingCallsStillRetryTransportErrors:
-    @respx.mock
-    async def test_anthropic_generate_counts_the_swallowed_transport_error(self) -> None:
-        adapter = AnthropicAdapter(
-            api_key="k", base_url="http://gw", max_retries=1, retry_base_delay=0.001
-        )
-        respx.post("http://gw/v1/messages").mock(
-            side_effect=[
-                httpx.ConnectError("connection refused"),
-                httpx.Response(
-                    200,
-                    json={
-                        "content": [{"type": "text", "text": "ok"}],
-                        "stop_reason": "end_turn",
-                        "usage": {"input_tokens": 1, "output_tokens": 1},
-                    },
-                ),
-            ]
-        )
-
-        result = await adapter.generate([], tools=[], system="", model="m", max_tokens=10)
-
-        assert result.content == "ok"
-        assert retry_counts() == {"llm.anthropic.connect": 1}
-
-
-# ---------------------------------------------------------------------------
-# resumable_stream: the window arithmetic, on a fake clock
+# The connection phase is under the same bound: a call made while the gateway is
+# down rides out the rollout instead of failing after three quick attempts
 # ---------------------------------------------------------------------------
 
 
@@ -619,6 +554,238 @@ def clock(monkeypatch) -> _Clock:
     return fake
 
 
+# The old connection-phase retry gave up after 3 retries: 1s + 2s + 4s of waiting.
+_OLD_CONNECTION_RETRY_SECONDS = 7.0
+
+
+@_wire_param()
+class TestConnectionPhaseOutage:
+    @respx.mock
+    @pytest.mark.parametrize(
+        "unavailable",
+        [httpx.ConnectError("connection refused"), httpx.Response(503, text="unavailable")],
+        ids=["ConnectError", "503"],
+    )
+    async def test_an_outage_longer_than_the_old_retries_recovers_within_the_window(
+        self, wire, unavailable, clock, caplog
+    ) -> None:
+        # Six failures: 1+2+4+8+10+10 = 35s of waiting, five times what three retries covered.
+        route = respx.post(wire.url).mock(
+            side_effect=[unavailable] * 6 + [_ok(wire.body(["back"], finish=True))]
+        )
+        adapter = wire.build(gateway_outage_window_seconds=120.0, retry_base_delay=1.0)
+
+        with caplog.at_level(logging.WARNING, logger="ravn.cap_telemetry"):
+            events = await _stream(adapter, wire)
+
+        assert route.call_count == 7
+        assert _answer(events)[0] == "back"
+        assert clock.slept == [1.0, 2.0, 4.0, 8.0, 10.0, 10.0]
+        assert sum(clock.slept) > _OLD_CONNECTION_RETRY_SECONDS
+        assert retry_counts() == {wire.path: 6}
+        assert cap_hit_counts() == {}
+        first = caplog.records[0].getMessage()
+        assert "retry 1" in first
+        assert "0.0s into the 120s llm.gateway_outage_window_seconds window" in first
+
+    @respx.mock
+    async def test_the_outage_window_is_spent_by_a_gateway_that_stays_down(
+        self, wire, clock
+    ) -> None:
+        route = respx.post(wire.url).mock(side_effect=httpx.ConnectError("connection refused"))
+        adapter = wire.build(gateway_outage_window_seconds=30.0, retry_base_delay=1.0)
+
+        with pytest.raises(LLMError) as raised:
+            await _stream(adapter, wire)
+
+        message = str(raised.value)
+        assert "llm.gateway_outage_window_seconds=30s" in message
+        assert "raise llm.gateway_outage_window_seconds".lower() in message.lower()
+        assert "ConnectError" in message
+        assert f"endpoint={wire.url}" in message
+        assert isinstance(raised.value.__cause__, httpx.ConnectError)
+        assert cap_hit_counts() == {GATEWAY_OUTAGE_KNOB: 1}
+        assert clock.slept == [1.0, 2.0, 4.0, 8.0, 10.0, 5.0]
+        assert route.call_count == 7
+        assert "llm.max_retries" not in message
+
+    @respx.mock
+    async def test_a_status_that_outlasts_the_window_is_carried_on_the_error(
+        self, wire, clock
+    ) -> None:
+        respx.post(wire.url).mock(return_value=httpx.Response(504, text="gateway timeout"))
+
+        with pytest.raises(LLMError) as raised:
+            await _stream(wire.build(gateway_outage_window_seconds=5.0), wire)
+
+        assert raised.value.status_code == 504
+        assert "status=504" in str(raised.value)
+
+    @respx.mock
+    async def test_a_client_error_is_raised_at_once_not_waited_out(self, wire, clock) -> None:
+        route = respx.post(wire.url).mock(return_value=httpx.Response(401, text="no"))
+
+        with pytest.raises(LLMError) as raised:
+            await _stream(wire.build(), wire)
+
+        assert raised.value.status_code == 401
+        assert route.call_count == 1
+        assert clock.slept == []
+
+
+class TestNonStreamingCallsRideOutTheOutageToo:
+    _OK = httpx.Response(
+        200,
+        json={
+            "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        },
+    )
+
+    @respx.mock
+    async def test_anthropic_generate_recovers_after_a_long_outage(self, clock) -> None:
+        adapter = AnthropicAdapter(api_key="k", base_url="http://gw", retry_base_delay=1.0)
+        route = respx.post("http://gw/v1/messages").mock(
+            side_effect=[httpx.ConnectError("refused")] * 3
+            + [httpx.Response(503, text="down")] * 3
+            + [self._OK]
+        )
+
+        result = await adapter.generate([], tools=[], system="", model="m", max_tokens=10)
+
+        assert result.content == "ok"
+        assert route.call_count == 7
+        assert sum(clock.slept) == 1 + 2 + 4 + 8 + 10 + 10
+        assert retry_counts() == {"llm.anthropic": 6}
+
+    @respx.mock
+    async def test_openai_generate_recovers_after_a_long_outage(self, clock) -> None:
+        adapter = OpenAICompatibleAdapter(api_key="k", base_url="http://gw", retry_base_delay=1.0)
+        route = respx.post("http://gw/v1/chat/completions").mock(
+            side_effect=[httpx.Response(502, text="bad gateway")] * 5
+            + [
+                httpx.Response(
+                    200,
+                    json={
+                        "choices": [
+                            {
+                                "message": {"role": "assistant", "content": "ok"},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                    },
+                )
+            ]
+        )
+
+        result = await adapter.generate([], tools=[], system="", model="m", max_tokens=10)
+
+        assert result.content == "ok"
+        assert route.call_count == 6
+        assert sum(clock.slept) == 1 + 2 + 4 + 8 + 10
+
+    @respx.mock
+    async def test_generate_exhaustion_names_the_window_and_chains_the_cause(self) -> None:
+        adapter = AnthropicAdapter(
+            api_key="k",
+            base_url="http://gw",
+            gateway_outage_window_seconds=0.05,
+            retry_base_delay=0.01,
+        )
+        respx.post("http://gw/v1/messages").mock(side_effect=httpx.ConnectError("refused"))
+
+        with pytest.raises(LLMError, match="llm.gateway_outage_window_seconds") as raised:
+            await adapter.generate([], tools=[], system="", model="m", max_tokens=10)
+
+        assert isinstance(raised.value.__cause__, httpx.ConnectError)
+        assert retry_counts()["llm.anthropic"] >= 1
+        assert cap_hit_counts() == {GATEWAY_OUTAGE_KNOB: 1}
+
+
+# ---------------------------------------------------------------------------
+# A stream that ends without its terminator is a cut answer, not an answer
+# ---------------------------------------------------------------------------
+
+
+@_wire_param()
+class TestIncompleteEndIsResumed:
+    @respx.mock
+    async def test_a_clean_end_without_the_terminator_is_sent_again(self, wire) -> None:
+        route = respx.post(wire.url).mock(
+            side_effect=[_ok(wire.incomplete), _ok(wire.body(["Hello ", "world"], finish=True))]
+        )
+
+        events = await _stream(wire.build(**_FAST), wire)
+
+        assert route.call_count == 2
+        assert [e.type for e in events].count(StreamEventType.STREAM_RESTART) == 1
+        text, calls = _answer(events)
+        assert text == "Hello world"
+        assert [c.id for c in calls] == ["t1"]
+        assert retry_counts() == {wire.path: 1}
+
+    @respx.mock
+    async def test_an_answer_that_never_completes_exhausts_the_window_loudly(self, wire) -> None:
+        route = respx.post(wire.url).mock(side_effect=lambda request: _ok(wire.incomplete))
+        adapter = wire.build(retry_base_delay=0.01, gateway_outage_window_seconds=0.05)
+
+        with pytest.raises(LLMError) as raised:
+            await _stream(adapter, wire)
+
+        assert GATEWAY_OUTAGE_KNOB in str(raised.value)
+        assert "StreamIncompleteError" in str(raised.value)
+        assert isinstance(raised.value.__cause__, StreamIncompleteError)
+        assert route.call_count > 1
+        assert cap_hit_counts() == {GATEWAY_OUTAGE_KNOB: 1}
+
+
+class TestAnthropicStreamErrors:
+    @respx.mock
+    @pytest.mark.parametrize("kind", ["overloaded_error", "api_error"])
+    async def test_an_overloaded_upstream_inside_the_stream_is_sent_again(self, kind) -> None:
+        wire = WIRES[0]
+        error = _data({"type": "error", "error": {"type": kind, "message": "try later"}})
+        route = respx.post(wire.url).mock(
+            side_effect=[_ok(error), _ok(wire.body(["fine"], finish=True))]
+        )
+
+        events = await _stream(wire.build(**_FAST), wire)
+
+        assert route.call_count == 2
+        assert _answer(events)[0] == "fine"
+
+    @respx.mock
+    async def test_a_request_the_upstream_rejects_is_raised_not_resent(self) -> None:
+        wire = WIRES[0]
+        error = _data(
+            {"type": "error", "error": {"type": "invalid_request_error", "message": "bad tool"}}
+        )
+        route = respx.post(wire.url).mock(return_value=_ok(error))
+
+        with pytest.raises(LLMError, match="invalid_request_error: bad tool"):
+            await _stream(wire.build(**_FAST), wire)
+
+        assert route.call_count == 1
+        assert retry_counts() == {}
+
+    @respx.mock
+    async def test_message_stop_alone_completes_a_stream(self) -> None:
+        wire = WIRES[0]
+        route = respx.post(wire.url).mock(return_value=_ok(_data({"type": "message_stop"})))
+
+        events = await _stream(wire.build(**_FAST), wire)
+
+        assert events == []
+        assert route.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# resumable_stream: the window arithmetic, on a fake clock
+# ---------------------------------------------------------------------------
+
+
 def _text(piece: str) -> StreamEvent:
     return StreamEvent(type=StreamEventType.TEXT_DELTA, text=piece)
 
@@ -628,12 +795,12 @@ class _Responses:
 
     def __init__(self, *attempts: tuple[list[StreamEvent], BaseException | None]) -> None:
         self._attempts = list(attempts)
-        self.opened: list[bool] = []
+        self.opened: list[GatewayOutage] = []
         self.closed = 0
         self._current = -1
 
-    async def open(self, resumed: bool) -> httpx.Response:
-        self.opened.append(resumed)
+    async def open(self, outage: GatewayOutage) -> httpx.Response:
+        self.opened.append(outage)
         self._current += 1
         response = AsyncMock(spec=httpx.Response)
 
@@ -656,10 +823,12 @@ async def _drive(script: _Responses, **kw) -> list[StreamEvent]:
     return [
         event
         async for event in resumable_stream(
-            provider="test",
-            window_seconds=kw.pop("window_seconds", 30.0),
-            base_delay=kw.pop("base_delay", 1.0),
-            max_backoff_seconds=kw.pop("max_backoff_seconds", 10.0),
+            outage=GatewayOutage(
+                provider="test",
+                window_seconds=kw.pop("window_seconds", 30.0),
+                base_delay=kw.pop("base_delay", 1.0),
+                max_backoff_seconds=kw.pop("max_backoff_seconds", 10.0),
+            ),
             open_response=script.open,
             read_events=script.read,
         )
@@ -673,16 +842,15 @@ class TestResumableStreamWindow:
         down = httpx.ConnectError("refused")
         script = _Responses(*[([], down)] * 20)
 
-        with pytest.raises(LLMError, match="llm.stream_resume_window_seconds=30s"):
+        with pytest.raises(LLMError, match="llm.gateway_outage_window_seconds=30s"):
             await _drive(script)
 
         # 1+2+4+8+10 = 25s, then the last 5s of the 30s window, then it is over.
         assert clock.slept == [1.0, 2.0, 4.0, 8.0, 10.0, 5.0]
         assert len(script.opened) == 7
-        assert script.opened == [False] + [True] * 6
         assert script.closed == 7
-        assert cap_hit_counts() == {STREAM_RESUME_KNOB: 1}
-        assert retry_counts() == {"llm.test.stream": 6}
+        assert cap_hit_counts() == {GATEWAY_OUTAGE_KNOB: 1}
+        assert retry_counts() == {"llm.test": 6}
 
     async def test_the_window_is_measured_from_the_first_failure_not_from_the_call(
         self, clock
@@ -729,7 +897,7 @@ class TestResumableStreamWindow:
         ]
         # 1s, 2s into the first outage; the second outage starts again at 1s.
         assert clock.slept == [1.0, 2.0, 1.0]
-        assert retry_counts() == {"llm.test.stream": 3}
+        assert retry_counts() == {"llm.test": 3}
 
     async def test_time_spent_failing_accumulates_across_outages_within_one_call(
         self, clock
@@ -751,7 +919,7 @@ class TestResumableStreamWindow:
         cut = httpx.RemoteProtocolError("cut")
         script = _Responses(*[([_text("x")], cut)] * 50)
 
-        with pytest.raises(LLMError, match="llm.stream_resume_window_seconds=3s"):
+        with pytest.raises(LLMError, match="llm.gateway_outage_window_seconds=3s"):
             await _drive(script, window_seconds=3.0)
 
         # Every cycle delivered something and every cycle still cost its backoff.
@@ -759,31 +927,18 @@ class TestResumableStreamWindow:
         assert clock.slept == [1.0] * 3
         assert len(script.opened) == 4
 
-    async def test_unavailable_statuses_are_transient(self, clock) -> None:
-        events_after = [_text("ok")]
+    async def test_an_incomplete_stream_is_sent_again(self, clock) -> None:
+        script = _Responses(
+            ([_text("a")], StreamIncompleteError("no terminator")), ([_text("b")], None)
+        )
 
-        async def open_response(resumed: bool):
-            if not resumed:
-                raise TransientStatusError(503)
-            return AsyncMock(spec=httpx.Response)
+        events = await _drive(script)
 
-        async def read(response):
-            for event in events_after:
-                yield event
-
-        events = [
-            event
-            async for event in resumable_stream(
-                provider="test",
-                window_seconds=30,
-                base_delay=1,
-                max_backoff_seconds=10,
-                open_response=open_response,
-                read_events=read,
-            )
+        assert [e.type for e in events] == [
+            StreamEventType.TEXT_DELTA,
+            StreamEventType.STREAM_RESTART,
+            StreamEventType.TEXT_DELTA,
         ]
-
-        assert [e.text for e in events] == ["ok"]
         assert clock.slept == [1.0]
 
     async def test_other_exceptions_pass_through_unretried(self, clock) -> None:
@@ -805,37 +960,75 @@ class TestResumableStreamWindow:
         assert clock.slept == []
 
 
-class TestReissueRequest:
-    @respx.mock
-    async def test_sends_fresh_headers_with_the_same_payload(self) -> None:
-        route = respx.post("http://gw/v1/x").mock(return_value=httpx.Response(200, text="ok"))
-        async with httpx.AsyncClient(headers={"authorization": "Bearer old"}) as client:
-            response = await reissue_request(
-                client, "http://gw/v1/x", {"a": 1}, headers={"authorization": "Bearer new"}
-            )
-            await response.aclose()
+def _outage(window: float = 30.0) -> GatewayOutage:
+    return GatewayOutage(
+        provider="test", window_seconds=window, base_delay=1.0, max_backoff_seconds=10.0
+    )
 
-        request = route.calls[0].request
-        assert request.headers["authorization"] == "Bearer new"
-        assert json.loads(request.content) == {"a": 1}
+
+class TestPostWithinWindow:
+    @respx.mock
+    async def test_every_attempt_sends_freshly_minted_headers(self, clock) -> None:
+        route = respx.post("http://gw/v1/x").mock(
+            side_effect=[httpx.ConnectError("down"), httpx.Response(200, text="ok")]
+        )
+        minted = iter(["Bearer old", "Bearer new"])
+
+        async def headers() -> dict[str, str]:
+            return {"authorization": next(minted)}
+
+        async with httpx.AsyncClient() as client:
+            response = await post_within_window(
+                client, "http://gw/v1/x", {"a": 1}, stream=False, outage=_outage(), headers=headers
+            )
+
+        assert response.status_code == 200
+        assert [c.request.headers["authorization"] for c in route.calls] == [
+            "Bearer old",
+            "Bearer new",
+        ]
+        assert json.loads(route.calls[1].request.content) == {"a": 1}
 
     @respx.mock
     @pytest.mark.parametrize("status", sorted(RETRYABLE_STATUS_CODES))
-    async def test_unavailable_statuses_raise_transient(self, status) -> None:
-        respx.post("http://gw/v1/x").mock(return_value=httpx.Response(status))
+    @pytest.mark.parametrize("stream", [True, False])
+    async def test_unavailable_statuses_are_waited_out(self, status, stream, clock) -> None:
+        route = respx.post("http://gw/v1/x").mock(
+            side_effect=[httpx.Response(status), httpx.Response(200, text="ok")]
+        )
         async with httpx.AsyncClient() as client:
-            with pytest.raises(TransientStatusError) as raised:
-                await reissue_request(client, "http://gw/v1/x", {})
-        assert raised.value.status_code == status
+            response = await post_within_window(
+                client, "http://gw/v1/x", {}, stream=stream, outage=_outage()
+            )
+            if stream:
+                await response.aread()
+                await response.aclose()
+
+        assert response.status_code == 200
+        assert route.call_count == 2
+        assert clock.slept == [1.0]
 
     @respx.mock
     @pytest.mark.parametrize("status", [200, 400, 401, 404, 422])
-    async def test_other_statuses_are_returned_for_the_reader_to_judge(self, status) -> None:
+    async def test_other_statuses_are_returned_for_the_caller_to_judge(self, status, clock) -> None:
         respx.post("http://gw/v1/x").mock(return_value=httpx.Response(status))
         async with httpx.AsyncClient() as client:
-            response = await reissue_request(client, "http://gw/v1/x", {})
-            await response.aclose()
+            response = await post_within_window(
+                client, "http://gw/v1/x", {}, stream=False, outage=_outage()
+            )
         assert response.status_code == status
+        assert clock.slept == []
+
+    @respx.mock
+    async def test_a_spent_window_raises_with_the_status(self, clock) -> None:
+        respx.post("http://gw/v1/x").mock(return_value=httpx.Response(503))
+        async with httpx.AsyncClient() as client:
+            with pytest.raises(LLMError) as raised:
+                await post_within_window(
+                    client, "http://gw/v1/x", {}, stream=True, outage=_outage(window=3.0)
+                )
+        assert raised.value.status_code == 503
+        assert "llm.gateway_outage_window_seconds=3s" in str(raised.value)
 
     def test_the_retryable_statuses_are_the_unavailable_ones(self) -> None:
         assert RETRYABLE_STATUS_CODES == {429, 500, 502, 503, 504}
@@ -974,7 +1167,7 @@ class RotatingTokenAuth:
         return False
 
 
-class TestReissueCarriesAFreshCredential:
+class TestRetryCarriesAFreshCredential:
     @respx.mock
     @pytest.mark.parametrize("wire", WIRES[2:], ids=WIRE_IDS[2:])
     async def test_a_reissue_minutes_later_does_not_reuse_the_first_token(self, wire) -> None:
