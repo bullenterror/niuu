@@ -10,6 +10,7 @@ import copy
 import json
 import logging
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
@@ -95,6 +96,19 @@ ANNOTATION_PLATFORM_VERSION = "niuu.world/platform-version"
 #: The version that release replaced. A Völundr that still renders it (the old replica
 #: while Völundr itself rolls out) must not move the resident back to it.
 ANNOTATION_REPLACED_PLATFORM_VERSION = "niuu.world/replaced-platform-version"
+#: Which of the owner's credentials each integration a resident declares was bound to
+#: when it was deployed (``{slug: credential name}``). Every later render reuses it:
+#: following the platform, restart and resume run without the owner's login, which
+#: reading the owner's connections needs.
+ANNOTATION_RESIDENT_INTEGRATIONS = "niuu.world/resident-integrations"
+
+
+@dataclass(frozen=True)
+class RenderedResident:
+    """A resident's release values and the integration credentials they were bound to."""
+
+    values: dict[str, Any]
+    integrations: dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -793,17 +807,22 @@ class FluxPodManager(
         self,
         runtime: ResidentRuntime,
         profile: ResidentDeploymentProfile,
-    ) -> dict[str, str]:
+        bound: Mapping[str, str],
+    ) -> tuple[dict[str, str], dict[str, str]]:
         """Inject the owner's credentials a profile declares, bound to the resident's own SA.
 
         ``deployment.credentials`` lists ``{integration: <slug>}`` (the owner's one enabled
         connection of that integration) or ``{credential: <name>}``, each with ``files``
         mapping a path under /run/secrets/ to a credential field. They render into the
         ravn container. Declared but impossible is fatal.
+
+        An integration already in ``bound`` keeps that credential; any other is read
+        from the owner's connections. Returns the annotations and every integration's
+        credential, for the release to record (``ANNOTATION_RESIDENT_INTEGRATIONS``).
         """
         declared = profile.deployment.get("credentials") or []
         if not declared:
-            return {}
+            return {}, {}
         if not isinstance(declared, list):
             raise ValueError(f"Resident profile {profile.id} deployment.credentials must be a list")
         injection = self._secret_injection
@@ -819,8 +838,14 @@ class FluxPodManager(
                 "resident's own service account: set the resident platform base URL"
             )
         mappings = [
-            await self._resident_credential_mapping(runtime, profile, item) for item in declared
+            await self._resident_credential_mapping(runtime, profile, item, bound)
+            for item in declared
         ]
+        integrations = {
+            str(item["integration"]): mapping.credential_name
+            for item, mapping in zip(declared, mappings, strict=True)
+            if item.get("integration")
+        }
         additions = await injection.workload_pod_spec_additions(
             runtime.owner_id,
             mappings,
@@ -829,13 +854,14 @@ class FluxPodManager(
             inject_containers=RESIDENT_CREDENTIAL_CONTAINERS,
             tenant_id=runtime.tenant_id,
         )
-        return dict(additions.annotations)
+        return dict(additions.annotations), integrations
 
     async def _resident_credential_mapping(
         self,
         runtime: ResidentRuntime,
         profile: ResidentDeploymentProfile,
         item: Any,
+        bound: Mapping[str, str],
     ) -> CredentialMapping:
         where = f"Resident profile {profile.id} deployment.credentials"
         if not isinstance(item, dict):
@@ -853,7 +879,9 @@ class FluxPodManager(
                     f"{where} files must map a path under {RESIDENT_SECRET_ROOT} to a field"
                 )
         if integration:
-            credential = await self._owner_integration_credential(runtime, where, integration)
+            credential = bound.get(integration) or await self._owner_integration_credential(
+                runtime, where, integration
+            )
         if self._credential_store is None:
             raise ValueError(f"{where} needs a credential store to check the owner's credentials")
         stored = await self._credential_store.get("user", runtime.owner_id, credential)
@@ -1169,7 +1197,8 @@ class FluxPodManager(
         profile: ResidentDeploymentProfile,
     ) -> ResidentRuntimeObservation:
         release_name = self._resident_release_name(runtime)
-        values = await self._render_resident_values(runtime, profile)
+        rendered = await self._render_resident_values(runtime, profile)
+        values = rendered.values
         version = self._platform_version(values)
         await self._ensure_resident_claims(runtime, self._resident_claims(runtime, profile))
         await self._ensure_resident_openclaw_secret(runtime, profile)
@@ -1180,6 +1209,7 @@ class FluxPodManager(
             annotations={
                 **self._resident_release_annotations(runtime),
                 ANNOTATION_PLATFORM_VERSION: version,
+                **_integrations_annotation(rendered.integrations),
             },
         )
         self._failed_platform_upgrades.pop(str(runtime.id), None)
@@ -1251,13 +1281,15 @@ class FluxPodManager(
         """
         runtime_id = str(runtime.id)
         try:
-            values = await self._render_resident_values(runtime, profile)
+            rendered = await self._render_resident_values(
+                runtime, profile, bound_integrations=_release_integrations(helmrelease)
+            )
         except Exception:
             # Deploy reports a profile or realm that does not render; reconcile
             # keeps observing the release as it runs.
             logger.debug("Resident %s does not render; not following the platform", runtime_id)
             return helmrelease, None
-        target = self._platform_version(values)
+        target = self._platform_version(rendered.values)
         current = self._release_platform_version(helmrelease)
         if current == target:
             self._failed_platform_upgrades.pop(runtime_id, None)
@@ -1274,7 +1306,7 @@ class FluxPodManager(
 
         logger.info("Upgrading resident %s from %s to %s", runtime.name, current, target)
         try:
-            upgraded = await self._roll_resident_release(runtime, profile, helmrelease, values)
+            upgraded = await self._roll_resident_release(runtime, profile, helmrelease, rendered)
         except Exception as exc:
             if getattr(exc, "status", None) == _HTTP_CONFLICT:
                 # Another Völundr replica moved it first; the next pass observes that.
@@ -1302,12 +1334,17 @@ class FluxPodManager(
         self,
         runtime: ResidentRuntime,
         profile: ResidentDeploymentProfile,
-    ) -> dict[str, Any]:
+        *,
+        bound_integrations: Mapping[str, str] | None = None,
+    ) -> RenderedResident:
+        """The resident's values; ``bound_integrations`` are those its release recorded."""
         values = self._resident_values(runtime, profile, await self._resolve_realm_slug(runtime))
-        annotations = await self._resident_credential_annotations(runtime, profile)
+        annotations, integrations = await self._resident_credential_annotations(
+            runtime, profile, bound_integrations or {}
+        )
         if annotations:
             values.setdefault("podAnnotations", {}).update(annotations)
-        return values
+        return RenderedResident(values=values, integrations=integrations)
 
     def _platform_version(self, values: dict[str, Any]) -> str:
         """The version this Völundr renders for a resident: its chart and images."""
@@ -1346,9 +1383,9 @@ class FluxPodManager(
         runtime: ResidentRuntime,
         profile: ResidentDeploymentProfile,
         helmrelease: dict[str, Any],
-        values: dict[str, Any],
+        rendered: RenderedResident,
     ) -> dict[str, Any]:
-        """Replace the release's chart and values with ``values``, keeping its metadata.
+        """Replace the release's chart and values with ``rendered``, keeping its metadata.
 
         The resident keeps the storage its release mounts (its own PVCs, or the
         claim a resident older than those runs on): the rolled pod mounts the same
@@ -1356,7 +1393,7 @@ class FluxPodManager(
         replace carries the release's resourceVersion: a concurrent writer makes it
         fail with a conflict rather than be overwritten.
         """
-        values = _with_release_storage(values, helmrelease)
+        values = _with_release_storage(rendered.values, helmrelease)
         claims = [
             claim
             for claim in self._resident_claims(runtime, profile)
@@ -1382,6 +1419,8 @@ class FluxPodManager(
             **manifest["metadata"]["annotations"],
             ANNOTATION_PLATFORM_VERSION: target,
         }
+        annotations.pop(ANNOTATION_RESIDENT_INTEGRATIONS, None)
+        annotations.update(_integrations_annotation(rendered.integrations))
         if current != target:
             annotations[ANNOTATION_REPLACED_PLATFORM_VERSION] = current
         metadata["annotations"] = annotations
@@ -1401,14 +1440,16 @@ class FluxPodManager(
         helmrelease = await self._get_helmrelease(self._resident_release_name(runtime))
         if helmrelease is None:
             return await self.deploy(runtime, profile)
-        values = await self._render_resident_values(runtime, profile)
+        rendered = await self._render_resident_values(
+            runtime, profile, bound_integrations=_release_integrations(helmrelease)
+        )
         if pod_annotations:
-            values.setdefault("podAnnotations", {}).update(pod_annotations)
+            rendered.values.setdefault("podAnnotations", {}).update(pod_annotations)
         current = self._release_platform_version(helmrelease)
-        target = self._platform_version(values)
+        target = self._platform_version(rendered.values)
         if current != target:
             logger.info("Upgrading resident %s from %s to %s", runtime.name, current, target)
-        await self._roll_resident_release(runtime, profile, helmrelease, values)
+        await self._roll_resident_release(runtime, profile, helmrelease, rendered)
         return await self._observe_after_lifecycle(runtime)
 
     def _resident_observation(
@@ -1816,6 +1857,27 @@ def resident_platform_version(chart: str, chart_version: str, values: dict[str, 
 
 #: The values that name a resident's volumes: an upgrade keeps them as the release has them.
 _RESIDENT_STORAGE_VALUES = ("homeVolume", "persistence")
+
+
+def _integrations_annotation(integrations: Mapping[str, str]) -> dict[str, str]:
+    """The release annotation recording a resident's integration credentials, if any."""
+    if not integrations:
+        return {}
+    return {ANNOTATION_RESIDENT_INTEGRATIONS: json.dumps(dict(sorted(integrations.items())))}
+
+
+def _release_integrations(helmrelease: dict[str, Any]) -> dict[str, str]:
+    """The integration credentials a resident's release recorded when it was deployed."""
+    annotations = (helmrelease.get("metadata") or {}).get("annotations") or {}
+    raw = annotations.get(ANNOTATION_RESIDENT_INTEGRATIONS)
+    if not raw:
+        return {}
+    recorded = json.loads(raw)
+    if not isinstance(recorded, dict) or not all(
+        isinstance(slug, str) and isinstance(name, str) and name for slug, name in recorded.items()
+    ):
+        raise ValueError(f"{ANNOTATION_RESIDENT_INTEGRATIONS} must map integrations to credentials")
+    return recorded
 
 
 def _with_release_storage(values: dict[str, Any], helmrelease: dict[str, Any]) -> dict[str, Any]:

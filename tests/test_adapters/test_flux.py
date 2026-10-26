@@ -3069,6 +3069,89 @@ class TestResidentCredentials:
                 _resident_runtime(), self._profile(self._DECLARED)
             )
 
+    async def test_deploy_records_which_credential_each_integration_bound(
+        self, pod_manager: FluxPodManager, mock_api
+    ) -> None:
+        self._wire(pod_manager)
+        with patch.object(pod_manager, "_get_api", return_value=mock_api):
+            await pod_manager.deploy(_resident_runtime(), self._profile(self._DECLARED))
+
+        body = mock_api.create_namespaced_custom_object.call_args.kwargs["body"]
+        assert body["metadata"]["annotations"]["niuu.world/resident-integrations"] == (
+            '{"xai": "xai-key"}'
+        )
+
+    @pytest.mark.parametrize("rerender", ["reconcile", "restart"])
+    async def test_a_rerender_keeps_the_recorded_credential_without_the_owners_login(
+        self, core_api: AsyncMock, rerender: str
+    ) -> None:
+        # Following the platform and restart run without the owner's bearer token,
+        # which reading the owner's connections needs.
+        pod_manager = _platform_manager()
+        injection = self._wire(pod_manager)
+        pod_manager._integrations.list_connections.side_effect = RuntimeError(
+            "Shared integrations require an authenticated caller bearer token"
+        )
+        runtime = _resident_runtime()
+        _own_claims_exist(core_api, runtime)
+        cluster = _Cluster(
+            _running_release(runtime, **{"niuu.world/resident-integrations": '{"xai": "xai-key"}'})
+        )
+        profile = _platform_profile()
+        profile.deployment["credentials"] = self._DECLARED
+
+        with _on_cluster(pod_manager, cluster):
+            if rerender == "reconcile":
+                await pod_manager.reconcile(runtime, profile)
+            else:
+                await pod_manager.restart(runtime, profile)
+
+        [rolled] = cluster.replaces
+        assert rolled["spec"]["values"]["image"] == _NEW_IMAGE
+        assert rolled["metadata"]["annotations"]["niuu.world/resident-integrations"] == (
+            '{"xai": "xai-key"}'
+        )
+        assert injection.workload_pod_spec_additions.await_args.args[1][0].credential_name == (
+            "xai-key"
+        )
+        pod_manager._integrations.list_connections.assert_not_awaited()
+
+    async def test_a_release_without_a_recorded_credential_reads_the_owners(
+        self, core_api: AsyncMock
+    ) -> None:
+        pod_manager = _platform_manager()
+        self._wire(pod_manager)
+        runtime = _resident_runtime()
+        _own_claims_exist(core_api, runtime)
+        cluster = _Cluster(_running_release(runtime))
+        profile = _platform_profile()
+        profile.deployment["credentials"] = self._DECLARED
+
+        with _on_cluster(pod_manager, cluster):
+            await pod_manager.restart(runtime, profile)
+
+        [rolled] = cluster.replaces
+        assert rolled["metadata"]["annotations"]["niuu.world/resident-integrations"] == (
+            '{"xai": "xai-key"}'
+        )
+        pod_manager._integrations.list_connections.assert_awaited_once_with("user-a")
+
+    @pytest.mark.parametrize("recorded", ['["xai-key"]', '{"xai": ""}', '{"xai": 3}'])
+    async def test_a_malformed_recorded_credential_is_fatal(
+        self, core_api: AsyncMock, recorded: str
+    ) -> None:
+        pod_manager = _platform_manager()
+        self._wire(pod_manager)
+        runtime = _resident_runtime()
+        cluster = _Cluster(
+            _running_release(runtime, **{"niuu.world/resident-integrations": recorded})
+        )
+        profile = _platform_profile()
+        profile.deployment["credentials"] = self._DECLARED
+
+        with _on_cluster(pod_manager, cluster), pytest.raises(ValueError, match="must map"):
+            await pod_manager.restart(runtime, profile)
+
     async def test_delete_removes_the_residents_credential_access(
         self, pod_manager: FluxPodManager, mock_api
     ) -> None:
