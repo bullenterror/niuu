@@ -960,6 +960,41 @@ class TestAgentHonoursStreamRestart:
         assert result.usage.input_tokens == 5
 
 
+class RotatingTokenAuth:
+    """Mints a different bearer token on every call, like a short-lived workload token."""
+
+    def __init__(self) -> None:
+        self._minted = 0
+
+    def headers(self) -> dict[str, str]:
+        self._minted += 1
+        return {"authorization": f"Bearer token-{self._minted}"}
+
+    def invalidate(self) -> bool:
+        return False
+
+
+class TestReissueCarriesAFreshCredential:
+    @respx.mock
+    @pytest.mark.parametrize("wire", WIRES[2:], ids=WIRE_IDS[2:])
+    async def test_a_reissue_minutes_later_does_not_reuse_the_first_token(self, wire) -> None:
+        route = respx.post(wire.url).mock(
+            side_effect=[
+                _cut(wire.body(["Hel"], finish=False)),
+                _ok(wire.body(["done"], finish=True)),
+            ]
+        )
+        adapter = wire.build(
+            auth_adapter="tests.ravn.unit.test_llm_stream_resume.RotatingTokenAuth",
+            **_FAST,
+        )
+
+        await _stream(adapter, wire)
+
+        sent = [call.request.headers["authorization"] for call in route.calls]
+        assert sent == ["Bearer token-1", "Bearer token-2"]
+
+
 class TestOpenAIResponsesGenerateHonoursStreamRestart:
     @respx.mock
     async def test_generate_returns_only_the_reissued_answer(self) -> None:
