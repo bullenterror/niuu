@@ -15,7 +15,15 @@ from niuu.domain.delivery import (
     ReviewPublication,
     ReviewRequest,
 )
-from niuu.domain.models import CIStatus, GitProviderType, PullRequest, RepoInfo
+from niuu.domain.models import (
+    CIStatus,
+    CommitDetail,
+    GitProviderType,
+    PullRequest,
+    RefChecks,
+    RefComparison,
+    RepoInfo,
+)
 from niuu.ports.delivery import DeliveryForgeProvider
 from niuu.ports.git import GitProvider, GitWorkflowProvider
 
@@ -360,6 +368,30 @@ class GitProviderRegistry:
         if provider is None:
             raise ValueError(f"No git provider found for: {repo_url}")
         return await provider.list_branches(repo_url)
+
+    def _require_provider(self, repo_url: str) -> GitProvider:
+        provider = self.get_provider(repo_url)
+        if provider is None:
+            raise ValueError(f"No git provider found for: {repo_url}")
+        return provider
+
+    async def get_commit(self, repo_url: str, ref: str) -> CommitDetail:
+        """Read one commit via the appropriate provider.
+
+        Raises:
+            ValueError: If no provider supports the URL.
+            GitAuthError: If authentication fails.
+            GitRepoNotFoundError: If the repository or the ref is not found.
+        """
+        return await self._require_provider(repo_url).get_commit(repo_url, ref)
+
+    async def compare_refs(self, repo_url: str, base: str, head: str) -> RefComparison:
+        """Compare two refs via the appropriate provider (errors as ``get_commit``)."""
+        return await self._require_provider(repo_url).compare_refs(repo_url, base, head)
+
+    async def get_ref_checks(self, repo_url: str, ref: str) -> RefChecks:
+        """Read CI / check results for a ref via the appropriate provider."""
+        return await self._require_provider(repo_url).get_ref_checks(repo_url, ref)
 
     async def close(self) -> None:
         """Close all provider HTTP clients."""

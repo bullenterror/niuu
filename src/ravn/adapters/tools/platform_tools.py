@@ -365,6 +365,17 @@ class VolundrGitTool(_PlatformAuthMixin, ToolPort):
     - ``get_pr``        — get PR details (requires ``pr_number``, ``repo_url``).
     - ``merge_pr``      — merge a pull request (requires ``pr_number``, ``repo_url``).
     - ``ci_status``     — get CI status (requires ``pr_number``, ``repo_url``, ``branch``).
+    - ``get_commit``    — read one commit: message, parents, changed files (requires
+      ``repo_url``, ``ref``; optional ``path``, ``include_patch``).
+    - ``compare``       — compare ``base`` with ``head``: ahead/behind, commits, changed
+      files (requires ``repo_url``, ``base``, ``head``; optional ``path``,
+      ``include_patch``).
+    - ``ref_checks``    — CI results for a branch, tag or commit, no PR needed (requires
+      ``repo_url``, ``ref``).
+
+    The three read actions go through the platform's authenticated Git credentials,
+    so they are the route for commits, diffs and CI. Fetching ``api.github.com``
+    anonymously is rate limited per egress IP and fails.
     """
 
     def __init__(
@@ -395,7 +406,17 @@ class VolundrGitTool(_PlatformAuthMixin, ToolPort):
             "Git operations via Volundr: list_repos, list_branches (repo_url), "
             "create_pr (session_id + title), list_prs (repo_url), "
             "get_pr (pr_number + repo_url), merge_pr (pr_number + repo_url), "
-            "ci_status (pr_number + repo_url + branch)."
+            "ci_status (pr_number + repo_url + branch). "
+            "To verify delivered work use the authenticated reads, never raw "
+            "api.github.com / gitlab fetches (anonymous calls are rate limited "
+            "and fail): get_commit (repo_url + ref: message, parents, changed "
+            "files with additions/deletions), compare (repo_url + base + head: "
+            "ahead/behind, commits, changed files) and ref_checks (repo_url + ref: "
+            "CI results for a branch, tag or commit, no PR needed). get_commit and "
+            "compare return the file list WITHOUT patches; set include_patch=true "
+            "and pass path (a file or directory, or a list) to read the diff of "
+            "just the files you need. files_total is the full count of changed "
+            "files and unmatched_paths lists requested paths the change did not touch."
         )
 
     @property
@@ -413,6 +434,9 @@ class VolundrGitTool(_PlatformAuthMixin, ToolPort):
                         "get_pr",
                         "merge_pr",
                         "ci_status",
+                        "get_commit",
+                        "compare",
+                        "ref_checks",
                     ],
                     "description": "Operation to perform.",
                 },
@@ -452,6 +476,36 @@ class VolundrGitTool(_PlatformAuthMixin, ToolPort):
                     "enum": ["open", "closed", "merged", "all"],
                     "description": "PR status filter for list_prs (default: open).",
                 },
+                "ref": {
+                    "type": "string",
+                    "description": (
+                        "Commit SHA, branch or tag (required for get_commit, ref_checks)."
+                    ),
+                },
+                "base": {
+                    "type": "string",
+                    "description": "Base commit SHA, branch or tag (required for compare).",
+                },
+                "head": {
+                    "type": "string",
+                    "description": "Head commit SHA, branch or tag (required for compare).",
+                },
+                "path": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "get_commit / compare: only these changed files or directories "
+                        "(a string is accepted for one). Default: all changed files."
+                    ),
+                },
+                "include_patch": {
+                    "type": "boolean",
+                    "description": (
+                        "get_commit / compare: include each file's diff (default false: "
+                        "file list and line counts only). Combine with path to read the "
+                        "diff of a few files at a time."
+                    ),
+                },
             },
             "required": ["action"],
         }
@@ -478,6 +532,12 @@ class VolundrGitTool(_PlatformAuthMixin, ToolPort):
                     return await self._merge_pr(client, input)
                 case "ci_status":
                     return await self._ci_status(client, input)
+                case "get_commit":
+                    return await self._get_commit(client, input)
+                case "compare":
+                    return await self._compare(client, input)
+                case "ref_checks":
+                    return await self._ref_checks(client, input)
                 case _:
                     return _err(f"Unknown action: {action!r}")
         raise AssertionError("Unreachable execute fallthrough")
@@ -580,6 +640,63 @@ class VolundrGitTool(_PlatformAuthMixin, ToolPort):
             return _ok(resp.json())
         except Exception as exc:
             return _err(f"Failed to get CI status: {_http_failure(exc)}")
+
+    @staticmethod
+    def _read_params(input: dict, params: dict) -> dict:
+        """Add the optional ``path`` / ``include_patch`` shaping to a read request."""
+        raw_path = input.get("path")
+        paths = [raw_path] if isinstance(raw_path, str) else list(raw_path or [])
+        if paths:
+            params["path"] = paths
+        if input.get("include_patch"):
+            params["include_patch"] = "true"
+        return params
+
+    async def _get_commit(self, client: httpx.AsyncClient, input: dict) -> ToolResult:
+        repo_url = input.get("repo_url", "")
+        ref = input.get("ref", "")
+        if not repo_url or not ref:
+            return _err("repo_url and ref are required for get_commit")
+        try:
+            resp = await client.get(
+                f"{_NIUU_REPOS_PATH}/commit",
+                params=self._read_params(input, {"repo_url": repo_url, "ref": ref}),
+            )
+            resp.raise_for_status()
+            return _ok(resp.json())
+        except Exception as exc:
+            return _err(f"Failed to read commit {ref!r}: {_http_failure(exc)}")
+
+    async def _compare(self, client: httpx.AsyncClient, input: dict) -> ToolResult:
+        repo_url = input.get("repo_url", "")
+        base = input.get("base", "")
+        head = input.get("head", "")
+        if not repo_url or not base or not head:
+            return _err("repo_url, base and head are required for compare")
+        try:
+            resp = await client.get(
+                f"{_NIUU_REPOS_PATH}/compare",
+                params=self._read_params(input, {"repo_url": repo_url, "base": base, "head": head}),
+            )
+            resp.raise_for_status()
+            return _ok(resp.json())
+        except Exception as exc:
+            return _err(f"Failed to compare {base!r}...{head!r}: {_http_failure(exc)}")
+
+    async def _ref_checks(self, client: httpx.AsyncClient, input: dict) -> ToolResult:
+        repo_url = input.get("repo_url", "")
+        ref = input.get("ref", "")
+        if not repo_url or not ref:
+            return _err("repo_url and ref are required for ref_checks")
+        try:
+            resp = await client.get(
+                f"{_NIUU_REPOS_PATH}/checks",
+                params={"repo_url": repo_url, "ref": ref},
+            )
+            resp.raise_for_status()
+            return _ok(resp.json())
+        except Exception as exc:
+            return _err(f"Failed to read checks for {ref!r}: {_http_failure(exc)}")
 
 
 # ---------------------------------------------------------------------------
