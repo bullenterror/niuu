@@ -14,6 +14,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from niuu.domain.notifications import MAX_BODY_CHARS
+from ravn.cap_telemetry import record_truncation
 from ravn.domain.models import TokenUsage, TurnResult
 from ravn.domain.resident_continuation import (
     ResidentA2ATaskRecord,
@@ -684,7 +686,7 @@ def _render_turn_record(record: ResidentTurnRecord) -> str:
         "## Tool Results\n\n"
         f"{tool_results}\n\n"
         "## Mandate\n\n"
-        f"{record.mandate[:4000]}\n\n"
+        f"{record.mandate}\n\n"
         "## Outcome Fields\n\n"
         f"{fields or '- none'}\n\n"
         "## Selected Next Action\n\n"
@@ -892,6 +894,25 @@ def _parse_a2a_task(content: str) -> ResidentA2ATaskRecord | None:
     )
 
 
+def _operator_question_line(question: str) -> str:
+    """The question as stored and read back, bounded by what a notification carries.
+
+    The answer is bound to this text, so a cut is a cap hit rather than a quiet
+    edit of what was asked.
+    """
+    line = _compact_line(question, limit=MAX_BODY_CHARS)
+    flat = " ".join(question.split())
+    if len(flat) > MAX_BODY_CHARS:
+        record_truncation(
+            "niuu.notifications.MAX_BODY_CHARS",
+            what="an operator question",
+            kept=MAX_BODY_CHARS,
+            total=len(flat),
+            remedy="ask a shorter question; the operator's notification cannot carry more",
+        )
+    return line
+
+
 def _render_operator_needed(
     *,
     question: str,
@@ -914,12 +935,12 @@ def _render_operator_needed(
         f"- case_input_tokens: {turn.cumulative_usage.input_tokens}\n"
         f"- case_output_tokens: {turn.cumulative_usage.output_tokens}\n"
         f"- reason: {_compact_line(reason, limit=500)}\n"
-        f"- question: {_compact_line(question, limit=1000)}\n"
+        f"- question: {_operator_question_line(question)}\n"
         f"- created_at: {datetime.now(UTC).isoformat()}\n\n"
         "## Selected Next Action\n\n"
         f"{turn.selected_next_action.action if turn.selected_next_action else 'none'}\n\n"
         "## Mandate\n\n"
-        f"{turn.mandate[:4000]}\n"
+        f"{turn.mandate}\n"
     )
 
 
@@ -1033,7 +1054,7 @@ def _render_scheduled_wake(record: ResidentScheduledWakeRecord) -> str:
         f"- reason: {_compact_line(record.reason, limit=500)}\n"
         f"- created_at: {record.created_at.isoformat()}\n\n"
         "## Mandate\n\n"
-        f"{record.mandate[:4000]}\n"
+        f"{record.mandate}\n"
     )
 
 

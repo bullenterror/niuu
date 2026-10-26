@@ -123,7 +123,19 @@ class LLMConfig(BaseModel):
     """LLM provider configuration: primary provider and optional fallback chain."""
 
     model: str = Field(default="claude-sonnet-4-6")
-    max_tokens: int = Field(default=8192)
+    max_tokens: int | None = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Answer cap for every agent turn. null (the default) sends no cap: the "
+            "provider bounds the answer by the model's maximum output or the rest of "
+            "its context window, and the request timeout bounds the time. Adapters "
+            "whose protocol requires the parameter (Anthropic) read the model's "
+            "maximum output from the provider's catalog. Set a number only to spend "
+            "less than that; a turn that reaches it fails with OutputTruncatedError "
+            "and counts on ravn.cap.hits."
+        ),
+    )
     max_retries: int = Field(default=3)
     retry_base_delay: float = Field(default=1.0)
     timeout: float = Field(default=120.0)
@@ -564,11 +576,14 @@ class MemoryConfig(BaseModel):
             "reflection."
         ),
     )
-    reflection_max_tokens: int = Field(
-        default=4096,
+    reflection_max_tokens: int | None = Field(
+        default=None,
+        gt=0,
         description=(
-            "Maximum tokens for the reflection LLM call, reasoning included: a "
-            "reasoning model needs room to think before it answers."
+            "Answer cap for the post-task episode reflection and the ravn_reflect tool. "
+            "null (the default) sends no cap, so the model's own output limit (or the "
+            "rest of its context window) applies; a reasoning model spends part of any "
+            "cap thinking. A cut-off answer raises and counts on ravn.cap.hits."
         ),
     )
     task_summary_max_chars: int = Field(
@@ -807,7 +822,9 @@ class AgentConfig(BaseModel):
     """Core agent behaviour configuration."""
 
     model: str = Field(default="claude-sonnet-4-6")
-    max_tokens: int = Field(default=8192)
+    max_tokens: int | None = Field(
+        default=None, gt=0, description="Deprecated: use llm.max_tokens."
+    )
     max_iterations: int = Field(
         default=20,
         description="Max tool-call iterations per turn. Set 0 for no cap.",
@@ -921,9 +938,16 @@ class ContextManagementConfig(BaseModel):
             "non-zero: protect_last = compact_recent_turns * 2."
         ),
     )
-    compression_max_tokens: int = Field(
-        default=1024,
-        description="Max tokens for compaction document generation.",
+    compression_max_tokens: int | None = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Answer cap for the compaction state document. A cut-off document never "
+            "replaces history: compaction raises ContextCompressionError. "
+            "null (the default) sends no cap, so the model's own output limit (or the "
+            "rest of its context window) applies; a reasoning model spends part of any "
+            "cap thinking. A cut-off answer raises and counts on ravn.cap.hits."
+        ),
     )
     prompt_cache_max_entries: int = Field(
         default=16,
@@ -1061,7 +1085,7 @@ class TelegramChannelConfig(BaseModel):
     )
     message_max_chars: int = Field(
         default=4096,
-        description="Maximum characters per outbound Telegram message (API limit).",
+        description="Characters per outbound Telegram message (API limit); longer is split.",
     )
 
 
@@ -1326,7 +1350,7 @@ class DiscordChannelConfig(BaseModel):
     )
     message_max_chars: int = Field(
         default=2000,
-        description="Maximum characters per outbound Discord message (API limit).",
+        description="Characters per outbound Discord message (API limit); longer is split.",
     )
     retry_delay: float = Field(
         default=5.0,
@@ -1364,7 +1388,7 @@ class SlackChannelConfig(BaseModel):
     )
     message_max_chars: int = Field(
         default=3000,
-        description="Maximum characters per outbound Slack message before truncation.",
+        description="Maximum characters per outbound Slack message; longer text is split.",
     )
     retry_delay: float = Field(
         default=5.0,
@@ -1406,7 +1430,7 @@ class MatrixChannelConfig(BaseModel):
     )
     message_max_chars: int = Field(
         default=32000,
-        description="Maximum characters per outbound Matrix message.",
+        description="Maximum characters per outbound Matrix message; longer text is split.",
     )
 
 
@@ -1451,7 +1475,7 @@ class WhatsAppChannelConfig(BaseModel):
     )
     message_max_chars: int = Field(
         default=4096,
-        description="Maximum characters per outbound WhatsApp message.",
+        description="Maximum characters per outbound WhatsApp message; longer text is split.",
     )
     api_base: str = Field(
         default="https://graph.facebook.com/v18.0",
@@ -2121,14 +2145,6 @@ class MimirSourceTriggerConfig(BaseModel):
         default="mimir-curator",
         description="Persona to use for synthesis tasks.",
     )
-    max_tokens: int | None = Field(
-        default=4096,
-        description=(
-            "Maximum output tokens for synthesis tasks. "
-            "Set lower than the LLM default to leave room for large source documents "
-            "in the context window. None uses the LLM/settings default."
-        ),
-    )
     max_content_chars: int = Field(
         default=120_000,
         description=(
@@ -2166,12 +2182,6 @@ class MimirStalenessTriggerConfig(BaseModel):
         default="mimir-curator",
         description="Persona to use for refresh tasks.",
     )
-    max_tokens: int | None = Field(
-        default=4096,
-        description=(
-            "Maximum output tokens for staleness refresh tasks. None uses the LLM/settings default."
-        ),
-    )
 
 
 class MimirIngestConfig(BaseModel):
@@ -2185,9 +2195,24 @@ class MimirIngestConfig(BaseModel):
         default="claude-haiku-4-5-20251001",
         description="LLM model alias used for entity extraction (prefer cheap/fast).",
     )
-    entity_max_tokens: int = Field(
-        default=1024,
-        description="Maximum output tokens for the entity extraction LLM call.",
+    entity_max_tokens: int | None = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Answer cap for the entity extraction call. null (the default) sends none, "
+            "so the model's own output limit applies; a reasoning model spends part of "
+            "any cap thinking. A cut-off extraction fails the ingest's extraction step "
+            "and counts on ravn.cap.hits."
+        ),
+    )
+    entity_source_excerpt_chars: int = Field(
+        default=3000,
+        gt=0,
+        description=(
+            "Characters of a source's head the extractor reads (the prompt says so). "
+            "A deliberate excerpt, not a cap that is hit: entities named only further "
+            "down are not extracted from that source."
+        ),
     )
 
 
@@ -2542,10 +2567,6 @@ class BuriConfig(BaseModel):
             "'observation' regardless of the inferred type."
         ),
     )
-    session_summary_max_tokens: int = Field(
-        default=400,
-        description="Maximum tokens for the proto-RWKV rolling session summary.",
-    )
     supersession_cosine_threshold: float = Field(
         default=0.85,
         description=(
@@ -2686,6 +2707,16 @@ class ThreadConfig(BaseModel):
         description=(
             "LLM alias used by the enricher.  Should resolve to the cheapest/fastest "
             "model configured in the llm aliases map."
+        ),
+    )
+    enricher_content_excerpt_chars: int = Field(
+        default=500,
+        gt=0,
+        description=(
+            "Characters of a page's body the enricher shows the classifier, after its "
+            "title and summary. A deliberate excerpt, not a cap that is hit: whether a "
+            "page is an open thread shows in its head, and the whole page would cost "
+            "prefill on every new page."
         ),
     )
     decay_rate_per_day: float = Field(
@@ -2833,12 +2864,14 @@ class LearningMatchingConfig(BaseModel):
             "Empty uses reflection.llm_alias."
         ),
     )
-    judge_max_tokens: int = Field(
-        default=4096,
-        ge=1,
+    judge_max_tokens: int | None = Field(
+        default=None,
+        gt=0,
         description=(
-            "Maximum tokens one judge call may produce, reasoning included: a "
-            "reasoning model needs room to think before it answers."
+            "Answer cap for one lesson-judge call. null (the default) sends no cap, so "
+            "the model's own output limit applies; a reasoning model spends part of any "
+            "cap thinking. A cut-off answer raises LessonJudgeError and counts on "
+            "ravn.cap.hits."
         ),
     )
     embed_batch_size: int = Field(
@@ -3118,13 +3151,25 @@ class PostSessionReflectionConfig(BaseModel):
             "model in the LLM aliases map."
         ),
     )
-    max_tokens: int = Field(
-        default=1024,
+    max_tokens: int | None = Field(
+        default=None,
+        gt=0,
         description=(
-            "Maximum tokens the reflection LLM call may produce, including a "
-            "reasoning model's thinking. A reply cut off at this budget raises "
-            "instead of reading as 'no learning'; reasoning models such as "
-            "Qwen3.8 need several thousand."
+            "Answer cap for the post-session reflection call. null (the default) "
+            "sends no cap, so the model's own output limit applies; 1024 was a "
+            "guess from non-reasoning models that Qwen3.8 spent thinking. A reply "
+            "cut off at a cap raises ReflectionError instead of reading as 'no "
+            "learning', and counts on ravn.cap.hits."
+        ),
+    )
+    context_max_chars: int = Field(
+        default=12_000,
+        gt=0,
+        description=(
+            "Characters of the session's recorded work context (structured outcome) the "
+            "reflection prompt carries. The reflection model's context window is the "
+            "real bound; this keeps one long session from dominating the prompt. A cut "
+            "counts on ravn.cap.hits."
         ),
     )
     inject_learnings: bool = Field(
@@ -5593,22 +5638,41 @@ class Settings(BaseSettings):
         matching = reflection.matching.model_copy(update={"judge_llm_alias": reflection.llm_alias})
         return reflection.model_copy(update={"matching": matching})
 
-    def effective_max_tokens(self) -> int:
-        """Return the resolved max_tokens.
+    @model_validator(mode="after")
+    def _prompt_budget_is_derivable(self) -> Settings:
+        """Refuse a context window that no longer says how much of it the prompt may use.
 
-        Same backward-compat logic as :meth:`effective_model`.
+        With an answer cap the prompt budget is the window minus the cap. With
+        no cap (``llm.max_tokens: null``) the window holds prompt and answer
+        together, so the budget has to be stated.
         """
-        _default = 8192
-        if self.llm.max_tokens != _default:
+        cm = self.context_management
+        if cm.context_window_tokens and cm.max_prompt_tokens <= 0:
+            if self.llm.max_tokens is None and self.agent.max_tokens is None:
+                raise ValueError(
+                    "context_management.context_window_tokens is set but llm.max_tokens is "
+                    "null, so no prompt budget can be derived from the window; set "
+                    "context_management.max_prompt_tokens to the share of the window the "
+                    "prompt may use (or llm.max_tokens to reserve an answer cap)"
+                )
+        return self
+
+    def effective_max_tokens(self) -> int | None:
+        """Return the resolved answer cap, or ``None`` for no cap.
+
+        ``llm.max_tokens`` wins; the deprecated ``agent.max_tokens`` is read
+        only when ``llm.max_tokens`` is unset.
+        """
+        if self.llm.max_tokens is not None:
             return self.llm.max_tokens
-        if self.agent.max_tokens != _default:
+        if self.agent.max_tokens is not None:
             import logging as _log
 
             _log.getLogger(__name__).warning(
                 "agent.max_tokens is deprecated — use llm.max_tokens instead",
             )
             return self.agent.max_tokens
-        return _default
+        return None
 
 
 # ---------------------------------------------------------------------------

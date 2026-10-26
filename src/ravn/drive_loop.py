@@ -47,6 +47,7 @@ from ravn.adapters.channels.silent import SilentChannel
 from ravn.adapters.channels.skuld_channel import SkuldChannel
 from ravn.adapters.channels.task_context import TaskContextChannel
 from ravn.adapters.events.noop_publisher import NoOpEventPublisher
+from ravn.cap_telemetry import record_truncation
 from ravn.config import (
     HttpChannelConfig,
     InitiativeConfig,
@@ -138,6 +139,12 @@ def _bounded_room_context(value: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     dropped = len(text) - limit
+    record_truncation(
+        "resident_state.directed_message_context_max_chars",
+        what="the prior room message a human replied to",
+        kept=limit,
+        total=len(text),
+    )
     return f"{text[:limit].rstrip()}\n[prior room context truncated: {dropped} characters omitted]"
 
 
@@ -798,9 +805,12 @@ def _build_resident_valkyrie_schema_repair_prompt(
         f"{json.dumps(_json_safe(outcome_fields), indent=2)}\n\n"
         "Use only the supplied response and parsed fields. Preserve decisions, evidence, "
         "references and working-state entries; do not invent observations or actions.\n\n"
+        # Whole: the outcome block sits at the end, and keeping only the head cut
+        # off exactly what is being repaired. The repair call's prompt budget is
+        # the bound (agent.repair_outcome raises PromptBudgetExceededError).
         "Previous response:\n"
         "<previous_response>\n"
-        f"{original_response[:4000]}\n"
+        f"{original_response}\n"
         "</previous_response>\n\n"
         "Required block shape:\n"
         "---outcome---\n"
@@ -3009,7 +3019,8 @@ class DriveLoop:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    logger.warning(
+                    # Handed to the model below as a failed recovery, not dropped.
+                    logger.error(
                         "drive_loop: durable tool recovery failed for task %s tool=%s: %s",
                         task.task_id,
                         getattr(tool, "name", type(tool).__name__),
@@ -3032,6 +3043,12 @@ class DriveLoop:
                 for result in results or []:
                     content = str(getattr(result, "content", result))
                     if max_chars > 0 and len(content) > max_chars:
+                        record_truncation(
+                            "tools.max_result_chars",
+                            what=f"recovered result of {getattr(tool, 'name', 'tool')!r}",
+                            kept=max_chars,
+                            total=len(content),
+                        )
                         content = content[:max_chars].rstrip() + "\n… (truncated)"
                     status = "error" if bool(getattr(result, "is_error", False)) else "completed"
                     recovered.append(
@@ -5355,7 +5372,6 @@ class DriveLoop:
             "output_mode": str(task.output_mode),
             "persona": task.persona,
             "priority": task.priority,
-            "max_tokens": task.max_tokens,
             "deadline": task.deadline.isoformat() if task.deadline else None,
             "output_path": str(task.output_path) if task.output_path else None,
             "root_correlation_id": task.root_correlation_id,
@@ -5472,7 +5488,6 @@ class DriveLoop:
                     output_mode=OutputMode(rec.get("output_mode", "silent")),
                     persona=rec.get("persona"),
                     priority=rec.get("priority", 10),
-                    max_tokens=rec.get("max_tokens"),
                     deadline=deadline,
                     output_path=Path(output_path_str) if output_path_str else None,
                     root_correlation_id=rec.get("root_correlation_id", ""),

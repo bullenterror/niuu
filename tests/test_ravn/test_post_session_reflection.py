@@ -26,6 +26,7 @@ from ravn.adapters.reflection.post_session import (
     _titles_similar,
     fetch_relevant_learnings,
 )
+from ravn.cap_telemetry import cap_hit_counts
 from ravn.config import PostSessionReflectionConfig
 from ravn.domain.models import LLMResponse, StopReason, TokenUsage
 from sleipnir.adapters.in_process import InProcessBus
@@ -320,6 +321,7 @@ async def test_reflection_prompt_bounds_recorded_outcome_context():
     prompt = llm.generate.await_args.kwargs["messages"][0]["content"]
     assert "recorded context truncated" in prompt
     assert "x" * 13_000 not in prompt
+    assert cap_hit_counts() == {"reflection.context_max_chars": 1}
 
 
 @pytest.mark.asyncio
@@ -492,6 +494,20 @@ async def test_process_raises_when_reflection_exhausts_its_token_budget():
     # Asking again at the same budget would fail the same way.
     assert llm.generate.await_count == 1
     mimir.upsert_page.assert_not_awaited()
+    assert cap_hit_counts() == {"reflection.max_tokens": 1}
+
+
+@pytest.mark.asyncio
+async def test_reflection_sends_no_cap_by_default():
+    """1024 was a guess from non-reasoning models that Qwen3.8 spent thinking."""
+    bus = InProcessBus()
+    llm = AsyncMock()
+    llm.generate.return_value = _make_llm_response("null")
+    svc = PostSessionReflectionService(bus, AsyncMock(), llm, _make_config(max_tokens=None))
+
+    await svc._run_reflection({"outcome": "success"})
+
+    assert llm.generate.await_args.kwargs["max_tokens"] is None
 
 
 @pytest.mark.asyncio

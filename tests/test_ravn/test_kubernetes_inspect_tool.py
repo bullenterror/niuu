@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from ravn.adapters.tools.kubernetes import KubernetesClients, KubernetesInspectTool
+from ravn.cap_telemetry import cap_hit_counts
 from ravn.cli.commands import _filter_tools, _groups_for_persona
 from ravn.config import Settings
 
@@ -285,6 +286,7 @@ async def test_configmap_values_are_capped(tmp_path) -> None:
     payload = json.loads(result.content)
     assert payload["data"] == {"config.yaml": "x" * 10, "small": "ok"}
     assert payload["truncated_keys"] == ["config.yaml"]
+    assert cap_hit_counts() == {"tools.kubernetes.max_configmap_value_chars": 1}
 
 
 @pytest.mark.asyncio
@@ -360,6 +362,7 @@ async def test_pods_lists_a_namespace_so_a_changing_pod_name_can_be_found(tmp_pa
     assert core.selectors == ["app.kubernetes.io/name=valkyrie"]
     assert payload["total"] == 2
     assert payload["truncated"] is True
+    assert cap_hit_counts() == {"tools.kubernetes.max_list_items": 1}
     assert payload["pods"] == [
         {
             "name": "valkyrie-ymir-k8s-7b864d-abcde",

@@ -12,6 +12,7 @@ from typing import Any
 
 import yaml
 
+from ravn.cap_telemetry import record_cap_hit, record_truncation
 from ravn.domain.models import ToolResult
 from ravn.ports.tool import ToolPort
 
@@ -268,6 +269,12 @@ class KubernetesInspectTool(ToolPort):
             if _field(_field(pod, "metadata", default={}), "name", default="").startswith(prefix)
         ]
         shown = pods[: self._max_list_items]
+        if len(pods) > len(shown):
+            record_cap_hit(
+                "tools.kubernetes.max_list_items",
+                f"kubernetes_inspect listed {len(shown)} of {len(pods)} pods in {namespace}; "
+                "raise tools.kubernetes.max_list_items, or narrow with a selector or prefix",
+            )
         return {
             "action": "pods",
             "namespace": namespace,
@@ -334,6 +341,14 @@ class KubernetesInspectTool(ToolPort):
         configmap = await _maybe_await(self._core_v1.read_namespaced_config_map(name, namespace))
         data = dict(_field(configmap, "data", default={}) or {})
         limit = self._max_configmap_value_chars
+        for key, value in data.items():
+            if len(str(value)) > limit:
+                record_truncation(
+                    "tools.kubernetes.max_configmap_value_chars",
+                    what=f"configmap {namespace}/{name} key {key!r}",
+                    kept=limit,
+                    total=len(str(value)),
+                )
         return {
             "action": "configmap",
             "namespace": namespace,
