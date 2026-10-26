@@ -277,10 +277,13 @@ class ResidentWakefulness:
                 )
             )
 
-        learnings = await self._curate_learnings()
         # After the skill pass: retiring a tool archives its lifecycle skill,
         # which the stale/promotion loop above must not see half-way through.
+        # Before learning curation, which reads Mímir: the tool library lives
+        # on this resident's disk, and a Mímir outage failing the dream must
+        # not also stop the library from being kept.
         learned_tools = await self._tool_curator.curate() if self._tool_curator else {}
+        learnings = await self._curate_learnings()
 
         return {
             "skills_reviewed": len(rows),
