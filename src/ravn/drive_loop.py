@@ -47,6 +47,7 @@ from ravn.adapters.channels.silent import SilentChannel
 from ravn.adapters.channels.skuld_channel import SkuldChannel
 from ravn.adapters.channels.task_context import TaskContextChannel
 from ravn.adapters.events.noop_publisher import NoOpEventPublisher
+from ravn.cap_telemetry import record_cap_hit, record_degraded, record_truncation
 from ravn.config import (
     HttpChannelConfig,
     InitiativeConfig,
@@ -138,6 +139,12 @@ def _bounded_room_context(value: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     dropped = len(text) - limit
+    record_truncation(
+        "resident_state.directed_message_context_max_chars",
+        what="the prior room message a human replied to",
+        kept=limit,
+        total=len(text),
+    )
     return f"{text[:limit].rstrip()}\n[prior room context truncated: {dropped} characters omitted]"
 
 
@@ -798,9 +805,12 @@ def _build_resident_valkyrie_schema_repair_prompt(
         f"{json.dumps(_json_safe(outcome_fields), indent=2)}\n\n"
         "Use only the supplied response and parsed fields. Preserve decisions, evidence, "
         "references and working-state entries; do not invent observations or actions.\n\n"
+        # Whole: the outcome block sits at the end, and keeping only the head cut
+        # off exactly what is being repaired. The repair call's prompt budget is
+        # the bound (agent.repair_outcome raises PromptBudgetExceededError).
         "Previous response:\n"
         "<previous_response>\n"
-        f"{original_response[:4000]}\n"
+        f"{original_response}\n"
         "</previous_response>\n\n"
         "Required block shape:\n"
         "---outcome---\n"
@@ -2539,10 +2549,20 @@ class DriveLoop:
             except UnboundOperatorReplyError as exc:
                 # The human's words still reach the resident, labelled as what
                 # they are: a reply whose question is no longer open.
-                logger.error("drive_loop: %s; delivering it as unbound operator input", exc)
+                record_degraded(
+                    "operator_reply.unbound",
+                    f"{exc}; delivering it as unbound operator input",
+                )
                 unbound_case_id = exc.case_id
-            except Exception:
+            except Exception as exc:
+                # Raising would drop the operator's message; it goes on as an
+                # ordinary task instead, and that is counted, not just logged.
                 logger.exception("drive_loop: directed message interceptor failed")
+                record_degraded(
+                    "operator_reply.persist",
+                    f"saving a directed message as an operator answer failed ({exc!r}); "
+                    "it is delivered as an ordinary task and its question stays open",
+                )
 
         if (
             not unbound_case_id
@@ -2558,9 +2578,14 @@ class DriveLoop:
         if capture is not None:
             try:
                 inbox_ref = await capture(content, metadata)
-            except Exception:
+            except Exception as exc:
                 logger.exception(
                     "drive_loop: failed to persist directed message; continuing live delivery"
+                )
+                record_degraded(
+                    "directed_message.persist",
+                    f"the directed message was not written to the durable inbox ({exc!r}); "
+                    "it is delivered live only and is lost if this task does not finish",
                 )
 
         task_id = f"task_{int(time.time() * 1000):x}_{self._next_counter()}"
@@ -3009,7 +3034,8 @@ class DriveLoop:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    logger.warning(
+                    # Handed to the model below as a failed recovery, not dropped.
+                    logger.error(
                         "drive_loop: durable tool recovery failed for task %s tool=%s: %s",
                         task.task_id,
                         getattr(tool, "name", type(tool).__name__),
@@ -3032,6 +3058,12 @@ class DriveLoop:
                 for result in results or []:
                     content = str(getattr(result, "content", result))
                     if max_chars > 0 and len(content) > max_chars:
+                        record_truncation(
+                            "tools.max_result_chars",
+                            what=f"recovered result of {getattr(tool, 'name', 'tool')!r}",
+                            kept=max_chars,
+                            total=len(content),
+                        )
                         content = content[:max_chars].rstrip() + "\n… (truncated)"
                     status = "error" if bool(getattr(result, "is_error", False)) else "completed"
                     recovered.append(
@@ -3063,13 +3095,11 @@ class DriveLoop:
         # in the journal and will be retried after the UTC day rolls over
         # and the budget resets.
         if self._settings.budget.enabled and not self._budget.can_spend():
-            logger.info(
-                "drive_loop: task %s (%r) skipped — daily budget cap reached "
-                "(spent=%.4f remaining=%.4f)",
-                task.task_id,
-                task.title,
-                self._budget.spent_today_usd,
-                self._budget.remaining_usd,
+            record_cap_hit(
+                "budget.daily_cap_usd",
+                f"task {task.task_id} ({task.title!r}) held until the UTC day rolls over: "
+                f"daily budget spent ({self._budget.spent_today_usd:.4f} USD); raise "
+                "budget.daily_cap_usd, or set budget.enabled: false to run uncapped",
             )
             await self._emit_sleipnir_task_dropped(task, reason="budget_cap_reached")
             return "budget_dropped"
@@ -5355,7 +5385,6 @@ class DriveLoop:
             "output_mode": str(task.output_mode),
             "persona": task.persona,
             "priority": task.priority,
-            "max_tokens": task.max_tokens,
             "deadline": task.deadline.isoformat() if task.deadline else None,
             "output_path": str(task.output_path) if task.output_path else None,
             "root_correlation_id": task.root_correlation_id,
@@ -5472,7 +5501,6 @@ class DriveLoop:
                     output_mode=OutputMode(rec.get("output_mode", "silent")),
                     persona=rec.get("persona"),
                     priority=rec.get("priority", 10),
-                    max_tokens=rec.get("max_tokens"),
                     deadline=deadline,
                     output_path=Path(output_path_str) if output_path_str else None,
                     root_correlation_id=rec.get("root_correlation_id", ""),

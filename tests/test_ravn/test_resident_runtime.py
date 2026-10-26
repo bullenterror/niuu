@@ -186,7 +186,7 @@ async def test_selected_action_is_persisted_without_queueing_prose_as_work(tmp_p
         queued.append(task)
         return True
 
-    runtime = ResidentRuntime(state=state, max_turns=3)
+    runtime = ResidentRuntime(state=state)
     runtime.bind_enqueue(enqueue)
     disposition = await runtime.handle_completed_turn(
         task=_task(),
@@ -583,9 +583,8 @@ async def test_invalid_outcome_cannot_replace_state_or_queue_a_continuation(tmp_
 
 
 @pytest.mark.asyncio
-async def test_a_spent_continuation_budget_still_asks_the_operator(tmp_path) -> None:
-    """The budget bounds what the resident does alone. Swallowing its question at the
-    cap left it needing input with nothing an answer could bind to."""
+async def test_a_question_asked_on_any_turn_is_saved(tmp_path) -> None:
+    """A turn cap once stopped the case on the turn that asked; the question was never saved."""
     state = LocalResidentState(tmp_path)
     queued: list[AgentTask] = []
 
@@ -593,7 +592,7 @@ async def test_a_spent_continuation_budget_still_asks_the_operator(tmp_path) -> 
         queued.append(task)
         return True
 
-    runtime = ResidentRuntime(state=state, max_turns=1)
+    runtime = ResidentRuntime(state=state)
     runtime.bind_enqueue(enqueue)
     disposition = await runtime.handle_completed_turn(
         task=_task(),
@@ -1324,9 +1323,9 @@ async def test_a_completed_resumed_turn_consumes_wake_when_outcome_is_invalid(tm
 
 
 @pytest.mark.asyncio
-async def test_scheduled_resume_preserves_and_enforces_the_turn_budget(tmp_path) -> None:
+async def test_scheduled_resume_preserves_case_usage_and_keeps_rechecking(tmp_path) -> None:
     state = LocalResidentState(tmp_path)
-    runtime = ResidentRuntime(state=state, max_turns=3)
+    runtime = ResidentRuntime(state=state)
     queued: list[AgentTask] = []
     started_at = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
 
@@ -1365,54 +1364,13 @@ async def test_scheduled_resume_preserves_and_enforces_the_turn_budget(tmp_path)
                 "wake_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
             }
         ),
-        response_text="another recheck would exceed the case budget",
+        response_text="recheck again in an hour",
     )
 
-    assert disposition.kind is ContinuationDecisionKind.STOP
-    assert "turn budget" in disposition.reason
-    assert await state.list_scheduled_wakes() == []
-
-
-@pytest.mark.asyncio
-async def test_scheduled_resume_enforces_the_cumulative_token_budget(tmp_path) -> None:
-    state = LocalResidentState(tmp_path)
-    runtime = ResidentRuntime(state=state, max_turns=5, max_tokens=100)
-    queued: list[AgentTask] = []
-
-    async def enqueue(task: AgentTask) -> bool:
-        queued.append(task)
-        return True
-
-    runtime.bind_enqueue(enqueue)
-    await state.write_scheduled_wake(
-        ResidentScheduledWakeRecord(
-            case_id="case-token-budget",
-            root_correlation_id="root-token-budget",
-            wake_at=datetime.now(UTC) - timedelta(minutes=1),
-            reason="token-bounded recheck",
-            turn_index=1,
-            case_input_tokens=80,
-            case_output_tokens=10,
-        )
-    )
-
-    assert await runtime.resume_due_wakes() == 1
-    disposition = await runtime.handle_completed_turn(
-        task=queued[0],
-        prompt="schedule another recheck",
-        result=_result(
-            {
-                "continuation": "sleep",
-                "next_action_timing": "scheduled_time",
-                "wake_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
-            }
-        ),
-        response_text="another recheck would exceed the token budget",
-    )
-
-    assert disposition.kind is ContinuationDecisionKind.STOP
-    assert "token budget" in disposition.reason
-    assert await state.list_scheduled_wakes() == []
+    # No per-case turn cap: the daily budget, one turn per wake and the
+    # repeated-decision guard bound rechecks.
+    assert disposition.kind is ContinuationDecisionKind.SLEEP
+    assert len(await state.list_scheduled_wakes()) == 1
 
 
 @pytest.mark.asyncio
@@ -1915,7 +1873,8 @@ async def test_refresh_health_snapshot_counts_durable_state(tmp_path) -> None:
     assert snapshot["inbox_pending"] == 1
     assert snapshot["repeated_decision_streak"] == 0
     # The cached view serves the HUD without touching the store again.
-    assert runtime.health_snapshot() == snapshot
+    # The live cap-hit counts ride along with the durable ones.
+    assert runtime.health_snapshot() == {**snapshot, "cap_hits_total": 0, "degraded_total": 0}
 
 
 @pytest.mark.asyncio

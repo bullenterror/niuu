@@ -41,6 +41,20 @@ class MaxIterationsError(RavnError):
         super().__init__(f"Agent loop exceeded {max_iterations} iterations")
 
 
+class OutputTruncatedError(LLMError):
+    """Raised when a model answer stopped because it ran out of output room.
+
+    A truncated answer is not an answer: prose cut mid-sentence reads as a
+    conclusion, and a tool call cut mid-argument parses to an empty input.
+    ``knob`` is the setting that bounded the call, so the failure names its own
+    remedy.
+    """
+
+    def __init__(self, *, knob: str, message: str) -> None:
+        self.knob = knob
+        super().__init__(message)
+
+
 class ContextCompressionError(RavnError):
     """Raised when client-side compaction cannot produce its state document.
 

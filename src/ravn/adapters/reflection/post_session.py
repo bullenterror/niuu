@@ -38,8 +38,9 @@ from ravn.adapters.reflection.lessons import (
     body_section,
     frontmatter_values,
 )
+from ravn.cap_telemetry import record_truncation, require_complete
 from ravn.config import PostSessionReflectionConfig
-from ravn.domain.models import StopReason
+from ravn.domain.exceptions import OutputTruncatedError
 from ravn.ports.llm import LLMPort
 from ravn.resident_text import compact_line, significant_words, texts_overlap, texts_similar
 
@@ -70,7 +71,6 @@ _POSITIVE_FEEDBACK = frozenset({"useful", "good_action", "draft_accepted"})
 
 # Approximate chars-per-token ratio used for rough budget enforcement.
 _CHARS_PER_TOKEN = 4
-_REFLECTION_CONTEXT_MAX_CHARS = 12_000
 
 # Number of timeline entries that trigger each confidence level.
 _CONFIDENCE_MEDIUM_THRESHOLD = 2
@@ -372,10 +372,17 @@ class PostSessionReflectionService:
             if work_context
             else "(no subject-matter context was recorded)"
         )
-        if len(rendered_context) > _REFLECTION_CONTEXT_MAX_CHARS:
+        context_limit = self._config.context_max_chars
+        if len(rendered_context) > context_limit:
+            # The lesson is then drawn from part of what the session did.
+            record_truncation(
+                "reflection.context_max_chars",
+                what=f"the recorded work context of session {payload.get('session_id', '')}",
+                kept=context_limit,
+                total=len(rendered_context),
+            )
             rendered_context = (
-                rendered_context[:_REFLECTION_CONTEXT_MAX_CHARS].rstrip()
-                + "\n… (recorded context truncated)"
+                rendered_context[:context_limit].rstrip() + "\n… (recorded context truncated)"
             )
         prompt = _REFLECTION_PROMPT.format(
             persona=payload.get("persona", ""),
@@ -401,14 +408,17 @@ class PostSessionReflectionService:
                 model=model,
                 max_tokens=self._config.max_tokens,
             )
-            if response.stop_reason == StopReason.MAX_TOKENS:
-                # Asking again at the same budget fails the same way.
-                raise ReflectionError(
-                    f"reflection for session {session_id} was cut off: model {model!r} "
-                    f"used its whole {self._config.max_tokens}-token budget "
-                    f"(reasoning {len(response.reasoning or '')} chars, answer "
-                    f"{len(response.content or '')} chars); raise reflection.max_tokens"
+            # Asking again at the same budget fails the same way.
+            try:
+                require_complete(
+                    response,
+                    knob="reflection.max_tokens",
+                    budget=self._config.max_tokens,
+                    model=model,
+                    purpose=f"reflection for session {session_id}",
                 )
+            except OutputTruncatedError as exc:
+                raise ReflectionError(str(exc)) from exc
 
             raw = (response.content or "").strip()
             if not raw:

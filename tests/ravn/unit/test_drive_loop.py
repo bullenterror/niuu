@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -15,6 +16,7 @@ import pytest
 from ravn.adapters.channels.silent import SilentChannel
 from ravn.adapters.triggers.condition_poll import ConditionPollTrigger
 from ravn.adapters.triggers.cron import CronJob, CronTrigger, _cron_matches, parse_schedule
+from ravn.cap_telemetry import degraded_counts
 from ravn.config import InitiativeConfig, Settings, TriggerAdapterConfig
 from ravn.domain.events import RavnEvent, RavnEventType
 from ravn.domain.exceptions import UnboundOperatorReplyError
@@ -1312,6 +1314,53 @@ async def test_an_unbound_operator_reply_is_delivered_labelled_not_as_chat(
     assert "resident case resident-stewardship-1" in task.initiative_context
     assert "not applied as an answer" in task.initiative_context
     assert "Human reply: It is intended behaviour" in task.initiative_context
+
+
+@pytest.mark.asyncio
+async def test_an_unbound_operator_reply_is_counted(tmp_path: Path) -> None:
+    loop, _ = _make_drive_loop(tmp_path)
+    loop.enqueue = AsyncMock(return_value=True)
+    loop.register_directed_message_interceptor(
+        AsyncMock(side_effect=UnboundOperatorReplyError("resident-stewardship-1"))
+    )
+
+    await loop.handle_directed_message("late answer", None)
+
+    assert degraded_counts() == {"operator_reply.unbound": 1}
+
+
+@pytest.mark.asyncio
+async def test_a_failed_operator_answer_save_is_delivered_and_counted(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Raising would drop the operator's words; carrying on must still be loud."""
+    loop, _ = _make_drive_loop(tmp_path)
+    loop.enqueue = AsyncMock(return_value=True)
+    loop.register_directed_message_interceptor(AsyncMock(side_effect=OSError("disk full")))
+
+    with caplog.at_level(logging.ERROR):
+        assert await loop.handle_directed_message("Approved", None) is True
+
+    task = loop.enqueue.await_args.args[0]
+    assert "Approved" in task.initiative_context
+    assert degraded_counts() == {"operator_reply.persist": 1}
+    assert any(
+        r.levelno == logging.ERROR and "operator_reply.persist" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_failed_directed_message_persist_is_counted(tmp_path: Path) -> None:
+    loop, _ = _make_drive_loop(tmp_path)
+    loop.enqueue = AsyncMock(return_value=True)
+    loop._resident_runtime = MagicMock(
+        capture_directed_message=AsyncMock(side_effect=OSError("read-only"))
+    )
+
+    assert await loop.handle_directed_message("hello", None, output_mode=OutputMode.AMBIENT)
+
+    assert degraded_counts() == {"directed_message.persist": 1}
 
 
 @pytest.mark.asyncio
