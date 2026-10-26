@@ -187,6 +187,7 @@ async def test_replaying_regins_history_ends_the_escalations(tmp_path: Path) -> 
         judge=judge,
         config=LearningCurationConfig(enabled=True),
         similarity_threshold=0.5,
+        max_related=5,
         evidence_duplicate_similarity=0.9,
         min_repetitions=3,
         verified_recovery_promotes=True,

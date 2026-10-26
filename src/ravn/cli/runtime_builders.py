@@ -823,6 +823,7 @@ def _build_learning_curator(
         judge=consolidation.judge,
         config=reflection.curation,
         similarity_threshold=reflection.matching.similarity_threshold,
+        max_related=reflection.matching.max_related,
         evidence_duplicate_similarity=reflection.matching.evidence_duplicate_similarity,
         min_repetitions=reflection.candidate_min_repetitions,
         verified_recovery_promotes=reflection.verified_promotion.route_recovery_promotes,
