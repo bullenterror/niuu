@@ -5,7 +5,6 @@ from __future__ import annotations
 import re
 import textwrap
 from dataclasses import dataclass
-from datetime import date, datetime, time
 from typing import Any, Literal
 
 import yaml
@@ -363,7 +362,7 @@ def _select_marker_segment(clean: str) -> str:
         return clean
     for segment in reversed(segments):
         try:
-            if isinstance(yaml.safe_load(segment), dict):
+            if isinstance(_load_outcome_yaml(segment), dict):
                 return segment
         except yaml.YAMLError:
             continue
@@ -410,26 +409,39 @@ def _validate_against_schema(
     return errors
 
 
-def _json_shaped(value: Any) -> Any:
-    """Return *value* with the shape JSON can carry.
+class _OutcomeLoader(yaml.SafeLoader):
+    """YAML for outcome blocks: dates and timestamps stay the text the model wrote.
 
-    YAML turns an unquoted ``2026-10-26:`` into a ``datetime.date`` key and
-    ``at: 2026-10-26T04:35:00Z`` into a ``datetime`` value. An outcome is a
-    JSON contract that is published, persisted and reflected on; a date key
-    made reflection fail with "keys must be str" on every such turn.
+    An outcome is a JSON contract that is published, persisted and reflected
+    on. Stock YAML turns an unquoted ``2026-10-26:`` into a ``datetime.date``
+    key, and post-session reflection then failed with "keys must be str" on
+    every such turn; resolving ``expires_at: 2026-06-04T20:30:00Z`` also
+    rewrote the model's value. Timestamps are not resolved here at all.
     """
+
+
+_OutcomeLoader.yaml_implicit_resolvers = {
+    first: [(tag, regexp) for tag, regexp in resolvers if tag != "tag:yaml.org,2002:timestamp"]
+    for first, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
+
+
+def _load_outcome_yaml(text: str) -> Any:
+    """Load *text* as an outcome mapping with string keys and no timestamp resolution."""
+    return _string_keys(yaml.load(text, Loader=_OutcomeLoader))  # noqa: S506 - SafeLoader subclass
+
+
+def _string_keys(value: Any) -> Any:
+    # YAML keys may be ints, bools or null (``1:``, ``yes:``, ``~:``); JSON keys
+    # are strings, and mixed key types break sorting when the outcome is rendered.
     if isinstance(value, dict):
-        return {_json_key(key): _json_shaped(item) for key, item in value.items()}
-    if isinstance(value, list | tuple):
-        return [_json_shaped(item) for item in value]
-    if isinstance(value, date | datetime | time):
-        return value.isoformat()
+        return {_json_key(key): _string_keys(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_string_keys(item) for item in value]
     return value
 
 
 def _json_key(key: Any) -> str:
-    if isinstance(key, date | datetime | time):
-        return key.isoformat()
     if key is None:
         return "null"
     if isinstance(key, bool):
@@ -459,9 +471,9 @@ def parse_outcome_block(text: str, schema: OutcomeSchema | None = None) -> Parse
     parsed_fields: dict[str, Any] = {}
 
     try:
-        loaded = yaml.safe_load(clean)
+        loaded = _load_outcome_yaml(clean)
         if isinstance(loaded, dict):
-            parsed_fields = _json_shaped(loaded)
+            parsed_fields = loaded
         else:
             got = type(loaded).__name__
             parse_errors.append(f"outcome block did not parse as a YAML mapping; got {got}")
@@ -475,11 +487,11 @@ def parse_outcome_block(text: str, schema: OutcomeSchema | None = None) -> Parse
         loaded = None
         if repaired is not None:
             try:
-                loaded = yaml.safe_load(repaired)
+                loaded = _load_outcome_yaml(repaired)
             except yaml.YAMLError:
                 loaded = None
         if isinstance(loaded, dict):
-            parsed_fields = _json_shaped(loaded)
+            parsed_fields = loaded
         else:
             parse_errors.append(f"YAML parse error: {exc}")
 
