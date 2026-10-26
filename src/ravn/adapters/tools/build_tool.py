@@ -224,7 +224,14 @@ class BuildTool(ToolPort):
                         "declared_reach": {
                             "type": "array",
                             "description": (
-                                "External reach grants. Use [] for pure local computation."
+                                "External reach grants. Use [] for pure local computation. "
+                                "Networking is OFF unless a grant names something off this "
+                                "machine: kinds file, filesystem, path, workspace, "
+                                "credential, secret, native_tool and pure_compute stay "
+                                "local; any other kind (network, http, kubernetes, …) "
+                                "grants outbound network. A tool that calls an API — the "
+                                "Kubernetes API included — must declare it, or its "
+                                "sockets fail."
                             ),
                             "items": {
                                 "oneOf": [

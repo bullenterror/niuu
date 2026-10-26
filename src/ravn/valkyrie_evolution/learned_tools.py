@@ -34,6 +34,7 @@ from ravn.valkyrie_evolution.tool_runtime import (
     ToolRunResult,
     ToolVenvError,
     ensure_tool_venv,
+    network_isolation_unavailable_reason,
     run_tool,
     write_tool,
 )
@@ -49,11 +50,33 @@ from ravn.valkyrie_evolution.tool_verification import (
 
 logger = logging.getLogger(__name__)
 
-#: Reach kinds whose declaration grants a learned tool outbound network
-#: access. Any grant whose kind is in this set — or starts with ``http``
-#: ("http_get", "https_post", …) — flips the sandbox to a networked
-#: container; every other tool runs with networking off.
-NETWORK_REACH_KINDS = frozenset({"network", "http", "https", "api", "external_read"})
+#: Reach kinds that declare pure computation: nothing outside the process.
+PURE_COMPUTE_REACH_KINDS = frozenset({"", "pure_compute", "compute", "none"})
+
+#: Reach kinds a tool satisfies without leaving the machine: local files,
+#: named credentials, and the resident's own tools via the host SDK.
+#: Together with :data:`PURE_COMPUTE_REACH_KINDS` these are the ONLY kinds
+#: that keep a tool off the network. Any other kind — ``network``, ``http``,
+#: ``kubernetes``, ``k8s_api``, ``prometheus`` or a free-text description —
+#: names something outside the process, which a tool can only reach over the
+#: network, so it grants network access. Resident-authored manifests name
+#: their reach in their own words; a closed vocabulary of *local* kinds is
+#: what makes "this tool declared no network" a decidable claim.
+LOCAL_REACH_KINDS = PURE_COMPUTE_REACH_KINDS | frozenset(
+    {
+        "file",
+        "filesystem",
+        "path",
+        "workspace",
+        "credential",
+        "credentials",
+        "secret",
+        "secrets",
+        "native_tool",
+        "host_tool",
+        "host_sdk",
+    }
+)
 
 #: Docker network mode used when a tool's declared reach grants network access.
 NETWORK_ALLOWED_DOCKER_NETWORK = "bridge"
@@ -113,12 +136,16 @@ class LearnedToolUsageError(RuntimeError):
 LearnedToolUsageRecorder = Callable[[str, str, bool], None]
 
 
+def grant_reaches_network(grant: ToolReachGrant) -> bool:
+    """True when *grant* reaches past this machine (see :data:`LOCAL_REACH_KINDS`)."""
+    if grant.access == "none":
+        return False
+    return grant.kind.strip().casefold() not in LOCAL_REACH_KINDS
+
+
 def reach_allows_network(declared_reach: Sequence[ToolReachGrant]) -> bool:
     """True when a manifest's declared reach grants outbound network access."""
-    return any(
-        grant.kind.lower() in NETWORK_REACH_KINDS or grant.kind.lower().startswith("http")
-        for grant in declared_reach
-    )
+    return any(grant_reaches_network(grant) for grant in declared_reach)
 
 
 class LearnedToolRunner(Protocol):
@@ -137,20 +164,31 @@ class LearnedToolRunner(Protocol):
     ) -> ToolRunResult:
         """Execute a learned tool and return a structured run result."""
 
+    def check_reach(self, declared_reach: Sequence[ToolReachGrant]) -> None:
+        """Raise :class:`LearnedToolError` when this backend cannot enforce
+        *declared_reach*. Called when a tool is loaded, so a tool whose
+        reach cannot be honoured is refused before anyone can invoke it."""
+
 
 class LocalLearnedToolRunner:
-    """Run learned tools through the existing local isolated subprocess.
+    """Run learned tools as subprocesses of the resident.
 
-    Local execution is crash isolation, not security isolation: it cannot
-    turn networking off for a tool that declares no network reach.
-    :attr:`enforces_reach` is honest about that, and executing such a tool
-    locally logs a one-time warning instead of pretending a boundary exists.
-    Tools with declared ``requirements`` run with the python of a dedicated
-    per-tool venv provisioned under ``venvs_dir``.
+    The one reach boundary this backend enforces is the network: a tool whose
+    declared reach is entirely local (see :data:`LOCAL_REACH_KINDS`) runs with
+    every network socket denied — a fresh network namespace on Linux, a
+    no-network Seatbelt profile on macOS. Where the host cannot apply that
+    (e.g. unprivileged user namespaces blocked by sysctl, seccomp or
+    AppArmor) such a tool is refused — at load through :meth:`check_reach`
+    and again at run time — never run with the resident's network.
+
+    What it does not narrow, and says so: a tool granted network gets the
+    resident's whole network (a grant's ``target`` is not an egress filter),
+    and every tool reads the filesystem as the resident's user. Use the
+    ``container`` or ``k8s_job`` backend where those must hold too. Tools with
+    declared ``requirements`` run with the python of a dedicated per-tool
+    venv provisioned under ``venvs_dir``.
     """
 
-    #: A local subprocess cannot express network isolation.
-    enforces_reach = False
     #: The local backend runs in this resident's own process tree, so the
     #: host-call channel back to it is meaningful here (unlike a container
     #: or Job that has no route back to this process).
@@ -166,10 +204,32 @@ class LocalLearnedToolRunner:
         *,
         venvs_dir: str | Path | None = None,
         pip_timeout_seconds: float = DEFAULT_TOOL_VENV_PIP_TIMEOUT_SECONDS,
+        network_isolation_probe: Callable[[], str | None] = (network_isolation_unavailable_reason),
     ) -> None:
         self._venvs_dir = Path(venvs_dir) if venvs_dir else None
         self._pip_timeout_seconds = pip_timeout_seconds
-        self._reach_warned: set[str] = set()
+        self._network_isolation_probe = network_isolation_probe
+
+    @property
+    def enforces_reach(self) -> bool:
+        """True when this host can run a no-network tool without network."""
+        return self._network_isolation_probe() is None
+
+    def check_reach(self, declared_reach: Sequence[ToolReachGrant]) -> None:
+        if reach_allows_network(declared_reach):
+            return
+        reason = self._network_isolation_probe()
+        if reason is None:
+            return
+        raise LearnedToolError(
+            "this learned tool declares no network reach, but the local execution "
+            f"backend cannot take its network away on this host ({reason}); refusing "
+            "to run it with the resident's network. Remedy: allow unprivileged user "
+            "namespaces on the host (Linux; on Ubuntu 23.10+ set "
+            "kernel.apparmor_restrict_unprivileged_userns=0), set "
+            "resident_evolution.learned_tool_execution_backend to 'container' or "
+            "'k8s_job', or rebuild the tool declaring the network reach it really needs"
+        )
 
     async def run(
         self,
@@ -182,7 +242,16 @@ class LocalLearnedToolRunner:
         declared_reach: Sequence[ToolReachGrant] = (),
         host_call: HostCall | None = None,
     ) -> ToolRunResult:
-        self._warn_unenforced_reach(tool_path, declared_reach)
+        deny_network = not reach_allows_network(declared_reach)
+        try:
+            self.check_reach(declared_reach)
+        except LearnedToolError as exc:
+            return ToolRunResult(
+                ok=False,
+                error=f"learned tool {tool_path.stem}: {exc}",
+                enforcement=REACH_ENFORCEMENT_UNAVAILABLE,
+                infrastructure=True,
+            )
         python_executable: Path | None = None
         if requirements:
             if self._venvs_dir is None:
@@ -216,6 +285,7 @@ class LocalLearnedToolRunner:
             timeout_seconds=timeout_seconds,
             python_executable=python_executable,
             host_call=host_call,
+            deny_network=deny_network,
         )
 
     async def verify(
@@ -239,24 +309,6 @@ class LocalLearnedToolRunner:
             requirements=list(requirements),
             entry_point=entry_point,
             timeout_seconds=int(timeout_seconds),
-        )
-
-    def _warn_unenforced_reach(
-        self,
-        tool_path: Path,
-        declared_reach: Sequence[ToolReachGrant],
-    ) -> None:
-        """One-time honesty warning where enforcement would have mattered."""
-        if reach_allows_network(declared_reach):
-            return
-        key = tool_path.stem
-        if key in self._reach_warned:
-            return
-        self._reach_warned.add(key)
-        logger.warning(
-            "learned tool %s declares no network reach, but the local runner "
-            "cannot turn networking off — reach is NOT enforced on the local backend",
-            key,
         )
 
 
@@ -416,6 +468,9 @@ class ContainedLearnedToolRunner:
         self._output_limit_bytes = output_limit_bytes
         self._provision_timeout_seconds = provision_timeout_seconds
         self._venv_locks: dict[str, asyncio.Lock] = {}
+
+    def check_reach(self, declared_reach: Sequence[ToolReachGrant]) -> None:
+        self._reach_args(declared_reach)
 
     async def run(
         self,
@@ -645,12 +700,7 @@ class ContainedLearnedToolRunner:
     ) -> tuple[list[str], list[str]]:
         args: list[str] = []
         credentials: list[str] = []
-        network_grants = [
-            grant
-            for grant in declared_reach
-            if (grant.kind.lower() in NETWORK_REACH_KINDS or grant.kind.lower().startswith("http"))
-            and grant.access != "none"
-        ]
+        network_grants = [grant for grant in declared_reach if grant_reaches_network(grant)]
         targeted_network = [grant.target for grant in network_grants if grant.target.strip()]
         if targeted_network:
             raise LearnedToolError(
@@ -1131,7 +1181,6 @@ class ForgeSandboxLearnedToolRunner:
         #: Self-managed shells, one per docker network mode, so a networked
         #: tool and an isolated tool never share a container.
         self._shells: dict[str, Any] = {}
-        self._reach_warned: set[str] = set()
         #: One provisioning lock per tool so concurrent runs of the same tool
         #: cannot rebuild each other's in-container venv mid-install.
         self._venv_locks: dict[str, asyncio.Lock] = {}
@@ -1142,6 +1191,19 @@ class ForgeSandboxLearnedToolRunner:
         if self._shell is None:
             return True
         return _shell_network_mode(self._shell) is not None
+
+    def check_reach(self, declared_reach: Sequence[ToolReachGrant]) -> None:
+        if self._shell is None or reach_allows_network(declared_reach):
+            return
+        network = _shell_network_mode(self._shell)
+        if _reach_enforcement(network=network, network_allowed=False) == REACH_ENFORCEMENT_ENFORCED:
+            return
+        raise LearnedToolError(
+            "this learned tool declares no network reach, but the configured forge "
+            f"sandbox shell runs with network mode {network or 'unknown'!r}; refusing to "
+            "run it with network. Remedy: configure the shell with network 'none', or "
+            "let the runner manage its own per-network-mode shells"
+        )
 
     async def run(
         self,
@@ -1198,7 +1260,16 @@ class ForgeSandboxLearnedToolRunner:
             timeout_seconds=timeout_seconds,
         )
         if enforcement == REACH_ENFORCEMENT_UNAVAILABLE and not network_allowed:
-            self._warn_enforcement_unavailable(tool_path)
+            return ToolRunResult(
+                ok=False,
+                error=(
+                    f"learned tool {tool_path.stem} declares no network reach, but the "
+                    "forge sandbox shell cannot run it with networking off; refusing to "
+                    "run it with network"
+                ),
+                enforcement=enforcement,
+                infrastructure=True,
+            )
 
         run_dir = self._runs_dir / uuid.uuid4().hex
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -1293,18 +1364,6 @@ class ForgeSandboxLearnedToolRunner:
         # A config object we cannot re-scope is used as-is; the resulting
         # shell's actual network mode drives the enforcement marker honestly.
         return base
-
-    def _warn_enforcement_unavailable(self, tool_path: Path) -> None:
-        key = tool_path.stem
-        if key in self._reach_warned:
-            return
-        self._reach_warned.add(key)
-        logger.warning(
-            "learned tool %s declares no network reach, but the forge sandbox "
-            "shell cannot express network isolation — enforcement recorded as "
-            "unavailable, never faked",
-            key,
-        )
 
     async def _ensure_sandbox_venv(
         self,
@@ -1427,6 +1486,9 @@ class LearnedTool(ToolPort):
         self._tool_path = Path(tool_path)
         self._timeout_seconds = timeout_seconds
         self._runner = runner or LocalLearnedToolRunner()
+        # Refuse at load a tool whose declared reach this backend cannot
+        # enforce, so it is never offered for invocation. run() checks again.
+        self._runner.check_reach(manifest.declared_reach)
         self._requirements = list(requirements)
         self._host_call = host_call
         self._artifact_id = artifact_id
