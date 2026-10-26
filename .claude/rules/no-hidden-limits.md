@@ -75,6 +75,28 @@ If you cannot name the real bound, the cap does not go in.
 4. **Tests assert the hit is loud.** A test that asserts a capped path
    "returns None", "continues", or "does not raise" encodes this defect.
 
+## Report through `ravn.cap_telemetry`
+
+In Ravn, every hit goes through the shared helper in `src/ravn/cap_telemetry.py`
+so it lands on one counter and one health surface. Do not add a parallel
+counter, metric name or log format:
+
+- **Model answers:** `require_complete(response, knob=…, budget=…, model=…,
+  purpose=…)` after every `LLMPort.generate`/`stream` call. It raises
+  `OutputTruncatedError` on `StopReason.MAX_TOKENS` and counts the hit.
+- **Truncation:** `record_truncation(knob, what=…, kept=…, total=…)` wherever
+  content is cut.
+- **Any other cap:** `record_cap_hit(knob, message)` just before raising or
+  holding work back (iterations, the daily budget, list limits).
+- **A path that must continue** because raising would lose more, such as an
+  operator reply that could not be saved: `record_degraded(path, message)`.
+
+These log at error and count on `ravn.cap.hits` / `ravn.degraded`. The
+resident health snapshot carries them as `cap_hits_total`, `cap_hits.<knob>`,
+`degraded_total` and `degraded.<path>`. `knob` is the config path the
+operator would change. Limits and decisions are listed in
+`docs/operator/ravn-limits.md`; add a row when you add or keep a cap.
+
 ## In review — the patterns to reject
 
 - A literal number for tokens, turns, attempts, retries, lengths, or items.
