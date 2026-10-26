@@ -51,7 +51,6 @@ from ravn.cap_telemetry import record_cap_hit, record_degraded, record_truncatio
 from ravn.config import (
     HttpChannelConfig,
     InitiativeConfig,
-    ResidentStateConfig,
     Settings,
 )
 from ravn.domain.budget import DailyBudgetTracker, resolve_task_cost_usd
@@ -124,7 +123,6 @@ _A2A_TERMINAL_STATES = frozenset(
     }
 )
 _HTTP_DEFAULTS = HttpChannelConfig()
-_RESIDENT_STATE_DEFAULTS = ResidentStateConfig()
 
 
 def _bounded_hud_text(value: str, limit: int) -> str:
@@ -132,20 +130,6 @@ def _bounded_hud_text(value: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return f"{text[: max(0, limit - 1)].rstrip()}…"
-
-
-def _bounded_room_context(value: str, limit: int) -> str:
-    text = value.strip()
-    if len(text) <= limit:
-        return text
-    dropped = len(text) - limit
-    record_truncation(
-        "resident_state.directed_message_context_max_chars",
-        what="the prior room message a human replied to",
-        kept=limit,
-        total=len(text),
-    )
-    return f"{text[:limit].rstrip()}\n[prior room context truncated: {dropped} characters omitted]"
 
 
 def _integer_setting(value: object, default: int) -> int:
@@ -2431,14 +2415,6 @@ class DriveLoop:
         context = metadata.get("help_context")
         reply_context = metadata.get("reply_context")
         recent_room_context = metadata.get("recent_room_context")
-        context_limit = _integer_setting(
-            getattr(
-                getattr(self._settings, "resident_state", None),
-                "directed_message_context_max_chars",
-                None,
-            ),
-            _RESIDENT_STATE_DEFAULTS.directed_message_context_max_chars,
-        )
         has_help_context = bool(
             help_summary
             or help_reason
@@ -2470,7 +2446,7 @@ class DriveLoop:
                 parts.extend(
                     [
                         "The human replied to this prior room message:",
-                        _bounded_room_context(prior_content, context_limit),
+                        prior_content,
                     ]
                 )
         elif isinstance(recent_room_context, dict) and recent_room_context:
@@ -2480,7 +2456,7 @@ class DriveLoop:
                     [
                         "Most recent message from this participant in the room "
                         "(context only; the human did not explicitly reply to it):",
-                        _bounded_room_context(prior_content, context_limit),
+                        prior_content,
                     ]
                 )
         label = "Human reply" if has_help_context or reply_context else "Human message"
