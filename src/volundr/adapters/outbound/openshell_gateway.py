@@ -230,7 +230,6 @@ CODEX_ENROLLMENT_HOME = "/tmp/niuu-codex-enrollment"
 CODEX_ENROLLMENT_AUTH_PATH = f"{CODEX_ENROLLMENT_HOME}/auth.json"
 CODEX_ENROLLMENT_LOG_PATH = "/tmp/niuu-codex-enrollment.log"
 CODEX_ENROLLMENT_PID_PATH = "/tmp/niuu-codex-enrollment.pid"
-PROVIDER_NETWORK_ONLY_CREDENTIAL = "network_only"
 CODEX_DEVICE_CODE_PATTERN = re.compile(r"[A-Z0-9]{4,8}(?:-[A-Z0-9]{4,8})+")
 HERMES_API_SERVER_KEY_ENV = "API_SERVER_KEY"
 HERMES_API_SERVER_DEFAULT_PORT = 8642
@@ -6002,14 +6001,11 @@ def _provider_profile(
 def _provider_credential_slots(profile: Any) -> dict[str, str]:
     """Name the credential slots a provider carries, empty until the grant fills them.
 
-    The gateway rejects a provider with no credentials at all, so a
-    network-only profile still declares one named slot that stays empty —
-    values arrive from the profile's token grant, never from this call.
+    OpenShell accepts only slots the profile declares, so a network-only
+    profile (no credentials) gets a provider with no slots at all; the gateway
+    allows that because none of the profile's credentials is required.
     """
-    slots = {str(credential.name): "" for credential in profile.credentials}
-    if slots:
-        return slots
-    return {PROVIDER_NETWORK_ONLY_CREDENTIAL: ""}
+    return {str(credential.name): "" for credential in profile.credentials}
 
 
 def _codex_enrollment_profile(profile_id: str) -> Any:

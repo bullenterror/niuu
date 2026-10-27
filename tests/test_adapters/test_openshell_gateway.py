@@ -3253,8 +3253,9 @@ def test_provider_grant_names_a_credential_slot_the_gateway_accepts(monkeypatch)
         config={"volundr_enrollment_id": "1"},
     )
 
+    # OpenShell rejects slots the profile does not declare.
     slots = created[0].provider.credentials
-    assert slots == {adapter.PROVIDER_NETWORK_ONLY_CREDENTIAL: ""}
+    assert slots == {}
 
 
 def test_provider_grant_leaves_declared_credentials_for_the_token_grant(monkeypatch) -> None:
