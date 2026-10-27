@@ -27,10 +27,12 @@ dashboard's wakefulness and last-dream columns reflect live truth.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -82,6 +84,8 @@ class ResidentWakefulness:
         promote_min_successes: int = DEFAULT_PROMOTE_MIN_SUCCESSES,
         clock: Callable[[], float] = time.monotonic,
         source: str = "",
+        state_path: Path | None = None,
+        wall_clock: Callable[[], float] = time.time,
     ) -> None:
         self._identity = identity
         self._skills = skills
@@ -102,8 +106,44 @@ class ResidentWakefulness:
         self._source = source or identity.valkyrie_id
         self._state = _SLEEPING
         self._last_activity_at = clock()
-        self._last_dream_at = clock()
+        self._state_path = state_path
+        self._wall_clock = wall_clock
+        self._last_dream_at = self._initial_last_dream_at()
         self._task: asyncio.Task | None = None
+
+    def _initial_last_dream_at(self) -> float:
+        """Place the last dream on the monotonic clock from the persisted wall time.
+
+        Without a state path the interval counts from now. With one, a restart
+        keeps counting from the last dream instead of postponing it a full
+        interval, and a resident with no recorded dream is due at once.
+
+        :raises ValueError: the state file exists but cannot be parsed.
+        """
+        now = self._clock()
+        if self._state_path is None:
+            return now
+        if not self._state_path.exists():
+            return now - self._dream_interval_seconds
+        try:
+            last_wall = float(
+                json.loads(self._state_path.read_text(encoding="utf-8"))["last_dream_at"]
+            )
+        except (ValueError, KeyError, TypeError) as exc:
+            raise ValueError(
+                f"consolidation dream state {self._state_path} is unreadable ({exc}); fix it, "
+                "or delete it to dream at the next idle minute"
+            ) from exc
+        return now - max(0.0, self._wall_clock() - last_wall)
+
+    def _record_dream(self) -> None:
+        self._last_dream_at = self._clock()
+        if self._state_path is None:
+            return
+        self._state_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self._state_path.with_suffix(".json.tmp")
+        tmp_path.write_text(json.dumps({"last_dream_at": self._wall_clock()}), encoding="utf-8")
+        tmp_path.replace(self._state_path)
 
     @property
     def identity(self) -> ResidentLearningIdentity:
@@ -182,10 +222,10 @@ class ResidentWakefulness:
         except BaseException:
             # A failed dream must not leave the resident stuck in "dreaming":
             # tick() skips while dreaming, so it would never dream or wake again.
-            self._last_dream_at = self._clock()
+            self._record_dream()
             await self._transition(_WATCHING, reason="consolidation dream failed")
             raise
-        self._last_dream_at = self._clock()
+        self._record_dream()
         await self._publish_dream_event(
             "valkyrie.dream.completed",
             dream_id,

@@ -338,3 +338,76 @@ async def test_guarded_promotion_candidates_become_review_items(tmp_path) -> Non
     await machine.dream()
     assert len(reloaded.list(kind="skill_promotion")) == 1
     assert len(await recorder.of_type(registry.ODIN_REVIEW_REQUESTED)) == 1
+
+
+# ---------------------------------------------------------------------------
+# Persisted dream time: a restart does not postpone the next dream
+# ---------------------------------------------------------------------------
+
+
+def _persisted_machine(tmp_path, *, wall_now: float) -> tuple[ResidentWakefulness, ManualClock]:
+    clock = ManualClock()
+    machine = ResidentWakefulness(
+        identity=_identity(),
+        skills=_skills(tmp_path),
+        publisher=InProcessBus(),
+        dream_interval_seconds=100.0,
+        dream_min_idle_seconds=20.0,
+        clock=clock,
+        state_path=tmp_path / "state" / "consolidation_dream_state.json",
+        wall_clock=lambda: wall_now,
+    )
+    return machine, clock
+
+
+async def test_resident_with_no_recorded_dream_dreams_at_the_first_idle_tick(tmp_path) -> None:
+    machine, clock = _persisted_machine(tmp_path, wall_now=1_000.0)
+    await machine._transition("watching", reason="test start")
+
+    clock.advance(21.0)
+    await machine.tick()
+
+    assert (tmp_path / "state" / "consolidation_dream_state.json").exists()
+    assert machine.state == "watching"
+    saved = (tmp_path / "state" / "consolidation_dream_state.json").read_text()
+    assert '"last_dream_at": 1000.0' in saved
+
+
+async def test_restart_keeps_counting_from_the_recorded_dream(tmp_path) -> None:
+    state = tmp_path / "state" / "consolidation_dream_state.json"
+    state.parent.mkdir()
+    state.write_text('{"last_dream_at": 1000.0}', encoding="utf-8")
+
+    # Restarted 90s after the last dream: due 10s later, not a full interval later.
+    machine, clock = _persisted_machine(tmp_path, wall_now=1_090.0)
+    await machine._transition("watching", reason="test start")
+    clock.advance(9.0)
+    machine.notify_activity()
+    clock.advance(21.0)
+    await machine.tick()
+
+    assert '"last_dream_at": 1090.0' in state.read_text()
+
+
+async def test_restart_soon_after_a_dream_does_not_dream_again(tmp_path) -> None:
+    state = tmp_path / "state" / "consolidation_dream_state.json"
+    state.parent.mkdir()
+    state.write_text('{"last_dream_at": 1000.0}', encoding="utf-8")
+
+    machine, clock = _persisted_machine(tmp_path, wall_now=1_010.0)
+    await machine._transition("watching", reason="test start")
+    clock.advance(21.0)
+    await machine.tick()
+
+    assert state.read_text() == '{"last_dream_at": 1000.0}'
+
+
+def test_unreadable_dream_state_raises_with_remedy(tmp_path) -> None:
+    state = tmp_path / "state" / "consolidation_dream_state.json"
+    state.parent.mkdir()
+    state.write_text("not json", encoding="utf-8")
+
+    import pytest
+
+    with pytest.raises(ValueError, match="delete it to dream at the next idle minute"):
+        _persisted_machine(tmp_path, wall_now=1_000.0)

@@ -693,6 +693,7 @@ async def _run_daemon(
         learning_curator=learning_curator,
         self_improvement=self_improvement,
         tool_curator=tool_curator,
+        state_dir=_resident_ravn_state_dir(workspace, settings),
     )
     if tool_curator is not None and resident_wakefulness is None:
         raise RuntimeError(

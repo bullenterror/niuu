@@ -430,8 +430,13 @@ def _build_resident_wakefulness(
     learning_curator: Any | None = None,
     self_improvement: Any | None = None,
     tool_curator: Any | None = None,
+    state_dir: Path,
 ) -> Any | None:
-    """Build the wakefulness state machine for a resident daemon."""
+    """Build the wakefulness state machine for a resident daemon.
+
+    ``state_dir`` holds the last consolidation dream time, so a restart does
+    not postpone the next dream by a full interval.
+    """
     if not settings.resident_wakefulness.enabled:
         return None
     if resident_learning_runtime is None or publisher is None:
@@ -460,6 +465,7 @@ def _build_resident_wakefulness(
         dream_min_idle_seconds=cfg.dream_min_idle_seconds,
         stale_skill_age_seconds=cfg.stale_skill_age_seconds,
         promote_min_successes=cfg.promote_min_successes,
+        state_path=state_dir / "consolidation_dream_state.json",
     )
 
 
