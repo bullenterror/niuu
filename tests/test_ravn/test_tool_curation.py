@@ -550,8 +550,17 @@ async def test_legacy_curation_state_is_folded_into_archive_and_lifecycle(tmp_pa
             }
         )
     )
+    await _install(tmp_path, skills, "triplet")
     (artifacts_dir / "_curation" / "verdicts.json").write_text(
-        json.dumps({"pairs": {"learned-tool:keeper|learned-tool:twin": {"same": True}}})
+        json.dumps(
+            {
+                "pairs": {
+                    # Transitive: twin~keeper and triplet~twin are one capability.
+                    "learned-tool:keeper|learned-tool:twin": {"same": True},
+                    "learned-tool:triplet|learned-tool:twin": {"same": True},
+                }
+            }
+        )
     )
     args = {"tools_dir": code_dir, "artifacts_dir": artifacts_dir, "skills": skills}
 
@@ -562,13 +571,53 @@ async def test_legacy_curation_state_is_folded_into_archive_and_lifecycle(tmp_pa
     assert not (artifacts_dir / "_curation").exists()
     record = skills.lifecycle_records()["old_variant"]
     assert (record.archived_reason, record.superseded_by) == (RETIRED_SUPERSEDED, "keeper")
-    twin = json.loads(learned_tool_artifact_path(artifacts_dir, "twin").read_text())
-    keeper = json.loads(learned_tool_artifact_path(artifacts_dir, "keeper").read_text())
-    assert twin["source_gap_id"] == keeper["source_gap_id"]
-    assert CAPABILITY_MATCHED_KEY in twin["provenance"]
+    capabilities = {
+        name: json.loads(learned_tool_artifact_path(artifacts_dir, name).read_text())
+        for name in ("keeper", "twin", "triplet")
+    }
+    assert len({envelope["source_gap_id"] for envelope in capabilities.values()}) == 1
+    # Not marked: the dream judges them against today's library.
+    assert all(CAPABILITY_MATCHED_KEY not in e["provenance"] for e in capabilities.values())
     assert await migrate_legacy_curation_state(**args) == 0
     plan = await LearnedToolCurator(state_dir=tmp_path, skills=skills).plan()
-    assert [(d.name, d.superseded_by) for d in plan.retire] == [("twin", "keeper")]
+    assert sorted((d.name, d.superseded_by) for d in plan.retire) == [
+        ("triplet", "keeper"),
+        ("twin", "keeper"),
+    ]
+
+
+async def test_tools_marked_by_the_first_migration_are_judged_again(tmp_path: Path) -> None:
+    """dev.369 marked migrated tools as matched, which left split families unjoined."""
+    skills = _skills(tmp_path)
+    await _install(
+        tmp_path,
+        skills,
+        "list_pods_in_namespace_incluster",
+        run_count=22,
+        success_count=22,
+        last_used_at=_iso(30),
+    )
+    await _install(
+        tmp_path,
+        skills,
+        "k8s_pods_list_namespace",
+        run_count=58,
+        success_count=58,
+        last_used_at=_iso(1),
+    )
+    _, artifacts_dir = _dirs(tmp_path)
+    for name in ("list_pods_in_namespace_incluster", "k8s_pods_list_namespace"):
+        path = learned_tool_artifact_path(artifacts_dir, name)
+        envelope = json.loads(path.read_text())
+        envelope["provenance"][CAPABILITY_MATCHED_KEY] = {"by": "migration"}
+        path.write_text(json.dumps(envelope))
+    matcher = FakeMatcher({"list_pods_in_namespace_incluster", "k8s_pods_list_namespace"})
+
+    plan = await LearnedToolCurator(state_dir=tmp_path, skills=skills, matcher=matcher).plan()
+
+    assert [(d.name, d.superseded_by) for d in plan.retire] == [
+        ("list_pods_in_namespace_incluster", "k8s_pods_list_namespace")
+    ]
 
 
 async def test_a_lifecycle_snapshot_reads_without_writing(tmp_path: Path) -> None:
