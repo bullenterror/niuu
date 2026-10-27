@@ -271,9 +271,9 @@ class ResidentWakefulness:
             await self._transition(_WATCHING, reason="consolidation dream failed")
             raise
         except BaseException:
-            # Cancelled (the runtime is stopping): nothing finished, so the
-            # last outcome stays the one already recorded.
-            self._record_dream(self._last_dream)
+            # Cancelled (the runtime is stopping): nothing finished, so neither
+            # the last dream time nor its outcome moves. The interrupted pass
+            # is still due and runs again at the next idle minute after restart.
             await self._transition(_WATCHING, reason="consolidation dream interrupted")
             raise
         outcome = self._dream_outcome(dream_id, "completed", started_at, started_clock, **summary)

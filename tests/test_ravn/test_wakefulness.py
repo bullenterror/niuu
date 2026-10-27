@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -558,3 +559,43 @@ def test_dream_state_with_a_non_object_outcome_raises_with_remedy(tmp_path) -> N
 
     with pytest.raises(ValueError, match="delete it to dream at the next idle minute"):
         _persisted_machine(tmp_path, wall_now=1_000.0)
+
+
+class _BlockingToolCurator:
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+
+    async def curate(self) -> dict:
+        self.entered.set()
+        await asyncio.Event().wait()
+        return {}
+
+
+async def test_cancelled_dream_is_not_recorded_as_a_dream(tmp_path) -> None:
+    state = tmp_path / "state" / "consolidation_dream_state.json"
+    state.parent.mkdir()
+    state.write_text('{"last_dream_at": 1000.0, "last_dream": null}', encoding="utf-8")
+    bus = InProcessBus()
+    recorder = BusRecorder(bus)
+    await bus.subscribe(["*"], recorder)
+    curator = _BlockingToolCurator()
+    machine, _clock = _reporting_machine(
+        tmp_path, bus=bus, wall_now=[2_000.0], tool_curator=curator
+    )
+    await machine._transition("watching", reason="test start")
+
+    task = asyncio.create_task(machine.dream())
+    await curator.entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # The interrupted pass did not count: the persisted time is unchanged, so a
+    # restart finds the dream still due.
+    assert state.read_text() == '{"last_dream_at": 1000.0, "last_dream": null}'
+    assert machine.last_dream is None
+    assert machine.state == "watching"
+    assert not await recorder.of_type("valkyrie.dream.completed")
+    assert not await recorder.of_type("valkyrie.dream.failed")
+    restarted, _clock = _reporting_machine(tmp_path, bus=bus, wall_now=[2_000.0])
+    assert restarted._clock() - restarted._last_dream_at >= 100.0
