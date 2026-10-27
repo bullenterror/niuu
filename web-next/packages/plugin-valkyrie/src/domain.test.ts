@@ -16,6 +16,9 @@ import {
   decisionNeedsApproval,
   decisionSkillName,
   decisionSubject,
+  dreamLessonsCurated,
+  dreamProposalsFiled,
+  formatDreamDuration,
   grantWorkflowName,
   isToolBuilderWorkflow,
   latestBuildGrant,
@@ -41,6 +44,7 @@ import {
   type TingWorkflowSummary,
   type ValkyrieResident,
 } from './domain';
+import { createSeedValkyrieDashboard } from './adapters/mock';
 
 describe('normalizeValkyrieSignalEvent', () => {
   it('normalizes a signal event from wire data', () => {
@@ -853,5 +857,31 @@ describe('learning feedback verdicts', () => {
 
   it('treats an incomplete feedback payload as awaiting', () => {
     expect(learningFeedbackVerdictLabel(undefined)).toBe('Awaiting');
+  });
+});
+
+describe('consolidation dream summaries', () => {
+  const seed = createSeedValkyrieDashboard();
+  const completed = seed.valkyries.find(
+    (entry) => entry.id === 'valkyrie-valhalla-sigrun',
+  )!.lastDream!;
+  const failed = seed.valkyries.find((entry) => entry.id === 'valkyrie-printer-eir')!.lastDream!;
+
+  it('counts every lesson the dream changed', () => {
+    expect(dreamLessonsCurated(completed)).toBe(4);
+    expect(dreamLessonsCurated(failed)).toBe(0);
+  });
+
+  it('counts held promotions and self-improvement actions as filed proposals', () => {
+    expect(dreamProposalsFiled(completed)).toBe(2);
+    expect(dreamProposalsFiled(failed)).toBe(0);
+  });
+
+  it('formats how long a dream ran', () => {
+    expect(formatDreamDuration(42.4)).toBe('42s');
+    expect(formatDreamDuration(95.4)).toBe('1m 35s');
+    expect(formatDreamDuration(120)).toBe('2m');
+    expect(formatDreamDuration(3600)).toBe('1h');
+    expect(formatDreamDuration(5430)).toBe('1h 30m');
   });
 });
