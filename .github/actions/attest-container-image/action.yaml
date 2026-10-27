@@ -51,7 +51,10 @@ runs:
         IMAGE_REF: ${{ inputs.registry }}/${{ inputs.image }}:${{ inputs.tag }}
       run: |
         set -euo pipefail
-        digest="$(docker buildx imagetools inspect "${IMAGE_REF}" | awk '$1 == "Digest:" { print $2; exit }')"
+        # Read the whole output: an awk that exits at the first match closes the
+        # pipe while docker is still writing, docker exits 255 on the broken
+        # pipe, and pipefail fails the step depending on output length.
+        digest="$(docker buildx imagetools inspect "${IMAGE_REF}" | awk '$1 == "Digest:" && !found { print $2; found = 1 }')"
         if ! [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
           echo "::error title=attest::${IMAGE_REF} resolved to '${digest}', not a sha256 digest"
           exit 1

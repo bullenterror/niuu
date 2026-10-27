@@ -743,11 +743,15 @@ async def test_attestations_for_an_unparseable_repo_url_are_not_found(
 
 @respx.mock
 async def test_the_storage_link_never_reaches_the_logs(
-    provider: GitHubProvider, caplog: pytest.LogCaptureFixture
+    provider: GitHubProvider, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     respx.get(ATTESTATIONS).mock(return_value=_linked())
     respx.get(url__regex=BLOB_PATTERN).mock(return_value=_blob_response())
-    caplog.set_level(logging.DEBUG)
+    # Other tests in the same worker reconfigure logging; pin httpx's own logger.
+    httpx_logger = logging.getLogger("httpx")
+    monkeypatch.setattr(httpx_logger, "disabled", False)
+    monkeypatch.setattr(httpx_logger, "propagate", True)
+    caplog.set_level(logging.INFO, logger="httpx")
 
     await provider.get_image_attestations(REPO, DIGEST)
 
