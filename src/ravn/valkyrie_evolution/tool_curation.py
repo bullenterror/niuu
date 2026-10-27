@@ -187,7 +187,11 @@ class ToolEntry:
 
     @property
     def matched(self) -> bool:
-        return CAPABILITY_MATCHED_KEY in self.artifact.provenance
+        marker = self.artifact.provenance.get(CAPABILITY_MATCHED_KEY)
+        # The dev.369 migration marked tools from folded verdicts, which split
+        # variant families its single pass could not join; those are judged
+        # once more by the dream.
+        return isinstance(marker, dict) and marker.get("by") != "migration"
 
     @property
     def retired_reason(self) -> str:
@@ -978,6 +982,13 @@ async def migrate_legacy_curation_state(
 
 
 def _fold_legacy_verdicts(tools_dir: Path, artifacts_dir: Path, path: Path, skills: Any) -> None:
+    """Turn legacy "same capability" verdicts into shared capability ids.
+
+    Verdicts join tools transitively (A~B and B~C put A, B and C in one
+    capability), so they are folded as connected groups. The tools are not
+    marked as matched: the dream's backfill judges them against the current
+    library, which the verdicts predate.
+    """
     payload = _read_json_object(path, what="legacy capability verdicts") or {}
     pairs = payload.get("pairs") if isinstance(payload.get("pairs"), dict) else {}
     if not pairs:
@@ -986,22 +997,33 @@ def _fold_legacy_verdicts(tools_dir: Path, artifacts_dir: Path, path: Path, skil
         entry.artifact.artifact_id: entry
         for entry in tool_inventory(tools_dir=tools_dir, artifacts_dir=artifacts_dir, skills=skills)
     }
-    judged = {key for pair in pairs for key in pair.split("|")}
-    capability = {key: entry.capability for key, entry in installed.items()}
+    parent = {key: key for key in installed}
+
+    def find(key: str) -> str:
+        while parent[key] != key:
+            parent[key] = parent[parent[key]]
+            key = parent[key]
+        return key
+
     for pair, verdict in pairs.items():
         left, _, right = pair.partition("|")
         if isinstance(verdict, dict) and verdict.get("same"):
             if left in installed and right in installed:
-                capability[right] = capability[left]
-    for key, entry in installed.items():
-        if key not in judged:
+                parent[find(left)] = find(right)
+    groups: dict[str, list[str]] = {}
+    for key in installed:
+        groups.setdefault(find(key), []).append(key)
+    for members in groups.values():
+        if len(members) < 2:
             continue
-        provenance = dict(entry.artifact.provenance)
-        provenance.setdefault(CAPABILITY_MATCHED_KEY, capability_matched_marker(by="migration"))
-        artifact = replace(entry.artifact, source_gap_id=capability[key], provenance=provenance)
-        _write_json(
-            learned_tool_artifact_path(artifacts_dir, artifact.manifest.name), artifact.to_dict()
-        )
+        capability = installed[sorted(members)[0]].capability
+        for key in members:
+            entry = installed[key]
+            artifact = replace(entry.artifact, source_gap_id=capability)
+            _write_json(
+                learned_tool_artifact_path(artifacts_dir, artifact.manifest.name),
+                artifact.to_dict(),
+            )
 
 
 # ---------------------------------------------------------------------------
