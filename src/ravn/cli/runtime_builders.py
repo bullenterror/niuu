@@ -792,7 +792,7 @@ def _build_self_improvement(
         lessons=consolidation.lessons,
         judge=consolidation.judge,
         config=reflection.self_improvement,
-        procedure_max_chars=reflection.curation.procedure_max_chars,
+        procedure_max_chars=reflection.learning_entry_max_chars,
         resident_id=resident_id,
         # Improvements that need a tool or a ticket run as ordinary resident tasks.
         dispatch=drive_loop.enqueue if drive_loop is not None else None,
@@ -827,6 +827,7 @@ def _build_learning_curator(
         evidence_duplicate_similarity=reflection.matching.evidence_duplicate_similarity,
         min_repetitions=reflection.candidate_min_repetitions,
         verified_recovery_promotes=reflection.verified_promotion.route_recovery_promotes,
+        procedure_max_chars=reflection.learning_entry_max_chars,
     )
 
 

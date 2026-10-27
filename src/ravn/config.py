@@ -3032,11 +3032,6 @@ class LearningCurationConfig(BaseModel):
             "never consolidated before, one model call each, and marks them `curated`."
         ),
     )
-    procedure_max_chars: int = Field(
-        default=280,
-        ge=40,
-        description="Longest procedural 'When X, do Y' rewrite accepted from the judge.",
-    )
     prune_after_days: float = Field(
         default=14.0,
         gt=0.0,

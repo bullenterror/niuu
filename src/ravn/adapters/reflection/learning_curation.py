@@ -139,6 +139,7 @@ class LearningCurator:
         evidence_duplicate_similarity: float,
         min_repetitions: int,
         verified_recovery_promotes: bool,
+        procedure_max_chars: int,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self._mimir = mimir
@@ -150,6 +151,9 @@ class LearningCurator:
         self._evidence_duplicate_similarity = evidence_duplicate_similarity
         self._min_repetitions = min_repetitions
         self._verified_recovery_promotes = verified_recovery_promotes
+        # A procedure is what injection puts in the prompt, so it must fit in
+        # the room one injected learning has (reflection.learning_entry_max_chars).
+        self._procedure_max_chars = procedure_max_chars
         self._clock = clock
         self._last_run: datetime | None = None
 
@@ -424,9 +428,7 @@ class LearningCurator:
             if self._past(deadline):
                 report.rewrites_remaining = len(pending) - index
                 return
-            procedure = await self._judge.procedure(
-                lesson, max_chars=self._config.procedure_max_chars
-            )
+            procedure = await self._judge.procedure(lesson, max_chars=self._procedure_max_chars)
             content = set_procedure(lesson.content, procedure)
             content = _set_frontmatter_value(
                 content, "procedure_rewritten", now.strftime("%Y-%m-%dT%H:%M:%SZ")

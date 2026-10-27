@@ -907,6 +907,7 @@ async def test_noatun_duplicate_learnings_collapse_and_stay_collapsed(tmp_path: 
         evidence_duplicate_similarity=0.9,
         min_repetitions=3,
         verified_recovery_promotes=True,
+        procedure_max_chars=600,
         clock=lambda: datetime(2026, 10, 27, tzinfo=UTC),
     )
 

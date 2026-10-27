@@ -24,7 +24,7 @@ from ravn.adapters.reflection.learning_curation import (
     _PassState,
 )
 from ravn.adapters.reflection.lesson_consolidation import timeline_entries as _timeline_entries
-from ravn.adapters.reflection.lesson_judge import LessonJudge, LessonJudgeError
+from ravn.adapters.reflection.lesson_judge import PROCEDURE_KNOB, LessonJudge, LessonJudgeError
 from ravn.adapters.reflection.lessons import (
     LessonIndex,
     body_section,
@@ -76,6 +76,7 @@ def _curator(
         evidence_duplicate_similarity=0.9,
         min_repetitions=3,
         verified_recovery_promotes=True,
+        procedure_max_chars=600,
         clock=clock,
     )
 
@@ -680,8 +681,20 @@ async def test_judge_procedure() -> None:
     assert await judge.procedure(verified, max_chars=100) == "When x, do y."
     with pytest.raises(LessonJudgeError, match="When X, do Y"):
         await judge.procedure(verified, max_chars=100)
-    with pytest.raises(LessonJudgeError, match="limit"):
+    hits = cap_hit_counts().get(PROCEDURE_KNOB, 0)
+    with pytest.raises(LessonJudgeError, match="reflection.learning_entry_max_chars"):
         await judge.procedure(verified, max_chars=100)
+    assert cap_hit_counts()[PROCEDURE_KNOB] == hits + 1
+
+
+async def test_a_rule_that_fits_one_injected_learning_is_kept() -> None:
+    """Runa's and Regin's dreams failed on 300- and 284-character rules against a
+    guessed 280; what bounds a rule is the room injection gives one learning."""
+    rule = "When " + "x" * 295
+    judge = _judge(_llm(json.dumps({"procedure": rule})))
+    limit = Settings().reflection.learning_entry_max_chars
+
+    assert await judge.procedure(_lesson("a"), max_chars=limit) == rule
 
 
 async def test_judge_procedure_mentions_verification() -> None:
@@ -828,6 +841,7 @@ def test_semantic_consolidation_and_curator_are_built_from_config() -> None:
     assert consolidation.judge._model == settings.reflection.llm_alias
     curator = _build_learning_curator(settings, mimir=MagicMock(), consolidation=consolidation)
     assert isinstance(curator, LearningCurator)
+    assert curator._procedure_max_chars == settings.reflection.learning_entry_max_chars
     with pytest.raises(RuntimeError, match="no Mímir mount"):
         _build_learning_curator(settings, mimir=None, consolidation=consolidation)
 

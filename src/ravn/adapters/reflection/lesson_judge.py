@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from ravn.adapters.reflection.post_session import _parse_reflection_json
-from ravn.cap_telemetry import require_complete
+from ravn.cap_telemetry import record_cap_hit, require_complete
 from ravn.domain.exceptions import OutputTruncatedError
 from ravn.resident_text import compact_line
 
@@ -65,6 +65,11 @@ Learning:
 Respond with a single JSON object:
 {{"procedure": "When ..., ..."}}\
 """
+
+
+#: What bounds a procedure rewrite: injection shows one learning in at most this
+#: many characters, so a longer rule would be cut where it is used.
+PROCEDURE_KNOB = "reflection.learning_entry_max_chars"
 
 
 class LessonJudgeError(RuntimeError):
@@ -148,9 +153,13 @@ class LessonJudge:
                 f"judge rewrite is not a 'When X, do Y' rule: {compact_line(procedure)!r}"
             )
         if len(procedure) > max_chars:
-            raise LessonJudgeError(
-                f"judge rewrite is {len(procedure)} characters; the limit is {max_chars}"
+            message = (
+                f"judge rewrite is {len(procedure)} characters; the limit is {max_chars}, "
+                f"the room one injected learning has. Raise {PROCEDURE_KNOB} if rules that "
+                "long are worth injecting whole"
             )
+            record_cap_hit(PROCEDURE_KNOB, message)
+            raise LessonJudgeError(message)
         return procedure
 
     async def ask_json(self, prompt: str) -> dict:

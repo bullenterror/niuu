@@ -205,7 +205,6 @@ reflection:
   curation:
     enabled: true                     # needs resident_wakefulness.enabled
     min_interval_seconds: 0           # 0 = every consolidation dream
-    procedure_max_chars: 280
     prune_after_days: 14
     audit_prefix: learning-curation
 
