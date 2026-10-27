@@ -3519,6 +3519,15 @@ class ResidentWakefulnessConfig(BaseModel):
             "promoted to environment scope during a dream, policy permitting."
         ),
     )
+    dream_snapshot_interval_seconds: float = Field(
+        default=300.0,
+        gt=0,
+        description=(
+            "How often the last consolidation dream outcome is republished as "
+            "valkyrie.dream.snapshot, so a dashboard restarted without event replay "
+            "shows it within this interval instead of after the next dream."
+        ),
+    )
 
 
 class WorkflowSelectorConfig(BaseModel):

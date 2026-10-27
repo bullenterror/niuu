@@ -465,6 +465,7 @@ def _build_resident_wakefulness(
         dream_min_idle_seconds=cfg.dream_min_idle_seconds,
         stale_skill_age_seconds=cfg.stale_skill_age_seconds,
         promote_min_successes=cfg.promote_min_successes,
+        dream_snapshot_interval_seconds=cfg.dream_snapshot_interval_seconds,
         state_path=state_dir / "consolidation_dream_state.json",
     )
 
