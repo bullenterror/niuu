@@ -331,6 +331,38 @@ def check_service_requests() -> None:
     finally:
         client.close()
 
+    import grpc
+
+    class SandboxMissing(grpc.RpcError):
+        def code(self):
+            return grpc.StatusCode.NOT_FOUND
+
+    class Unavailable(grpc.RpcError):
+        def code(self):
+            return grpc.StatusCode.UNAVAILABLE
+
+    def raise_error(error):
+        def handler(_request):
+            raise error
+
+        return handler
+
+    # The gateway answers NOT_FOUND when the parent sandbox is already gone.
+    client = _client(_UnaryStub({"DeleteService": raise_error(SandboxMissing())}))
+    try:
+        assert client.delete_service(sandbox_name="gone", service="skuld") is False
+    finally:
+        client.close()
+    client = _client(_UnaryStub({"DeleteService": raise_error(Unavailable())}))
+    try:
+        client.delete_service(sandbox_name="sandbox", service="skuld")
+    except grpc.RpcError as exc:
+        assert exc.code() == grpc.StatusCode.UNAVAILABLE
+    else:
+        raise AssertionError("only NOT_FOUND means the service is already absent")
+    finally:
+        client.close()
+
 
 def _exec_stub(events):
     from openshell._proto import openshell_pb2 as p

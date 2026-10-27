@@ -601,16 +601,24 @@ class OpenShellGatewayClient:
         if len(sandbox_name) > MAX_SANDBOX_ROUTING_NAME_LENGTH:
             return False
 
-        response = self._stub.DeleteService(
-            openshell_pb2.DeleteServiceRequest(
-                workspace_scope=self._workspace_scope,
-                sandbox=sandbox_name,
-                name=service,
-                allow_missing=True,
-            ),
-            timeout=self._timeout,
-            metadata=self._metadata(),
-        )
+        try:
+            response = self._stub.DeleteService(
+                openshell_pb2.DeleteServiceRequest(
+                    workspace_scope=self._workspace_scope,
+                    sandbox=sandbox_name,
+                    name=service,
+                    allow_missing=True,
+                ),
+                timeout=self._timeout,
+                metadata=self._metadata(),
+            )
+        except grpc.RpcError as exc:
+            # The gateway resolves the sandbox before honouring allow_missing,
+            # so a sandbox that no longer exists answers NOT_FOUND. Its service
+            # is then already absent.
+            if exc.code() == grpc.StatusCode.NOT_FOUND:
+                return False
+            raise
         return _deletion_outcome(response.outcome, f"service {service!r} of {sandbox_name!r}")
 
     def get_provider(self, name: str) -> Any | None:
