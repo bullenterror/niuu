@@ -4579,7 +4579,10 @@ class OpenShellGatewayPodManager(
                 f"Credential {credential_name!r} does not contain fields: "
                 + ", ".join(missing_fields)
             )
-        if mapping.get("materializeEnvironment") or mapping.get("materialize_environment"):
+        materialize = bool(
+            mapping.get("materializeEnvironment") or mapping.get("materialize_environment")
+        )
+        if materialize:
             values = await self._credential_store.get_value(
                 "user",
                 subject.owner_id,
@@ -4608,6 +4611,7 @@ class OpenShellGatewayPodManager(
                 env_name=env_name,
                 token_endpoint=self._credential_token_endpoint,
                 target_config=mapping.get("provider"),
+                network_only=materialize,
             )
             if provider_name in providers:
                 continue
@@ -5918,8 +5922,41 @@ def _provider_profile(
     token_endpoint: str,
     cache_ttl_seconds: int = 300,
     target_config: Any = None,
+    network_only: bool = False,
 ) -> Any:
+    """Build the OpenShell provider profile for one mapped credential field.
+
+    A token-grant credential is injected into HTTP requests by the gateway.
+    ``network_only`` drops it for credentials Völundr materializes into the
+    process environment itself: those reach raw-protocol endpoints (NATS,
+    databases) where OpenShell rejects token grants (``tls: skip`` bypasses
+    header injection), so the profile carries only the endpoint and binary
+    policy that admits the connection.
+    """
     target = _provider_target(env_name, target_config)
+    endpoints = target.get("endpoints") or [
+        _network_endpoint(
+            {
+                "host": host,
+                "port": 443,
+                "protocol": "rest",
+                "enforcement": "enforce",
+                "access": "full",
+            }
+        )
+        for host in target["hosts"]
+    ]
+    binaries = [sandbox_pb2.NetworkBinary(path=path) for path in target["binaries"]]
+    if network_only:
+        return openshell_pb2.ProviderProfile(
+            id=profile_id,
+            display_name=f"Niuu network access for {env_name}",
+            description="Endpoint policy for a credential Völundr materializes into the workload",
+            category=target["category"],
+            credentials=[],
+            endpoints=endpoints,
+            binaries=binaries,
+        )
     audience = f"{GRANT_AUDIENCE_PREFIX}{profile_id}"
     credential = openshell_pb2.ProviderProfileCredential(
         # Named for the env var it fills, not the generic "access_token".
@@ -5943,19 +5980,6 @@ def _provider_profile(
             cache_ttl=_duration(cache_ttl_seconds),
         ),
     )
-    endpoints = target.get("endpoints") or [
-        _network_endpoint(
-            {
-                "host": host,
-                "port": 443,
-                "protocol": "rest",
-                "enforcement": "enforce",
-                "access": "full",
-            }
-        )
-        for host in target["hosts"]
-    ]
-    binaries = [sandbox_pb2.NetworkBinary(path=path) for path in target["binaries"]]
     return openshell_pb2.ProviderProfile(
         id=profile_id,
         display_name=f"Niuu runtime credential for {env_name}",

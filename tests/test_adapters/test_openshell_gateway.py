@@ -1962,10 +1962,17 @@ async def test_resident_materializes_raw_protocol_credential_from_openbao(
     assert client.created is not None
     assert "RAVN_NATS_PASSWORD" not in client.created["env"]
     assert client.execs[1]["env"]["RAVN_NATS_PASSWORD"] == "nats-from-openbao"
-    assert any(
-        grant["profile"].credentials[0].env_vars == ["RAVN_NATS_PASSWORD"]
+    # The value is materialized by Völundr, so the provider carries only the
+    # raw-protocol endpoint policy: OpenShell rejects a token grant on a
+    # tls: skip endpoint.
+    nats_grants = [
+        grant
         for grant in client.provider_grants
-    )
+        if any(endpoint.port == 4222 for endpoint in grant["profile"].endpoints)
+    ]
+    assert len(nats_grants) == 1
+    assert list(nats_grants[0]["profile"].credentials) == []
+    assert [endpoint.host for endpoint in nats_grants[0]["profile"].endpoints] == ["10.191.72.34"]
 
     await manager.restart(runtime, profile)
 
